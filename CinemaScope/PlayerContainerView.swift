@@ -54,6 +54,69 @@ final class PlayerContainerViewController: UIViewController {
         canvasVC.view.frame = view.bounds
         canvasVC.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         canvasVC.didMove(toParent: self)
+
+        // Observe playback failures and show error overlay
+        Task { @MainActor in
+            for await state in engine.$playbackState.values {
+                if case .failed(let msg) = state {
+                    self.showErrorOverlay(message: msg)
+                }
+            }
+        }
+    }
+
+    private func showErrorOverlay(message: String) {
+        // Remove any existing error overlay
+        view.subviews.filter { $0.tag == 999 }.forEach { $0.removeFromSuperview() }
+
+        let overlay = UIView()
+        overlay.tag = 999
+        overlay.backgroundColor = UIColor.black.withAlphaComponent(0.85)
+        overlay.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(overlay)
+        NSLayoutConstraint.activate([
+            overlay.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            overlay.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            overlay.topAnchor.constraint(equalTo: view.topAnchor),
+            overlay.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+        ])
+
+        let stack = UIStackView()
+        stack.axis = .vertical
+        stack.spacing = 20
+        stack.alignment = .center
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        overlay.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.centerXAnchor.constraint(equalTo: overlay.centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: overlay.centerYAnchor),
+            stack.widthAnchor.constraint(lessThanOrEqualTo: overlay.widthAnchor, multiplier: 0.7),
+        ])
+
+        let icon = UILabel()
+        icon.text = "⚠️"
+        icon.font = .systemFont(ofSize: 64)
+        stack.addArrangedSubview(icon)
+
+        let title = UILabel()
+        title.text = "Playback Error"
+        title.font = .systemFont(ofSize: 32, weight: .bold)
+        title.textColor = .white
+        stack.addArrangedSubview(title)
+
+        let detail = UILabel()
+        detail.text = message
+        detail.font = .systemFont(ofSize: 20)
+        detail.textColor = UIColor.white.withAlphaComponent(0.7)
+        detail.numberOfLines = 0
+        detail.textAlignment = .center
+        stack.addArrangedSubview(detail)
+
+        let hint = UILabel()
+        hint.text = "Press Menu to go back"
+        hint.font = .systemFont(ofSize: 18)
+        hint.textColor = UIColor.white.withAlphaComponent(0.4)
+        stack.addArrangedSubview(hint)
     }
 
     override func viewDidAppear(_ animated: Bool) {
@@ -100,7 +163,7 @@ final class PlayerContainerViewController: UIViewController {
                     // First menu press dismisses OSD
                     hideOSD()
                 } else {
-                    engine.pause()
+                    engine.stop()
                     onExit()
                 }
                 return
@@ -171,7 +234,7 @@ final class PlayerContainerViewController: UIViewController {
             onSeek:        { [weak self] in self?.engine.seek(to: $0) },
             onDismiss:     { [weak self] in self?.hideOSD() },
             onExit:        { [weak self] in
-                self?.engine.pause()
+                self?.engine.stop()
                 self?.onExit()
             }
         )

@@ -51,26 +51,64 @@ struct EmbyLibrary: Codable, Identifiable {
 // MARK: - Media Item
 
 struct EmbyItem: Codable, Identifiable, Equatable {
-    let id:              String
-    let name:            String
-    let type:            String        // "Movie", "Series", "Episode"
-    let productionYear:  Int?
-    let imageTags:       ImageTags?
+    let id:                String
+    let name:              String
+    let type:              String        // "Movie", "Series", "Episode"
+    let productionYear:    Int?
+    let imageTags:         ImageTags?
     let backdropImageTags: [String]?
-    let overview:        String?
-    let runTimeTicks:    Int64?        // 1 tick = 100 nanoseconds
-    let userData:        UserData?
+    let overview:          String?
+    let runTimeTicks:      Int64?        // 1 tick = 100 nanoseconds
+    let userData:          UserData?
+    let genres:            [String]?
+    let people:            [EmbyPerson]?
+    let communityRating:   Double?
+    let officialRating:    String?
+    let taglines:          [String]?
+    let studios:           [EmbyStudio]?
+    let parentId:          String?
+    let seriesId:          String?       // Series this episode belongs to
+    let seriesName:        String?
+    let seasonId:          String?
+    let seasonName:        String?
+    let episodeCount:      Int?
+    let childCount:        Int?
+    let indexNumber:       Int?       // episode number within season
+    let parentIndexNumber: Int?       // season number
+    let providerIds:       ProviderIds?
 
     enum CodingKeys: String, CodingKey {
-        case id              = "Id"
-        case name            = "Name"
-        case type            = "Type"
-        case productionYear  = "ProductionYear"
-        case imageTags       = "ImageTags"
+        case id                = "Id"
+        case name              = "Name"
+        case type              = "Type"
+        case productionYear    = "ProductionYear"
+        case imageTags         = "ImageTags"
         case backdropImageTags = "BackdropImageTags"
-        case overview        = "Overview"
-        case runTimeTicks    = "RunTimeTicks"
-        case userData        = "UserData"
+        case overview          = "Overview"
+        case runTimeTicks      = "RunTimeTicks"
+        case userData          = "UserData"
+        case genres            = "Genres"
+        case people            = "People"
+        case communityRating   = "CommunityRating"
+        case officialRating    = "OfficialRating"
+        case taglines          = "Taglines"
+        case studios           = "Studios"
+        case parentId          = "ParentId"
+        case seriesId          = "SeriesId"
+        case seriesName        = "SeriesName"
+        case seasonId          = "SeasonId"
+        case seasonName        = "SeasonName"
+        case episodeCount      = "EpisodeCount"
+        case childCount        = "ChildCount"
+        case indexNumber       = "IndexNumber"
+        case parentIndexNumber = "ParentIndexNumber"
+        case providerIds       = "ProviderIds"
+    }
+
+    // Convenience accessor for TMDB ID
+    var tmdbId: Int? {
+        guard let idStr = providerIds?.tmdb else { return nil }
+        return Int(idStr)
     }
 
     var runtimeMinutes: Int? {
@@ -81,7 +119,16 @@ struct EmbyItem: Codable, Identifiable, Equatable {
 
 struct ImageTags: Codable, Equatable {
     let primary: String?
-    enum CodingKeys: String, CodingKey { case primary = "Primary" }
+    let thumb:   String?   // 16:9 thumbnail — great for TV shows
+    let banner:  String?   // wide banner
+    let logo:    String?
+
+    enum CodingKeys: String, CodingKey {
+        case primary = "Primary"
+        case thumb   = "Thumb"
+        case banner  = "Banner"
+        case logo    = "Logo"
+    }
 }
 
 struct UserData: Codable, Equatable {
@@ -91,6 +138,59 @@ struct UserData: Codable, Equatable {
         case playbackPositionTicks = "PlaybackPositionTicks"
         case played                = "Played"
     }
+}
+
+// MARK: - Provider IDs
+
+struct ProviderIds: Codable, Equatable {
+    let tmdb:   String?
+    let imdb:   String?
+    let tvdb:   String?
+
+    enum CodingKeys: String, CodingKey {
+        case tmdb = "Tmdb"
+        case imdb = "Imdb"
+        case tvdb = "Tvdb"
+    }
+}
+
+// MARK: - Person
+
+struct EmbyPerson: Codable, Equatable, Identifiable {
+    let id:              String
+    let name:            String
+    let role:            String?
+    let type:            String?    // "Actor", "Director", "Writer", etc.
+    let primaryImageTag: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id              = "Id"
+        case name            = "Name"
+        case role            = "Role"
+        case type            = "Type"
+        case primaryImageTag = "PrimaryImageTag"
+    }
+}
+
+// MARK: - Studio
+
+struct EmbyStudio: Codable, Equatable {
+    let name: String
+    let id:   String?
+    enum CodingKeys: String, CodingKey { case name = "Name"; case id = "Id" }
+}
+
+
+// MARK: - Genre
+
+struct EmbyGenre: Codable {
+    let name: String
+    enum CodingKeys: String, CodingKey { case name = "Name" }
+}
+
+struct EmbyGenreResponse: Codable {
+    let items: [EmbyGenre]
+    enum CodingKeys: String, CodingKey { case items = "Items" }
 }
 
 // MARK: - Items Response
@@ -120,33 +220,122 @@ struct EmbyPlaybackInfo: Codable {
 }
 
 struct EmbyMediaSource: Codable {
-    let id:              String
-    let directStreamUrl: String?
+    let id:                   String
+    let directStreamUrl:      String?
     let supportsDirectStream: Bool?
-    let mediaStreams:    [EmbyMediaStream]?
-    let container:      String?   // "mkv", "mp4", "avi", etc.
+    let mediaStreams:          [EmbyMediaStream]?
+    let container:            String?    // "mkv", "mp4", "avi", etc.
+    let bitrate:              Int?       // overall bitrate in bps
+    let size:                 Int64?     // file size in bytes
+    let videoType:            String?    // "VideoFile", "BluRay", etc.
 
     enum CodingKeys: String, CodingKey {
-        case id                  = "Id"
-        case directStreamUrl     = "DirectStreamUrl"
+        case id                   = "Id"
+        case directStreamUrl      = "DirectStreamUrl"
         case supportsDirectStream = "SupportsDirectStream"
-        case mediaStreams         = "MediaStreams"
-        case container           = "Container"
+        case mediaStreams          = "MediaStreams"
+        case container            = "Container"
+        case bitrate              = "Bitrate"
+        case size                 = "Size"
+        case videoType            = "VideoType"
+    }
+
+    // Convenience
+    var videoStream: EmbyMediaStream? {
+        mediaStreams?.first { $0.type.lowercased() == "video" }
+    }
+    var audioStreams: [EmbyMediaStream] {
+        mediaStreams?.filter { $0.type.lowercased() == "audio" } ?? []
+    }
+    var subtitleStreams: [EmbyMediaStream] {
+        mediaStreams?.filter { $0.type.lowercased() == "subtitle" } ?? []
     }
 }
 
 struct EmbyMediaStream: Codable {
-    let type:          String   // "Video", "Audio", "Subtitle"
-    let codec:         String?
-    let width:         Int?
-    let height:        Int?
-    let displayTitle:  String?
+    let type:              String    // "Video", "Audio", "Subtitle"
+    let codec:             String?
+    let width:             Int?
+    let height:            Int?
+    let displayTitle:      String?
+    let bitrate:           Int?      // stream bitrate in bps
+    let bitDepth:          Int?      // 8, 10, 12-bit
+    let videoRange:        String?   // "SDR", "HDR", "HDR10", "DolbyVision"
+    let videoRangeType:    String?   // "HDR10", "HLG", "DOVIWithHDR10", etc.
+    let colorSpace:        String?
+    let profile:           String?   // "High", "Main 10", "DV Profile 5", etc.
+    let level:             Double?
+    let frameRate:         Double?
+    let averageFrameRate:  Double?
+    let channels:          Int?      // audio channels
+    let channelLayout:     String?   // "stereo", "5.1", "7.1 Atmos"
+    let sampleRate:        Int?
+    let language:          String?
+    let title:             String?
+    let isDefault:         Bool?
+    let isForced:          Bool?
+    let supportsExternalStream: Bool?
 
     enum CodingKeys: String, CodingKey {
-        case type         = "Type"
-        case codec        = "Codec"
-        case width        = "Width"
-        case height       = "Height"
-        case displayTitle = "DisplayTitle"
+        case type              = "Type"
+        case codec             = "Codec"
+        case width             = "Width"
+        case height            = "Height"
+        case displayTitle      = "DisplayTitle"
+        case bitrate           = "BitRate"
+        case bitDepth          = "BitDepth"
+        case videoRange        = "VideoRange"
+        case videoRangeType    = "VideoRangeType"
+        case colorSpace        = "ColorSpace"
+        case profile           = "Profile"
+        case level             = "Level"
+        case frameRate         = "FrameRate"
+        case averageFrameRate  = "AverageFrameRate"
+        case channels          = "Channels"
+        case channelLayout     = "ChannelLayout"
+        case sampleRate        = "SampleRate"
+        case language          = "Language"
+        case title             = "Title"
+        case isDefault         = "IsDefault"
+        case isForced          = "IsForced"
+        case supportsExternalStream = "SupportsExternalStream"
+    }
+
+    // Human-readable resolution label
+    var resolutionLabel: String? {
+        guard let w = width, let h = height else { return nil }
+        switch h {
+        case 2160...: return "4K"
+        case 1440...: return "1440p"
+        case 1080...: return "1080p"
+        case 720...:  return "720p"
+        case 480...:  return "480p"
+        default:      return "\(h)p"
+        }
+    }
+
+    // HDR badge
+    var hdrLabel: String? {
+        switch (videoRangeType ?? "").lowercased() {
+        case let s where s.contains("dovi"):   return "Dolby Vision"
+        case let s where s.contains("hdr10+"): return "HDR10+"
+        case let s where s.contains("hdr10"):  return "HDR10"
+        case let s where s.contains("hlg"):    return "HLG"
+        case "hdr":                             return "HDR"
+        default:
+            switch (videoRange ?? "").lowercased() {
+            case "hdr": return "HDR"
+            default:    return nil
+            }
+        }
+    }
+
+    // Audio label
+    var audioLabel: String? {
+        guard type.lowercased() == "audio" else { return nil }
+        var parts: [String] = []
+        if let codec = codec?.uppercased() { parts.append(codec) }
+        if let layout = channelLayout { parts.append(layout) }
+        return parts.isEmpty ? displayTitle : parts.joined(separator: " ")
     }
 }

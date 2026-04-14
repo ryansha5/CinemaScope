@@ -26,16 +26,11 @@ enum NavTab: String, CaseIterable, Identifiable {
 
 enum AppDestination: Equatable {
     case detail(EmbyItem)
+    case season(series: EmbyItem, season: EmbyItem)
     case collection(EmbyItem)
     case player(EmbyItem)
     case search
-}
-
-// MARK: - Card Size
-
-enum CardSize {
-    case poster
-    case wide
+    case settings
 }
 
 // MARK: - HomeView
@@ -56,10 +51,13 @@ struct HomeView: View {
             switch destination {
             case .detail(let item):
                 DetailView(
-                    item:    item,
-                    session: session,
-                    onPlay:  { play($0) },
-                    onBack:  { withAnimation { destination = nil } }
+                    item:           item,
+                    session:        session,
+                    onPlay:         { play($0) },
+                    onRestart:      { restart($0) },
+                    onNavigate:     { navigated in withAnimation { destination = .detail(navigated) } },
+                    onSelectSeason: { series, season in withAnimation { destination = .season(series: series, season: season) } },
+                    onBack:         { withAnimation { destination = nil } }
                 )
                 .transition(.opacity)
 
@@ -69,9 +67,19 @@ struct HomeView: View {
                     engine:  engine,
                     session: session,
                     onExit:  {
-                        engine.pause()
+                        engine.stop()
                         withAnimation { destination = nil }
                     }
+                )
+                .transition(.opacity)
+
+            case .season(let series, let season):
+                SeasonDetailView(
+                    series:        series,
+                    initialSeason: season,
+                    session:       session,
+                    onSelect:      { episode in withAnimation { destination = .detail(episode) } },
+                    onBack:        { withAnimation { destination = nil } }
                 )
                 .transition(.opacity)
 
@@ -92,6 +100,13 @@ struct HomeView: View {
                 )
                 .transition(.opacity)
 
+            case .settings:
+                SettingsView(
+                    availableGenres: store.availableGenres,
+                    onDismiss: { withAnimation { destination = nil } }
+                )
+                .transition(.opacity)
+
             case nil:
                 if settings.scopeUIEnabled {
                     scopeShell.transition(.opacity)
@@ -106,7 +121,16 @@ struct HomeView: View {
             guard let server = session.server,
                   let user   = session.user,
                   let token  = session.token else { return }
-            await store.load(server: server, userId: user.id, token: token)
+            await store.load(server: server, userId: user.id, token: token,
+                             ribbons: settings.homeRibbons)
+        }
+        .onChange(of: settings.homeRibbons) { _, newRibbons in
+            guard let server = session.server,
+                  let user   = session.user,
+                  let token  = session.token else { return }
+            Task {
+                await store.loadRibbons(newRibbons, server: server, userId: user.id, token: token)
+            }
         }
     }
 
@@ -133,8 +157,10 @@ struct HomeView: View {
                 Color.black.ignoresSafeArea()
 
                 ZStack {
-                    CinemaTheme.backgroundGradient
-                    CinemaTheme.radialOverlay
+                    // Canvas uses current color mode — bars always black regardless
+                    CinemaTheme.backgroundGradient(settings.colorMode)
+                    CinemaTheme.radialOverlay(settings.colorMode)
+                    CinemaTheme.shimmerOverlay(settings.colorMode)
                 }
                 .frame(width: canvas.width, height: canvas.height)
                 .offset(x: canvas.minX, y: canvas.minY)
@@ -172,21 +198,18 @@ struct HomeView: View {
 
             Spacer()
 
-            scopeToggleButton(compact: false)
-            searchButton(compact: false)
-
-            Button("Sign Out") { session.logout() }
-                .font(.system(size: 16))
-                .foregroundStyle(.white.opacity(0.3))
-                .focusRingFree()
-                .padding(.leading, 24)
+            ScopeToggleButton(enabled: $settings.scopeUIEnabled, compact: false)
+            NavActionButton(icon: "magnifyingglass", label: "Search", compact: false) { withAnimation { destination = .search } }
+            NavActionButton(icon: "gearshape.fill", label: "Settings", compact: false) { withAnimation { destination = .settings } }
+            NavActionButton(icon: "rectangle.portrait.and.arrow.right", label: "Sign Out", compact: false) { session.logout() }
+                .padding(.leading, 16)
         }
         .padding(.horizontal, CinemaTheme.pagePadding)
         .padding(.vertical, 20)
-        .background(.ultraThinMaterial.opacity(0.5))
+        .background(.ultraThinMaterial.opacity(settings.colorMode == .light ? 0.85 : 0.5))
         .overlay(alignment: .bottom) {
             Rectangle()
-                .fill(CinemaTheme.peacockLight.opacity(0.15))
+                .fill(CinemaTheme.border(settings.colorMode))
                 .frame(height: 1)
         }
     }
@@ -208,88 +231,28 @@ struct HomeView: View {
 
             Spacer()
 
-            scopeToggleButton(compact: true)
-            searchButton(compact: true)
+            ScopeToggleButton(enabled: $settings.scopeUIEnabled, compact: true)
+            NavActionButton(icon: "magnifyingglass", label: "Search", compact: true) { withAnimation { destination = .search } }
 
-            Button {
-                session.logout()
-            } label: {
-                HStack(spacing: 10) {
-                    Image(systemName: "rectangle.portrait.and.arrow.right")
-                        .font(.system(size: 15))
-                    Text("Sign Out")
-                        .font(.system(size: 16))
-                }
-                .foregroundStyle(.white.opacity(0.3))
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
+            NavActionButton(icon: "gearshape.fill", label: "Settings", compact: true) {
+                withAnimation { destination = .settings }
             }
-            .focusRingFree()
+            NavActionButton(icon: "rectangle.portrait.and.arrow.right", label: "Sign Out", compact: true) { session.logout() }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 24)
         .frame(width: CinemaTheme.navRailWidth)
-        .background(CinemaTheme.peacockDeep.opacity(0.5))
+        .background(CinemaTheme.surfaceNav(settings.colorMode))
         .overlay(alignment: .trailing) {
             Rectangle()
-                .fill(CinemaTheme.peacockLight.opacity(0.15))
+                .fill(CinemaTheme.border(settings.colorMode))
                 .frame(width: 1)
         }
     }
 
     // MARK: - Shared buttons
 
-    private func scopeToggleButton(compact: Bool) -> some View {
-        Button {
-            settings.scopeUIEnabled.toggle()
-        } label: {
-            HStack(spacing: 8) {
-                Image(systemName: settings.scopeUIEnabled ? "rectangle.inset.filled" : "rectangle")
-                    .font(.system(size: compact ? 15 : 17, weight: .medium))
-                Text("Scope UI")
-                    .font(.system(size: compact ? 16 : 17, weight: .medium))
-            }
-            .foregroundStyle(settings.scopeUIEnabled ? CinemaTheme.accentGold : .white.opacity(0.5))
-            .padding(.horizontal, compact ? 14 : 18)
-            .padding(.vertical,   compact ? 10 : 12)
-            .background(
-                settings.scopeUIEnabled ? CinemaTheme.peacockDeep.opacity(0.8) : Color.clear,
-                in: RoundedRectangle(cornerRadius: 10)
-            )
-            .overlay {
-                RoundedRectangle(cornerRadius: 10)
-                    .strokeBorder(
-                        settings.scopeUIEnabled ? CinemaTheme.accentGold.opacity(0.4) : Color.clear,
-                        lineWidth: 1
-                    )
-            }
-        }
-        .focusRingFree()
-    }
 
-    private func searchButton(compact: Bool) -> some View {
-        Button {
-            withAnimation { destination = .search }
-        } label: {
-            HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass")
-                    .font(.system(size: compact ? 15 : 18, weight: .medium))
-                Text("Search")
-                    .font(.system(size: compact ? 16 : 18, weight: .medium))
-            }
-            .foregroundStyle(.white.opacity(0.7))
-            .padding(.horizontal, compact ? 14 : 20)
-            .padding(.vertical,   compact ? 10 : 12)
-            .background(CinemaTheme.peacockDeep.opacity(0.5),
-                        in: RoundedRectangle(cornerRadius: 10))
-            .overlay {
-                RoundedRectangle(cornerRadius: 10)
-                    .strokeBorder(CinemaTheme.peacockLight.opacity(0.2), lineWidth: 1)
-            }
-        }
-        .focusRingFree()
-        .padding(.leading, compact ? 0 : 16)
-    }
 
     // MARK: - Content Area
 
@@ -316,8 +279,8 @@ struct HomeView: View {
         if store.isLoading {
             VStack(spacing: 20) {
                 Spacer()
-                ProgressView().progressViewStyle(.circular).tint(.white).scaleEffect(1.5)
-                Text("Loading library…").font(CinemaTheme.bodyFont).foregroundStyle(.white.opacity(0.5))
+                ProgressView().progressViewStyle(.circular).tint(CinemaTheme.accentGold).scaleEffect(1.5)
+                Text("Loading library…").font(CinemaTheme.bodyFont).foregroundStyle(CinemaTheme.secondary(settings.colorMode))
                 Spacer()
             }
             .frame(maxWidth: .infinity)
@@ -325,7 +288,7 @@ struct HomeView: View {
             VStack(spacing: 20) {
                 Spacer()
                 Image(systemName: "exclamationmark.triangle").font(.system(size: 48)).foregroundStyle(.yellow)
-                Text(error).foregroundStyle(.white.opacity(0.7)).multilineTextAlignment(.center)
+                Text(error).foregroundStyle(CinemaTheme.secondary(settings.colorMode)).multilineTextAlignment(.center)
                 Spacer()
             }
             .frame(maxWidth: .infinity).padding(60)
@@ -335,26 +298,25 @@ struct HomeView: View {
                     VStack(alignment: .leading, spacing: 6) {
                         Text("Good \(timeOfDay), \(session.user?.name ?? "")")
                             .font(.system(size: scopeMode ? 28 : 36, weight: .bold))
-                            .foregroundStyle(.white)
+                            .foregroundStyle(CinemaTheme.primary(settings.colorMode))
                         Text("What are we watching tonight?")
                             .font(.system(size: scopeMode ? 16 : 20))
-                            .foregroundStyle(CinemaTheme.peacockLight.opacity(0.8))
+                            .foregroundStyle(CinemaTheme.secondary(settings.colorMode))
                     }
 
-                    if !store.continueWatchingItems.isEmpty {
-                        MediaRow(title: "Continue Watching",     items: store.continueWatchingItems, session: session, cardSize: .wide,   scopeMode: scopeMode, onSelect: { showDetail($0) })
-                    }
-                    if !store.recentMovies.isEmpty {
-                        MediaRow(title: "Recently Added Movies", items: store.recentMovies,          session: session, cardSize: .poster, scopeMode: scopeMode, onSelect: { showDetail($0) })
-                    }
-                    if !store.recentShows.isEmpty {
-                        MediaRow(title: "Recently Added TV",     items: store.recentShows,           session: session, cardSize: .poster, scopeMode: scopeMode, onSelect: { showDetail($0) })
-                    }
-                    if !store.homeMovies.isEmpty {
-                        MediaRow(title: "Movies",                items: store.homeMovies,            session: session, cardSize: .poster, scopeMode: scopeMode, onSelect: { showDetail($0) })
-                    }
-                    if !store.homeShows.isEmpty {
-                        MediaRow(title: "TV Shows",              items: store.homeShows,             session: session, cardSize: .poster, scopeMode: scopeMode, onSelect: { showDetail($0) })
+                    ForEach(settings.homeRibbons.filter(\.enabled)) { ribbon in
+                        let items = store.ribbonItems[ribbon.type.id] ?? []
+                        if !items.isEmpty {
+                            MediaRow(
+                                title:     ribbon.type.displayName,
+                                items:     items,
+                                session:   session,
+                                cardSize:  ribbon.type.preferredCardSize,
+                                scopeMode: scopeMode,
+                                onSelect:  { showDetail($0) },
+                                onViewAll: viewAllAction(for: ribbon)
+                            )
+                        }
                     }
                 }
                 // Extra vertical padding so cards don't clip when scaled up
@@ -392,6 +354,18 @@ struct HomeView: View {
         }
     }
 
+    private func viewAllAction(for ribbon: HomeRibbon) -> (() -> Void)? {
+        switch ribbon.type {
+        case .movies, .recentMovies:      return { activeTab = .movies }
+        case .tvShows, .recentTV:         return { activeTab = .tvShows }
+        case .collections:                return { activeTab = .collections }
+        case .playlists:                  return { activeTab = .playlists }
+        case .continueWatching:           return nil
+        case .recommended:                return nil
+        case .genre:                      return nil
+        }
+    }
+
     private func play(_ item: EmbyItem) {
         guard let server = session.server,
               let user   = session.user,
@@ -401,13 +375,31 @@ struct HomeView: View {
                 let url = try await EmbyAPI.playbackURL(
                     server: server, userId: user.id, token: token, itemId: item.id
                 )
+                let resumeTicks = item.userData?.playbackPositionTicks ?? 0
                 await MainActor.run {
-                    engine.load(url: url)
+                    engine.setReportingContext(server: server, userId: user.id, token: token, itemId: item.id)
+                    engine.load(url: url, startTicks: resumeTicks)
                     withAnimation { destination = .player(item) }
                 }
-            } catch {
-                print("[HomeView] Playback error: \(error)")
-            }
+            } catch { print("[HomeView] Playback error: \(error)") }
+        }
+    }
+
+    private func restart(_ item: EmbyItem) {
+        guard let server = session.server,
+              let user   = session.user,
+              let token  = session.token else { return }
+        Task {
+            do {
+                let url = try await EmbyAPI.playbackURL(
+                    server: server, userId: user.id, token: token, itemId: item.id
+                )
+                await MainActor.run {
+                    engine.setReportingContext(server: server, userId: user.id, token: token, itemId: item.id)
+                    engine.load(url: url, startTicks: 0)
+                    withAnimation { destination = .player(item) }
+                }
+            } catch { print("[HomeView] Restart error: \(error)") }
         }
     }
 }
@@ -421,12 +413,12 @@ struct NavTabButton: View {
     let compact:  Bool
     let onTap:    () -> Void
 
+    @EnvironmentObject var settings: AppSettings
     @FocusState private var isFocused: Bool
 
     var body: some View {
-        Button {
-            onTap()
-        } label: {
+        let mode = settings.colorMode
+        Button { onTap() } label: {
             HStack(spacing: 8) {
                 Image(systemName: tab.icon)
                     .font(.system(size: compact ? 15 : 16,
@@ -434,26 +426,35 @@ struct NavTabButton: View {
                 Text(tab.rawValue)
                     .font(.system(size: compact ? 16 : 18,
                                   weight: isActive ? .semibold : .regular))
+                    .lineLimit(1).minimumScaleFactor(0.8).truncationMode(.tail)
                 if compact { Spacer() }
             }
-            .foregroundStyle(isActive
-                ? CinemaTheme.accentGold
-                : .white.opacity(isFocused ? 0.9 : 0.55))
+            .foregroundStyle(
+                isActive  ? CinemaTheme.navActive(mode) :
+                isFocused ? CinemaTheme.primary(mode)   :
+                            CinemaTheme.secondary(mode)
+            )
+            .scaleEffect(isFocused ? 1.04 : 1.0, anchor: .leading)
             .padding(.horizontal, compact ? 14 : 20)
             .padding(.vertical,   compact ? 10 : 12)
             .frame(maxWidth: compact ? .infinity : nil, alignment: .leading)
             .background(
                 RoundedRectangle(cornerRadius: 10)
-                    .fill(isActive
-                        ? CinemaTheme.peacockDeep.opacity(0.7)
-                        : (isFocused ? CinemaTheme.peacock.opacity(0.3) : Color.clear))
+                    .fill(
+                        isActive  ? CinemaTheme.surfaceNav(mode).opacity(mode == .light ? 1 : 0.8) :
+                        isFocused ? CinemaTheme.surfaceRaised(mode)                                 :
+                                    Color.clear
+                    )
                     .overlay {
                         RoundedRectangle(cornerRadius: 10)
                             .strokeBorder(
-                                isActive ? CinemaTheme.accentGold.opacity(0.4) : Color.clear,
-                                lineWidth: 1)
+                                isActive  ? CinemaTheme.navActive(mode).opacity(0.5) :
+                                isFocused ? CinemaTheme.border(mode)                  :
+                                            Color.clear,
+                                lineWidth: isActive ? 1.5 : 1)
                     }
             )
+            .animation(.spring(response: 0.25, dampingFraction: 0.7), value: isFocused)
         }
         .focusRingFree()
         .focused($isFocused)
@@ -469,15 +470,16 @@ struct MediaRow: View {
     let cardSize:  CardSize
     let scopeMode: Bool
     let onSelect:  (EmbyItem) -> Void
+    var onViewAll: (() -> Void)? = nil
+
+    @EnvironmentObject var settings: AppSettings
 
     var body: some View {
         VStack(alignment: .leading, spacing: CinemaTheme.sectionSpacing) {
             Text(title)
                 .font(scopeMode ? .system(size: 20, weight: .semibold) : CinemaTheme.sectionFont)
-                .foregroundStyle(.white.opacity(0.8))
+                .foregroundStyle(CinemaTheme.secondary(settings.colorMode))
 
-            // Vertical padding inside the scroll view gives room for
-            // the scale-up glow to breathe without clipping
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: scopeMode ? 20 : CinemaTheme.cardSpacing) {
                     ForEach(items) { item in
@@ -488,13 +490,91 @@ struct MediaRow: View {
                             scopeMode: scopeMode
                         ) { onSelect(item) }
                     }
+                    // View All card at end of ribbon
+                    if let viewAll = onViewAll {
+                        ViewAllCard(cardSize: cardSize, scopeMode: scopeMode, onTap: viewAll)
+                    }
                 }
-                .padding(.vertical, 20)  // room for glow + scale without clipping
+                .padding(.vertical, 20)
                 .padding(.horizontal, 4)
             }
-            // CRITICAL: disable clipping so scaled cards aren't cut off
             .clipped(antialiased: false)
         }
+    }
+}
+
+// MARK: - ViewAllCard
+
+struct ViewAllCard: View {
+    let cardSize:  CardSize
+    let scopeMode: Bool
+    let onTap:     () -> Void
+    @FocusState private var isFocused: Bool
+
+    private var cardWidth: CGFloat {
+        switch (cardSize, scopeMode) {
+        case (.poster, false): return CinemaTheme.standardCardWidth
+        case (.poster, true):  return CinemaTheme.scopeCardWidth
+        case (.wide,   false): return 320
+        case (.wide,   true):  return 220
+        case (.thumb,  false): return 360
+        case (.thumb,  true):  return 250
+        }
+    }
+    private var cardHeight: CGFloat {
+        switch (cardSize, scopeMode) {
+        case (.poster, false): return CinemaTheme.standardCardHeight
+        case (.poster, true):  return CinemaTheme.scopeCardHeight
+        case (.wide,   false): return 180
+        case (.wide,   true):  return 124
+        case (.thumb,  false): return 203   // 16:9 of 360
+        case (.thumb,  true):  return 141   // 16:9 of 250
+        }
+    }
+
+    var body: some View {
+        Button(action: onTap) {
+            VStack(alignment: .leading, spacing: 10) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(
+                            isFocused
+                                ? CinemaTheme.peacock.opacity(0.5)
+                                : CinemaTheme.peacockDeep.opacity(0.6)
+                        )
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 8)
+                                .strokeBorder(
+                                    isFocused
+                                        ? LinearGradient(colors: [CinemaTheme.accentGold, CinemaTheme.teal.opacity(0.7)],
+                                                         startPoint: .topLeading, endPoint: .bottomTrailing)
+                                        : LinearGradient(colors: [CinemaTheme.peacockLight.opacity(0.3)],
+                                                         startPoint: .top, endPoint: .bottom),
+                                    lineWidth: isFocused ? 2 : 1
+                                )
+                        }
+                    VStack(spacing: 12) {
+                        Image(systemName: "rectangle.grid.2x2")
+                            .font(.system(size: scopeMode ? 22 : 32, weight: .light))
+                            .foregroundStyle(isFocused ? CinemaTheme.accentGold : .white.opacity(0.5))
+                        Text("View All")
+                            .font(.system(size: scopeMode ? 13 : 16, weight: .semibold))
+                            .foregroundStyle(isFocused ? .white : .white.opacity(0.6))
+                    }
+                }
+                .frame(width: cardWidth, height: cardHeight)
+                .scaleEffect(isFocused ? 1.06 : 1.0, anchor: .bottom)
+                .shadow(color: isFocused ? CinemaTheme.accentGold.opacity(0.4) : .clear, radius: 20, x: 0, y: 10)
+                .animation(.spring(response: 0.28, dampingFraction: 0.68), value: isFocused)
+
+                Text("View All")
+                    .font(.system(size: scopeMode ? 13 : 16, weight: .semibold))
+                    .foregroundStyle(isFocused ? .white : .white.opacity(0.6))
+                    .frame(width: cardWidth, alignment: .leading)
+            }
+        }
+        .focusRingFree()
+        .focused($isFocused)
     }
 }
 
@@ -507,6 +587,7 @@ struct MediaCard: View {
     let scopeMode: Bool
     let onTap:     () -> Void
 
+    @EnvironmentObject var settings: AppSettings
     @FocusState private var isFocused: Bool
 
     private var cardWidth: CGFloat {
@@ -516,19 +597,30 @@ struct MediaCard: View {
     }
 
     private var cardHeight: CGFloat {
-        scopeMode
-            ? (cardSize == .poster ? CinemaTheme.scopeCardHeight : 135)
-            : (cardSize == .poster ? CinemaTheme.standardCardHeight : 180)
+        switch (cardSize, scopeMode) {
+        case (.poster, false): return CinemaTheme.standardCardHeight
+        case (.poster, true):  return CinemaTheme.scopeCardHeight
+        case (.wide,   false): return 180
+        case (.wide,   true):  return 124
+        case (.thumb,  false): return 203
+        case (.thumb,  true):  return 141
+        }
     }
 
     private var posterURL: URL? {
-        guard let server = session.server,
-              let tag    = item.imageTags?.primary
-        else { return nil }
-        return EmbyAPI.primaryImageURL(
-            server: server, itemId: item.id, tag: tag,
-            width: Int(cardWidth * 2)
-        )
+        guard let server = session.server else { return nil }
+        let w = Int(cardWidth * 2)
+        if cardSize == .thumb {
+            // Prefer Thumb image, fall back to first backdrop, then primary
+            if let tag = item.imageTags?.thumb {
+                return EmbyAPI.thumbImageURL(server: server, itemId: item.id, tag: tag, width: w)
+            }
+            if let tag = item.backdropImageTags?.first {
+                return EmbyAPI.backdropImageURL(server: server, itemId: item.id, tag: tag, width: w)
+            }
+        }
+        guard let tag = item.imageTags?.primary else { return nil }
+        return EmbyAPI.primaryImageURL(server: server, itemId: item.id, tag: tag, width: w)
     }
 
     var body: some View {
@@ -554,26 +646,38 @@ struct MediaCard: View {
                         progressBar(ticks: ticks, total: total)
                     }
                 }
-                // Scale and glow — no card button style, no grey box
-                .scaleEffect(isFocused ? 1.06 : 1.0, anchor: .center)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8)
+                        .strokeBorder(
+                            isFocused
+                                ? CinemaTheme.focusRimGradient(settings.colorMode)
+                                : LinearGradient(colors: [.clear], startPoint: .top, endPoint: .bottom),
+                            lineWidth: isFocused ? 2.5 : 0
+                        )
+                }
+                .scaleEffect(isFocused ? 1.06 : 1.0, anchor: .bottom)
                 .shadow(
-                    color: isFocused
-                        ? CinemaTheme.accentGold.opacity(0.55)
-                        : .clear,
-                    radius: 20, x: 0, y: 8
+                    color: isFocused ? CinemaTheme.focusAccent(settings.colorMode).opacity(0.5) : .clear,
+                    radius: 24, x: 0, y: 12
                 )
-                .animation(.spring(response: 0.3, dampingFraction: 0.7), value: isFocused)
+                .shadow(
+                    color: isFocused ? CinemaTheme.focusGlow(settings.colorMode) : .clear,
+                    radius: 12, x: 0, y: 4
+                )
+                .animation(.spring(response: 0.28, dampingFraction: 0.68), value: isFocused)
 
                 // Title
                 VStack(alignment: .leading, spacing: 4) {
                     Text(item.name)
                         .font(.system(size: scopeMode ? 13 : 16, weight: .semibold))
-                        .foregroundStyle(isFocused ? .white : .white.opacity(0.75))
+                        .foregroundStyle(isFocused
+                            ? CinemaTheme.primary(settings.colorMode)
+                            : CinemaTheme.secondary(settings.colorMode))
                         .lineLimit(2)
                     if let year = item.productionYear {
                         Text("\(year)")
                             .font(.system(size: scopeMode ? 11 : 13))
-                            .foregroundStyle(CinemaTheme.peacockLight.opacity(0.65))
+                            .foregroundStyle(CinemaTheme.tertiary(settings.colorMode))
                     }
                 }
                 .frame(width: cardWidth, alignment: .leading)
@@ -586,7 +690,7 @@ struct MediaCard: View {
 
     private var cardPlaceholder: some View {
         ZStack {
-            RoundedRectangle(cornerRadius: 8).fill(CinemaTheme.cardGradient)
+            RoundedRectangle(cornerRadius: 8).fill(CinemaTheme.cardGradient(settings.colorMode))
             VStack(spacing: 8) {
                 Image(systemName: item.type == "Series" ? "tv" : "film")
                     .font(.system(size: scopeMode ? 22 : 32))
@@ -615,5 +719,98 @@ struct MediaCard: View {
         .frame(height: 4)
         .padding(.horizontal, 6)
         .padding(.bottom, 8)
+    }
+}
+
+// MARK: - ScopeToggleButton
+
+struct ScopeToggleButton: View {
+    @Binding var enabled: Bool
+    let compact: Bool
+    @EnvironmentObject var settings: AppSettings
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        let mode = settings.colorMode
+        Button { enabled.toggle() } label: {
+            HStack(spacing: 8) {
+                Image(systemName: enabled ? "rectangle.inset.filled" : "rectangle")
+                    .font(.system(size: compact ? 15 : 17, weight: .medium))
+                Text("Scope UI")
+                    .font(.system(size: compact ? 16 : 17, weight: .medium))
+                    .lineLimit(1).minimumScaleFactor(0.8)
+                if compact { Spacer() }
+            }
+            .foregroundStyle(
+                enabled   ? CinemaTheme.navActive(mode) :
+                isFocused ? CinemaTheme.primary(mode)   :
+                            CinemaTheme.secondary(mode)
+            )
+            .scaleEffect(isFocused ? 1.04 : 1.0, anchor: .leading)
+            .padding(.horizontal, compact ? 14 : 18)
+            .padding(.vertical,   compact ? 10 : 12)
+            .frame(maxWidth: compact ? .infinity : nil, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(
+                        enabled   ? CinemaTheme.surfaceNav(mode) :
+                        isFocused ? CinemaTheme.surfaceRaised(mode) :
+                                    Color.clear
+                    )
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 10)
+                            .strokeBorder(
+                                enabled   ? CinemaTheme.navActive(mode).opacity(0.5) :
+                                isFocused ? CinemaTheme.border(mode)                  :
+                                            Color.clear,
+                                lineWidth: enabled ? 1.5 : 1
+                            )
+                    }
+            )
+            .animation(.spring(response: 0.25, dampingFraction: 0.7), value: isFocused)
+        }
+        .focusRingFree()
+        .focused($isFocused)
+    }
+}
+
+// MARK: - NavActionButton
+
+struct NavActionButton: View {
+    let icon:    String
+    let label:   String
+    let compact: Bool
+    let action:  () -> Void
+    @EnvironmentObject var settings: AppSettings
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        let mode = settings.colorMode
+        Button { action() } label: {
+            HStack(spacing: 8) {
+                Image(systemName: icon)
+                    .font(.system(size: compact ? 15 : 18, weight: .medium))
+                Text(label)
+                    .font(.system(size: compact ? 16 : 18, weight: .medium))
+                    .lineLimit(1)
+                if compact { Spacer() }
+            }
+            .foregroundStyle(isFocused ? CinemaTheme.primary(mode) : CinemaTheme.secondary(mode))
+            .scaleEffect(isFocused ? 1.04 : 1.0, anchor: .leading)
+            .padding(.horizontal, compact ? 14 : 20)
+            .padding(.vertical,   compact ? 10 : 12)
+            .frame(maxWidth: compact ? .infinity : nil, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(isFocused ? CinemaTheme.surfaceRaised(mode) : CinemaTheme.surfaceNav(mode).opacity(0.6))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 10)
+                            .strokeBorder(CinemaTheme.border(mode), lineWidth: 1)
+                    }
+            )
+            .animation(.spring(response: 0.25, dampingFraction: 0.7), value: isFocused)
+        }
+        .focusRingFree()
+        .focused($isFocused)
     }
 }

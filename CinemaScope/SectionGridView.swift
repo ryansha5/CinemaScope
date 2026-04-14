@@ -44,7 +44,7 @@ struct SectionGridView: View {
                             .font(settings.scopeUIEnabled
                                   ? .system(size: 28, weight: .bold)
                                   : CinemaTheme.titleFont)
-                            .foregroundStyle(.white)
+                            .foregroundStyle(CinemaTheme.primary(settings.colorMode))
                             .padding(.top, settings.scopeUIEnabled ? 24 : 60)
 
                         LazyVGrid(columns: columns,
@@ -77,6 +77,7 @@ struct GridCard: View {
     let scopeMode: Bool
     let onTap:     () -> Void
 
+    @EnvironmentObject var settings: AppSettings
     @FocusState private var isFocused: Bool
 
     private var posterURL: URL? {
@@ -108,23 +109,35 @@ struct GridCard: View {
                 .overlay {
                     RoundedRectangle(cornerRadius: scopeMode ? 6 : 10)
                         .strokeBorder(
-                            isFocused ? CinemaTheme.accentGold : Color.clear,
-                            lineWidth: 3
+                            isFocused
+                                ? CinemaTheme.focusRimGradient(settings.colorMode)
+                                : LinearGradient(colors: [.clear], startPoint: .top, endPoint: .bottom),
+                            lineWidth: isFocused ? 2.5 : 0
                         )
                 }
-                .scaleEffect(isFocused ? 1.04 : 1.0, anchor: .center)
-                .animation(.spring(response: 0.25, dampingFraction: 0.75), value: isFocused)
+                .scaleEffect(isFocused ? 1.05 : 1.0, anchor: .bottom)
+                .shadow(
+                    color: isFocused ? CinemaTheme.focusAccent(settings.colorMode) : .clear,
+                    radius: 24, x: 0, y: 12
+                )
+                .shadow(
+                    color: isFocused ? CinemaTheme.focusGlow(settings.colorMode) : .clear,
+                    radius: 10, x: 0, y: 3
+                )
+                .animation(.spring(response: 0.28, dampingFraction: 0.68), value: isFocused)
 
                 Text(item.name)
                     .font(.system(size: scopeMode ? 10 : 16, weight: .semibold))
-                    .foregroundStyle(isFocused ? .white : .white.opacity(0.75))
+                    .foregroundStyle(isFocused
+                        ? CinemaTheme.primary(settings.colorMode)
+                        : CinemaTheme.secondary(settings.colorMode))
                     .lineLimit(2)
                     .animation(.easeOut(duration: 0.15), value: isFocused)
 
                 if let year = item.productionYear {
                     Text("\(year)")
                         .font(.system(size: scopeMode ? 9 : 13))
-                        .foregroundStyle(CinemaTheme.peacockLight.opacity(0.65))
+                        .foregroundStyle(CinemaTheme.tertiary(settings.colorMode))
                 }
             }
         }
@@ -135,7 +148,7 @@ struct GridCard: View {
     private var placeholderIcon: some View {
         ZStack {
             RoundedRectangle(cornerRadius: scopeMode ? 6 : 10)
-                .fill(CinemaTheme.cardGradient)
+                .fill(CinemaTheme.cardGradient(settings.colorMode))
             VStack(spacing: 8) {
                 Image(systemName: iconName)
                     .font(.system(size: scopeMode ? 18 : 28))
