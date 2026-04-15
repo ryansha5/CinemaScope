@@ -228,7 +228,6 @@ struct DetailView: View {
             if displayItem.type == "Episode" && !collectionItems.isEmpty {
                 moreEpisodesSection(scopeMode: scopeMode)
                     .padding(.leading, pad)
-                    .focusSection()
             // ── Collection siblings (movies/shows) ──
             } else if displayItem.type != "Episode" && !collectionItems.isEmpty {
                 collectionSection(scopeMode: scopeMode)
@@ -691,7 +690,6 @@ struct DetailView: View {
 
                 BackButton(colorMode: settings.colorMode, scopeMode: scopeMode, onTap: onBack)
             }
-            .focusSection()
             .onAppear { focusedButton = .play }
 
             // ── Next episode context line for Series ──
