@@ -22,6 +22,8 @@ struct DetailView: View {
     // Episode detail — all seasons for the series (drives the season picker in More Episodes)
     @State private var episodeSeasons:       [EmbyItem]  = []
     @State private var selectedEpisodeSeason: EmbyItem?  = nil
+    // Collection detail — name of the parent BoxSet (e.g. "Marvel Cinematic Universe")
+    @State private var collectionName:       String?     = nil
 
     enum DetailFocus { case play, restart, trailer }
     @FocusState private var focusedButton: DetailFocus?
@@ -589,18 +591,60 @@ struct DetailView: View {
     }
 
     private func collectionSection(scopeMode: Bool) -> some View {
-        let title = displayItem.studios?.first?.name ?? "Also in this collection"
-        return VStack(alignment: .leading, spacing: 14) {
-            Text("More Like This")
+        let others   = collectionItems.filter { $0.id != displayItem.id }
+        let movies   = others.filter { $0.type == "Movie"  }
+        let tvShows  = others.filter { $0.type == "Series" }
+        // Items that are neither Movie nor Series (rare) fall into whichever bucket is bigger
+        let overflow = others.filter { $0.type != "Movie" && $0.type != "Series" }
+        let hasBoth  = !movies.isEmpty && !tvShows.isEmpty
+
+        let heading  = collectionName.map { "Also in the \($0)" } ?? "Also in this collection"
+
+        return VStack(alignment: .leading, spacing: hasBoth ? 24 : 14) {
+            Text(heading)
                 .font(.system(size: scopeMode ? 18 : 22, weight: .semibold))
                 .foregroundStyle(CinemaTheme.primary(settings.colorMode))
 
+            // ── Movies ribbon ──
+            if !movies.isEmpty {
+                collectionRibbon(
+                    items:     movies + (hasBoth ? [] : overflow),
+                    sublabel:  hasBoth ? "Movies" : nil,
+                    scopeMode: scopeMode
+                )
+            }
+
+            // ── TV Shows ribbon ──
+            if !tvShows.isEmpty {
+                collectionRibbon(
+                    items:     tvShows + (hasBoth ? overflow : []),
+                    sublabel:  hasBoth ? "TV Shows" : nil,
+                    scopeMode: scopeMode
+                )
+            }
+
+            // Edge case: collection contains only non-Movie/Series items
+            if movies.isEmpty && tvShows.isEmpty && !overflow.isEmpty {
+                collectionRibbon(items: overflow, sublabel: nil, scopeMode: scopeMode)
+            }
+        }
+        .opacity(loadingCollection ? 0 : 1)
+        .animation(.easeIn(duration: 0.3), value: loadingCollection)
+    }
+
+    private func collectionRibbon(items: [EmbyItem], sublabel: String?, scopeMode: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if let sublabel {
+                Text(sublabel)
+                    .font(.system(size: scopeMode ? 13 : 15, weight: .semibold))
+                    .foregroundStyle(CinemaTheme.secondary(settings.colorMode))
+            }
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: scopeMode ? 16 : 24) {
-                    ForEach(collectionItems.filter { $0.id != displayItem.id }) { related in
-                        CollectionItemCard(item: related, session: session,
+                    ForEach(items) { item in
+                        CollectionItemCard(item: item, session: session,
                                           scopeMode: scopeMode, colorMode: settings.colorMode) {
-                            onNavigate(related)
+                            onNavigate(item)
                         }
                     }
                 }
@@ -609,8 +653,6 @@ struct DetailView: View {
             }
             .clipped(antialiased: false)
         }
-        .opacity(loadingCollection ? 0 : 1)
-        .animation(.easeIn(duration: 0.3), value: loadingCollection)
     }
 
     // MARK: - Action buttons
@@ -886,16 +928,17 @@ struct DetailView: View {
             mediaInfo = info
         }
 
-        // Step 4: Load collection siblings for movies/shows.
+        // Step 4: Load collection siblings + collection name for movies/shows.
         // Skip for Episodes — their siblings were loaded correctly in Step 2a
         // and we don't want to overwrite them with unordered fetchCollectionItems results.
         let resolvedType = detail?.type ?? item.type
         if resolvedType != "Episode", let pid = detail?.parentId, !pid.isEmpty {
             loadingCollection = true
-            if let siblings = try? await EmbyAPI.fetchCollectionItems(
-                server: server, userId: user.id, token: token, collectionId: pid) {
-                collectionItems   = siblings
-            }
+            // Fetch siblings and the BoxSet name in parallel
+            async let nameLoad     = EmbyAPI.fetchItemDetail(server: server, userId: user.id, token: token, itemId: pid)
+            async let siblingsLoad = EmbyAPI.fetchCollectionItems(server: server, userId: user.id, token: token, collectionId: pid)
+            collectionName  = (try? await nameLoad)?.name
+            collectionItems = (try? await siblingsLoad) ?? []
             loadingCollection = false
         }
 
