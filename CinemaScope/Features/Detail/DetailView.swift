@@ -565,23 +565,40 @@ struct DetailView: View {
             }
 
             // ── Episode thumb ribbon ──
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: scopeMode ? 16 : 24) {
-                    ForEach(collectionItems.filter { $0.type == "Episode" }) { ep in
-                        EpisodeThumbCard(
-                            episode:   ep,
-                            session:   session,
-                            scopeMode: scopeMode,
-                            colorMode: settings.colorMode,
-                            isCurrent: ep.id == displayItem.id
-                        ) { onNavigate(ep) }
+            // ScrollViewReader lets us jump to the current episode (or ep 1
+            // when the user switches to a different season).
+            ScrollViewReader { proxy in
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: scopeMode ? 16 : 24) {
+                        ForEach(collectionItems.filter { $0.type == "Episode" }) { ep in
+                            EpisodeThumbCard(
+                                episode:   ep,
+                                session:   session,
+                                scopeMode: scopeMode,
+                                colorMode: settings.colorMode,
+                                isCurrent: ep.id == displayItem.id
+                            ) { onNavigate(ep) }
+                            .id(ep.id)   // anchor for scrollTo
+                        }
+                    }
+                    .padding(.vertical, 8)
+                    .padding(.trailing, scopeMode ? 28 : 80)
+                }
+                .clipped(antialiased: false)
+                // When collectionItems changes (initial load or season switch),
+                // scroll to the current episode if it's present; otherwise
+                // scroll to the first episode so the new season starts at ep 1.
+                .onChange(of: collectionItems) { episodes in
+                    let targetId = episodes.first(where: { $0.id == displayItem.id })?.id
+                                   ?? episodes.first?.id
+                    guard let targetId else { return }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                        withAnimation(.easeInOut(duration: 0.35)) {
+                            proxy.scrollTo(targetId, anchor: .center)
+                        }
                     }
                 }
-                .padding(.vertical, 8)
-                .padding(.trailing, scopeMode ? 28 : 80)
             }
-            .clipped(antialiased: false)
-            .id(selectedEpisodeSeason?.id ?? "")   // reset scroll position when season changes
         }
         .opacity(loadingCollection ? 0 : 1)
         .animation(.easeIn(duration: 0.25), value: loadingCollection)
