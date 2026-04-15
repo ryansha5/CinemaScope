@@ -409,7 +409,7 @@ actor EmbyAPI {
     static func playbackURL(
         server: EmbyServer, userId: String, token: String,
         itemId: String, itemName: String = ""
-    ) async throws -> URL {
+    ) async throws -> PlaybackResult {
 
         // ── Step 1: Fetch PlaybackInfo ──────────────────────────────
         var infoComps = try urlComponents(server, path: "/Items/\(itemId)/PlaybackInfo")
@@ -421,6 +421,10 @@ actor EmbyAPI {
                                                        body: appleTVDeviceProfile(),
                                                        token: token))
         guard let source = info.mediaSources.first else { throw EmbyError.noMediaSource }
+
+        // Capture the Emby-assigned session ID. Falls back to a local UUID only
+        // if the server is very old and doesn't return one.
+        let playSessionId = info.playSessionId ?? UUID().uuidString
 
         // ── Step 2: Gather facts from PlaybackInfo ──────────────────
         let container          = source.container ?? "unknown"
@@ -461,7 +465,8 @@ actor EmbyAPI {
             case noDirectPath           = "Emby did not provide a direct-play or direct-stream path"
         }
 
-        var chosenPath  = "transcode"
+        var chosenPath   = "transcode"
+        var playMethod   = "Transcode"          // Emby PlayMethod value for reporting
         var reason: Reason = .noDirectPath
         var finalURL: URL? = nil
 
@@ -502,6 +507,7 @@ actor EmbyAPI {
             ]
             if let url = comps.url {
                 chosenPath = "direct-play"
+                playMethod = "DirectPlay"
                 reason     = .embySaysDPManualPath
                 finalURL   = url
                 print("[Playback] direct-play: source=manual-path (Emby authorised, no explicit DP URL in PlaybackInfo), length=\(url.absoluteString.count)")
@@ -516,6 +522,7 @@ actor EmbyAPI {
                 let flagNote = supportsDS == true ? "supportsDirectStream=true" : "supportsDirectStream=\(supportsDS.map{"\($0)"} ?? "nil") (trusting URL)"
                 if let url = resolveEmbyURL(dsUrl, label: "direct-stream (\(flagNote))") {
                     chosenPath = "direct-stream"
+                    playMethod = "DirectStream"
                     reason     = supportsDS == true ? .embySaysDS : .embyDSUrlOnly
                     finalURL   = url
                 }
@@ -597,14 +604,21 @@ actor EmbyAPI {
 [Playback] Emby TranscodingUrl:  \(embyTranscodeUrl.map { String($0.prefix(80)) } ?? "nil")
 [Playback] Codec check:          \(codecsSafe ? "✅ safe" : "⚠️ unsafe — codec(s) not in AVPlayer whitelist")
 [Playback] ─────────────────────────────────────────
-[Playback] Path chosen:          \(chosenPath)
+[Playback] Path chosen:          \(chosenPath)  (\(playMethod))
+[Playback] PlaySessionId:        \(playSessionId)
+[Playback] MediaSourceId:        \(source.id)
 [Playback] Reason:               \(reason.rawValue)
 [Playback] URL source:           \(isManual ? "⚠️ MANUALLY CONSTRUCTED" : "✅ from PlaybackInfo")
 [Playback] Final URL length:     \(url.absoluteString.count) chars
 [Playback] ══════════════════════════════════════════
 """)
 
-        return url
+        return PlaybackResult(
+            url:           url,
+            playSessionId: playSessionId,
+            mediaSourceId: source.id,
+            playMethod:    playMethod
+        )
     }
 
 
@@ -612,10 +626,15 @@ actor EmbyAPI {
     // MARK: - Device Profile
 
     private static func appleTVDeviceProfile() -> [String: Any] {
+        // Transcoding protocol is HLS (not HTTP progressive).
+        // HLS lets AVPlayer start on the first segment while the rest encode,
+        // which is why direct-play works instantly but HTTP progressive
+        // transcodes stall or fail on most files — the encode has to get far
+        // enough ahead before AVPlayer receives any data.
         let json = """
         {
             "DeviceProfile": {
-                "Name": "CinemaScope Apple TV 4K",
+                "Name": "Pinea Apple TV 4K",
                 "MaxStreamingBitrate": 120000000,
                 "DirectPlayProfiles": [
                     {
@@ -628,12 +647,14 @@ actor EmbyAPI {
                 "TranscodingProfiles": [
                     {
                         "Type": "Video",
-                        "Container": "mp4",
+                        "Container": "ts",
                         "VideoCodec": "h264",
                         "AudioCodec": "aac,ac3",
-                        "Protocol": "http",
+                        "Protocol": "hls",
                         "Context": "Streaming",
-                        "MaxAudioChannels": "6"
+                        "MaxAudioChannels": "6",
+                        "BreakOnNonKeyFrames": true,
+                        "MinSegments": 1
                     }
                 ],
                 "ContainerProfiles": [],
@@ -658,8 +679,8 @@ actor EmbyAPI {
 
     static func forcedTranscodeURL(
         server: EmbyServer, userId: String, token: String, itemId: String
-    ) async throws -> URL {
-        // Re-fetch PlaybackInfo to get a fresh transcode session
+    ) async throws -> PlaybackResult {
+        // Re-fetch PlaybackInfo to get a fresh HLS transcode session
         var infoComps = try urlComponents(server, path: "/Items/\(itemId)/PlaybackInfo")
         infoComps.queryItems = [.init(name: "UserId", value: userId)]
         guard let infoURL = infoComps.url else { throw EmbyError.invalidURL }
@@ -669,6 +690,8 @@ actor EmbyAPI {
                                                        body: appleTVDeviceProfile(),
                                                        token: token))
         guard let source = info.mediaSources.first else { throw EmbyError.noMediaSource }
+
+        let playSessionId = info.playSessionId ?? UUID().uuidString
 
         // Priority 1: Use Emby's TranscodingUrl exactly — preserve all params,
         // only append api_key if missing. Never rewrite or reconstruct.
@@ -681,20 +704,20 @@ actor EmbyAPI {
                 if !hadApiKey { items.append(.init(name: "api_key", value: token)) }
                 comps.queryItems = items
                 if let url = comps.url {
-                    print("[Playback] 🆘 forcedTranscode: source=PlaybackInfo, wasRelative=\(wasRelative), apiKeyAppended=\(!hadApiKey), length=\(url.absoluteString.count)")
-                    return url
+                    print("[Playback] 🆘 forcedTranscode: source=PlaybackInfo, playSessionId=\(playSessionId), wasRelative=\(wasRelative), length=\(url.absoluteString.count)")
+                    return PlaybackResult(url: url, playSessionId: playSessionId, mediaSourceId: source.id, playMethod: "Transcode")
                 }
             }
         }
 
-        // Priority 2: EMERGENCY manual fallback — only if Emby gave no TranscodingUrl.
-        // Params per spec: h264/aac+ac3, 8Mbps, 192k audio, 6ch, 1080p max.
-        print("[Playback] 🚨 forcedTranscode EMERGENCY: no Emby TranscodingUrl — constructing manual fallback")
-        var comps = try urlComponents(server, path: "/Videos/\(itemId)/stream.mp4")
+        // Priority 2: EMERGENCY manual HLS fallback — only if Emby gave no TranscodingUrl.
+        print("[Playback] 🚨 forcedTranscode EMERGENCY: no Emby TranscodingUrl — constructing manual HLS fallback")
+        var comps = try urlComponents(server, path: "/Videos/\(itemId)/master.m3u8")
         comps.queryItems = [
             .init(name: "MediaSourceId",   value: source.id),
             .init(name: "api_key",         value: token),
-            .init(name: "DeviceId",        value: "CinemaScope-AppleTV"),
+            .init(name: "DeviceId",        value: "cinemascope-appletv"),
+            .init(name: "PlaySessionId",   value: playSessionId),
             .init(name: "VideoCodec",      value: "h264"),
             .init(name: "AudioCodec",      value: "aac,ac3"),
             .init(name: "MaxVideoBitrate", value: "8000000"),
@@ -702,11 +725,10 @@ actor EmbyAPI {
             .init(name: "AudioChannels",   value: "6"),
             .init(name: "MaxWidth",        value: "1920"),
             .init(name: "MaxHeight",       value: "1080"),
-            .init(name: "Static",          value: "false"),
         ]
         guard let url = comps.url else { throw EmbyError.invalidURL }
-        print("[Playback] 🚨 forcedTranscode manual fallback: length=\(url.absoluteString.count)")
-        return url
+        print("[Playback] 🚨 forcedTranscode manual HLS fallback: length=\(url.absoluteString.count)")
+        return PlaybackResult(url: url, playSessionId: playSessionId, mediaSourceId: source.id, playMethod: "Transcode")
     }
 
     // MARK: - Image URLs
@@ -736,52 +758,71 @@ actor EmbyAPI {
     //   playbackProgress — called periodically (every ~10s) while playing
     //   playbackStop   — called when user exits, with final position
 
+    // ─────────────────────────────────────────────────────────────────
+    // MARK: - Playback Reporting
+    //
+    // All three endpoints expect a JSON POST body — NOT query parameters.
+    // The PlaySessionId must match the one Emby returned in PlaybackInfo
+    // so the server can associate reports with the active transcode job.
+    // PlayMethod must reflect the actual path chosen (DirectPlay / DirectStream
+    // / Transcode) so Emby's statistics and "Now Playing" dashboard are correct.
+    // ─────────────────────────────────────────────────────────────────
+
     static func reportPlaybackStart(
         server: EmbyServer, userId: String, token: String,
-        itemId: String, sessionId: String
+        itemId: String, mediaSourceId: String,
+        playSessionId: String, playMethod: String
     ) async {
-        guard var comps = try? urlComponents(server, path: "/Sessions/Playing") else { return }
-        comps.queryItems = [
-            .init(name: "ItemId",     value: itemId),
-            .init(name: "SessionId",  value: sessionId),
-            .init(name: "UserId",     value: userId),
-            .init(name: "PlayMethod", value: "DirectStream"),
+        guard let url = try? urlComponents(server, path: "/Sessions/Playing").url else { return }
+        let body: [String: Any] = [
+            "ItemId":          itemId,
+            "MediaSourceId":   mediaSourceId,
+            "PlaySessionId":   playSessionId,
+            "UserId":          userId,
+            "PlayMethod":      playMethod,
+            "PositionTicks":   0,
+            "CanSeek":         true,
+            "IsPaused":        false,
+            "IsMuted":         false,
         ]
-        guard let url = comps.url else { return }
-        _ = try? await post(url: url, body: [:], token: token)
+        _ = try? await postJSON(url: url, body: body, token: token)
     }
 
     static func reportPlaybackProgress(
         server: EmbyServer, token: String,
-        itemId: String, sessionId: String,
+        itemId: String, mediaSourceId: String,
+        playSessionId: String, playMethod: String,
         positionTicks: Int64, isPaused: Bool
     ) async {
-        guard var comps = try? urlComponents(server, path: "/Sessions/Playing/Progress") else { return }
-        comps.queryItems = [
-            .init(name: "ItemId",        value: itemId),
-            .init(name: "SessionId",     value: sessionId),
-            .init(name: "PositionTicks", value: "\(positionTicks)"),
-            .init(name: "IsPaused",      value: isPaused ? "true" : "false"),
-            .init(name: "PlayMethod",    value: "DirectStream"),
+        guard let url = try? urlComponents(server, path: "/Sessions/Playing/Progress").url else { return }
+        let body: [String: Any] = [
+            "ItemId":          itemId,
+            "MediaSourceId":   mediaSourceId,
+            "PlaySessionId":   playSessionId,
+            "PlayMethod":      playMethod,
+            "PositionTicks":   positionTicks,
+            "IsPaused":        isPaused,
+            "IsMuted":         false,
+            "CanSeek":         true,
         ]
-        guard let url = comps.url else { return }
-        _ = try? await post(url: url, body: [:], token: token)
+        _ = try? await postJSON(url: url, body: body, token: token)
     }
 
     static func reportPlaybackStop(
         server: EmbyServer, token: String,
-        itemId: String, sessionId: String,
+        itemId: String, mediaSourceId: String,
+        playSessionId: String, playMethod: String,
         positionTicks: Int64
     ) async {
-        guard var comps = try? urlComponents(server, path: "/Sessions/Playing/Stopped") else { return }
-        comps.queryItems = [
-            .init(name: "ItemId",        value: itemId),
-            .init(name: "SessionId",     value: sessionId),
-            .init(name: "PositionTicks", value: "\(positionTicks)"),
-            .init(name: "PlayMethod",    value: "DirectStream"),
+        guard let url = try? urlComponents(server, path: "/Sessions/Playing/Stopped").url else { return }
+        let body: [String: Any] = [
+            "ItemId":          itemId,
+            "MediaSourceId":   mediaSourceId,
+            "PlaySessionId":   playSessionId,
+            "PlayMethod":      playMethod,
+            "PositionTicks":   positionTicks,
         ]
-        guard let url = comps.url else { return }
-        _ = try? await post(url: url, body: [:], token: token)
+        _ = try? await postJSON(url: url, body: body, token: token)
     }
 
     // MARK: - Networking

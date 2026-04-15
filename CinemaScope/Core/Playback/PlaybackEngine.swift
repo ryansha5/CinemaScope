@@ -46,13 +46,15 @@ final class PlaybackEngine: ObservableObject {
     private var pendingStartTicks: Int64 = 0
 
     // Reporting context — set before playback starts
-    private var reportingServer:    EmbyServer? = nil
-    private var reportingToken:     String?     = nil
-    private var reportingItemId:    String?     = nil
-    private var reportingUserId:    String?     = nil
-    private var reportingSessionId: String      = UUID().uuidString
-    private var progressReportTimer: Timer?     = nil
-    private var hasReportedStart                = false
+    private var reportingServer:        EmbyServer? = nil
+    private var reportingToken:         String?     = nil
+    private var reportingItemId:        String?     = nil
+    private var reportingUserId:        String?     = nil
+    private var reportingSessionId:     String      = UUID().uuidString
+    private var reportingMediaSourceId: String      = ""
+    private var reportingPlayMethod:    String      = "Transcode"
+    private var progressReportTimer:    Timer?      = nil
+    private var hasReportedStart                    = false
 
     // Retry context — used for automatic fallback on failure
     private var retryHandler: (() async -> Void)? = nil
@@ -88,13 +90,20 @@ final class PlaybackEngine: ObservableObject {
         retryHandler = handler
     }
 
-    /// Call this before load() to enable Emby progress reporting
-    func setReportingContext(server: EmbyServer, userId: String, token: String, itemId: String) {
-        reportingServer    = server
-        reportingToken     = token
-        reportingItemId    = itemId
-        reportingUserId    = userId
-        reportingSessionId = UUID().uuidString
+    /// Call this before load() to enable Emby progress reporting.
+    /// Pass the PlaybackResult values so session/source IDs are correctly
+    /// echoed back to Emby in all progress reports.
+    func setReportingContext(
+        server: EmbyServer, userId: String, token: String, itemId: String,
+        mediaSourceId: String, playSessionId: String, playMethod: String
+    ) {
+        reportingServer        = server
+        reportingToken         = token
+        reportingItemId        = itemId
+        reportingUserId        = userId
+        reportingSessionId     = playSessionId
+        reportingMediaSourceId = mediaSourceId
+        reportingPlayMethod    = playMethod
     }
 
     // MARK: - Transport
@@ -235,10 +244,14 @@ final class PlaybackEngine: ObservableObject {
               let itemId = reportingItemId,
               let userId = reportingUserId else { return }
         hasReportedStart = true
+        let sid      = reportingSessionId
+        let sourceId = reportingMediaSourceId
+        let method   = reportingPlayMethod
         Task {
             await EmbyAPI.reportPlaybackStart(
                 server: server, userId: userId, token: token,
-                itemId: itemId, sessionId: reportingSessionId)
+                itemId: itemId, mediaSourceId: sourceId,
+                playSessionId: sid, playMethod: method)
         }
     }
 
@@ -246,12 +259,15 @@ final class PlaybackEngine: ObservableObject {
         guard let server = reportingServer,
               let token  = reportingToken,
               let itemId = reportingItemId else { return }
-        let ticks = currentPositionTicks
-        let sid   = reportingSessionId
+        let ticks    = currentPositionTicks
+        let sid      = reportingSessionId
+        let sourceId = reportingMediaSourceId
+        let method   = reportingPlayMethod
         Task {
             await EmbyAPI.reportPlaybackProgress(
                 server: server, token: token,
-                itemId: itemId, sessionId: sid,
+                itemId: itemId, mediaSourceId: sourceId,
+                playSessionId: sid, playMethod: method,
                 positionTicks: ticks, isPaused: isPaused)
         }
     }
@@ -260,12 +276,15 @@ final class PlaybackEngine: ObservableObject {
         guard let server = reportingServer,
               let token  = reportingToken,
               let itemId = reportingItemId else { return }
-        let ticks = currentPositionTicks
-        let sid   = reportingSessionId
+        let ticks    = currentPositionTicks
+        let sid      = reportingSessionId
+        let sourceId = reportingMediaSourceId
+        let method   = reportingPlayMethod
         Task {
             await EmbyAPI.reportPlaybackStop(
                 server: server, token: token,
-                itemId: itemId, sessionId: sid,
+                itemId: itemId, mediaSourceId: sourceId,
+                playSessionId: sid, playMethod: method,
                 positionTicks: ticks)
         }
     }

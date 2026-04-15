@@ -232,6 +232,22 @@ struct EmbyUsersResponse: Codable {
     enum CodingKeys: String, CodingKey { case items = "Items" }
 }
 
+// MARK: - PlaybackResult
+// Returned by EmbyAPI.playbackURL — carries everything the engine needs to
+// start playback and send correctly-attributed progress reports to Emby.
+
+struct PlaybackResult {
+    /// The URL to hand to AVPlayer (direct-play, direct-stream, or HLS .m3u8)
+    let url:           URL
+    /// Emby-assigned session ID from PlaybackInfo — must be echoed back in all
+    /// progress reports so Emby can match them to the active transcode job.
+    let playSessionId: String
+    /// Which media source Emby chose — required in progress/stop payloads.
+    let mediaSourceId: String
+    /// "DirectPlay" | "DirectStream" | "Transcode" — reported to Emby verbatim.
+    let playMethod:    String
+}
+
 // MARK: - Playback Info
 
 struct EmbyPlaybackInfo: Codable {

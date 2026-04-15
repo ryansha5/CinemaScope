@@ -381,24 +381,32 @@ struct HomeView: View {
               let token  = session.token else { return }
         Task {
             do {
-                let url = try await EmbyAPI.playbackURL(
+                let result = try await EmbyAPI.playbackURL(
                     server: server, userId: user.id, token: token,
                     itemId: item.id, itemName: item.name
                 )
                 let ticks = startTicks ?? (item.userData?.playbackPositionTicks ?? 0)
                 await MainActor.run {
-                    engine.setReportingContext(server: server, userId: user.id, token: token, itemId: item.id)
-                    // Retry handler: if primary URL fails, force transcode
+                    engine.setReportingContext(
+                        server: server, userId: user.id, token: token, itemId: item.id,
+                        mediaSourceId: result.mediaSourceId,
+                        playSessionId: result.playSessionId,
+                        playMethod:    result.playMethod)
+                    // Retry handler: if primary URL fails, force HLS transcode
                     engine.setRetryHandler {
                         print("[HomeView] 🔄 Primary failed — forcing transcode for \(item.name)")
-                        guard let tUrl = try? await EmbyAPI.forcedTranscodeURL(
+                        guard let fallback = try? await EmbyAPI.forcedTranscodeURL(
                             server: server, userId: user.id, token: token, itemId: item.id) else { return }
                         await MainActor.run {
-                            engine.setReportingContext(server: server, userId: user.id, token: token, itemId: item.id)
-                            engine.load(url: tUrl, startTicks: ticks)
+                            engine.setReportingContext(
+                                server: server, userId: user.id, token: token, itemId: item.id,
+                                mediaSourceId: fallback.mediaSourceId,
+                                playSessionId: fallback.playSessionId,
+                                playMethod:    fallback.playMethod)
+                            engine.load(url: fallback.url, startTicks: ticks)
                         }
                     }
-                    engine.load(url: url, startTicks: ticks)
+                    engine.load(url: result.url, startTicks: ticks)
                     withAnimation { destination = .player(item) }
                 }
             } catch { print("[HomeView] Playback error: \(error)") }
