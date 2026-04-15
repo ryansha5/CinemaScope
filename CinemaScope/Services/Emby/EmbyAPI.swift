@@ -490,7 +490,7 @@ actor EmbyAPI {
 [Playback]   hasPGS:        \(hasPGS)
 [Playback]   Audio streams: \(audioStreamsSummary.isEmpty ? "none" : audioStreamsSummary)
 [Playback]   Sub streams:   \(subStreamsSummary.isEmpty ? "none" : subStreamsSummary)
-[Playback]   AC3 fallback:  \(fallbackAudio.map { "index \($0.index.map{"\($0)"}??  "?"), codec \($0.codec ?? "?")" } ?? "❌ none found")
+[Playback]   AC3 fallback:  \(fallbackAudio.map { s in "index \(s.index.map { "\($0)" } ?? "?"), codec \(s.codec ?? "?")" } ?? "❌ none found")
 [Playback]   → Re-requesting PlaybackInfo with AudioStreamIndex=\(fallbackAudio?.index.map{"\($0)"} ?? "default") SubtitleStreamIndex=-1
 """)
 
