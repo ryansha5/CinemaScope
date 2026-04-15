@@ -424,18 +424,108 @@ actor EmbyAPI {
 
         // Capture the Emby-assigned session ID. Falls back to a local UUID only
         // if the server is very old and doesn't return one.
-        let playSessionId = info.playSessionId ?? UUID().uuidString
+        var playSessionId = info.playSessionId ?? UUID().uuidString
 
         // ── Step 2: Gather facts from PlaybackInfo ──────────────────
-        let container          = source.container ?? "unknown"
-        let videoCodec         = source.videoStream?.codec ?? "unknown"
-        let audioCodecs        = source.audioStreams.compactMap { $0.codec }.joined(separator: ", ")
-        let subCodecs          = source.subtitleStreams.compactMap { $0.codec }.joined(separator: ", ")
-        let supportsDP         = source.supportsDirectPlay
-        let supportsDS         = source.supportsDirectStream
-        let embyTranscodeUrl   = source.transcodingUrl
-        let embyDirectStreamUrl = source.directStreamUrl
-        let codecsSafe         = codecsAreSafeForAVPlayer(source)
+        let allStreams          = source.mediaStreams ?? []
+
+        // Log every audio stream's index and codec so we can see what Emby exposed
+        let audioStreamsSummary = allStreams
+            .filter { $0.type.lowercased() == "audio" }
+            .map { s -> String in
+                let idx     = s.index.map { "#\($0)" } ?? "#?"
+                let codec   = s.codec ?? "?"
+                let def     = s.isDefault == true ? " [default]" : ""
+                let layout  = s.channelLayout.map { " \($0)" } ?? ""
+                return "\(idx) \(codec)\(layout)\(def)"
+            }
+            .joined(separator: ", ")
+        let subStreamsSummary = allStreams
+            .filter { $0.type.lowercased() == "subtitle" }
+            .map { s -> String in
+                let idx   = s.index.map { "#\($0)" } ?? "#?"
+                let codec = s.codec ?? "?"
+                let def   = s.isDefault == true ? " [default]" : ""
+                return "\(idx) \(codec)\(def)"
+            }
+            .joined(separator: ", ")
+
+        // ── Step 2b: Difficult-file detection ───────────────────────
+        //
+        // Emby can fail to generate a valid master.m3u8 when:
+        //   • The default audio track is TrueHD / MLP lossless — many server
+        //     configurations can't transcode these directly.
+        //   • PGS (bitmap) subtitles are selected for burn-in — this adds a
+        //     second decode step that can stall or abort the transcode job.
+        //
+        // Strategy: detect the combination, then re-request PlaybackInfo with:
+        //   • AudioStreamIndex = index of the first AC3/EAC3 fallback track
+        //   • SubtitleStreamIndex = -1  (no subtitles)
+        // Emby will generate a new PlaySessionId and a TranscodingUrl that
+        // targets streams it can actually transcode.
+
+        var activeSource    = source         // may be replaced by re-fetch below
+        var activeSessionId = playSessionId
+
+        let defaultAudio     = allStreams.first { $0.type.lowercased() == "audio" && $0.isDefault == true }
+                             ?? allStreams.first { $0.type.lowercased() == "audio" }
+        let defaultAudioCodec = (defaultAudio?.codec ?? "").lowercased()
+        let hasTrueHD        = defaultAudioCodec.contains("truehd") || defaultAudioCodec.contains("mlp")
+        let hasPGS           = allStreams.contains {
+            let c = ($0.codec ?? "").lowercased()
+            return $0.type.lowercased() == "subtitle" && (c.contains("pgs") || c.contains("pgssub") || c.contains("hdmv"))
+        }
+        let isDifficult      = hasTrueHD || hasPGS
+
+        if isDifficult {
+            // Find the best AC3/EAC3 fallback audio track (prefer default/first)
+            let fallbackAudio = allStreams.first {
+                $0.type.lowercased() == "audio" &&
+                (($0.codec ?? "").lowercased() == "ac3" || ($0.codec ?? "").lowercased() == "eac3")
+            }
+
+            print("""
+[Playback] ⚠️ Difficult file detected for '\(itemName)':
+[Playback]   hasTrueHD:     \(hasTrueHD) (default audio: \(defaultAudioCodec.isEmpty ? "none" : defaultAudioCodec))
+[Playback]   hasPGS:        \(hasPGS)
+[Playback]   Audio streams: \(audioStreamsSummary.isEmpty ? "none" : audioStreamsSummary)
+[Playback]   Sub streams:   \(subStreamsSummary.isEmpty ? "none" : subStreamsSummary)
+[Playback]   AC3 fallback:  \(fallbackAudio.map { "index \($0.index.map{"\($0)"}??  "?"), codec \($0.codec ?? "?")" } ?? "❌ none found")
+[Playback]   → Re-requesting PlaybackInfo with AudioStreamIndex=\(fallbackAudio?.index.map{"\($0)"} ?? "default") SubtitleStreamIndex=-1
+""")
+
+            // Re-fetch PlaybackInfo with explicit safe stream selection
+            var retryComps = try urlComponents(server, path: "/Items/\(itemId)/PlaybackInfo")
+            var retryQuery: [URLQueryItem] = [.init(name: "UserId", value: userId)]
+            if let audioIdx = fallbackAudio?.index {
+                retryQuery.append(.init(name: "AudioStreamIndex", value: "\(audioIdx)"))
+            }
+            retryQuery.append(.init(name: "SubtitleStreamIndex", value: "-1"))
+            retryComps.queryItems = retryQuery
+            guard let retryURL = retryComps.url else { throw EmbyError.invalidURL }
+
+            if let retryInfo = try? decode(EmbyPlaybackInfo.self,
+                                           from: try await postJSON(url: retryURL,
+                                                                     body: appleTVDeviceProfile(),
+                                                                     token: token)),
+               let retrySource = retryInfo.mediaSources.first {
+                activeSource    = retrySource
+                activeSessionId = retryInfo.playSessionId ?? UUID().uuidString
+                print("[Playback] ✅ Re-fetch succeeded — new PlaySessionId: \(activeSessionId), TranscodingUrl: \(retrySource.transcodingUrl.map { String($0.prefix(80)) } ?? "nil")")
+            } else {
+                print("[Playback] ⚠️ Re-fetch failed — continuing with original PlaybackInfo")
+            }
+        }
+
+        let container          = activeSource.container ?? "unknown"
+        let videoCodec         = activeSource.videoStream?.codec ?? "unknown"
+        let audioCodecs        = activeSource.audioStreams.compactMap { $0.codec }.joined(separator: ", ")
+        let subCodecs          = activeSource.subtitleStreams.compactMap { $0.codec }.joined(separator: ", ")
+        let supportsDP         = activeSource.supportsDirectPlay
+        let supportsDS         = activeSource.supportsDirectStream
+        let embyTranscodeUrl   = activeSource.transcodingUrl
+        let embyDirectStreamUrl = activeSource.directStreamUrl
+        let codecsSafe         = codecsAreSafeForAVPlayer(activeSource)
         let nativeContainer    = avpDirectPlayContainers.contains(container.lowercased())
 
         // ── Step 3: Decision logic (Emby is authoritative) ─────────
@@ -471,9 +561,8 @@ actor EmbyAPI {
         var finalURL: URL? = nil
 
         // Helper: resolve a raw Emby URL string (relative or absolute) → URL,
-        // appending api_key if absent. Returns nil if the string is malformed.
-        // Logs path, and explicitly flags the presence of api_key, MediaSourceId,
-        // PlaySessionId, and Static=true so 404 root causes are easy to spot.
+        // appending api_key if absent.  Logs a full param audit so 404 root
+        // causes (missing MediaSourceId, no AudioStreamIndex, etc.) are visible.
         func resolveEmbyURL(_ raw: String, label: String) -> URL? {
             let wasRelative = !raw.hasPrefix("http")
             let absolute    = wasRelative ? server.url + raw : raw
@@ -482,26 +571,53 @@ actor EmbyAPI {
                 return nil
             }
             var items = comps.queryItems ?? []
-            let hadApiKey       = items.contains(where: { $0.name.lowercased() == "api_key" })
-            let hasMediaSrcId   = items.contains(where: { $0.name.lowercased() == "mediasourceid" })
-            let hasPlaySession  = items.contains(where: { $0.name.lowercased() == "playsessionid" })
-            let hasStaticTrue   = items.contains(where: {
-                $0.name.lowercased() == "static" && ($0.value ?? "").lowercased() == "true"
-            })
+
+            // ── Param audit ────────────────────────────────────────────
+            // Required for HLS transcode to start:
+            func val(_ key: String) -> String? {
+                items.first(where: { $0.name.lowercased() == key.lowercased() })?.value
+            }
+            func has(_ key: String) -> Bool { val(key) != nil }
+
+            let hadApiKey        = has("api_key")
+            let mediaSourceId    = val("MediaSourceId")
+            let deviceId         = val("DeviceId")
+            let playSessionId    = val("PlaySessionId")
+            let videoCodecVal    = val("VideoCodec")
+            let audioCodecVal    = val("AudioCodec")
+            let audioStreamIdx   = val("AudioStreamIndex")
+            let subStreamIdx     = val("SubtitleStreamIndex")
+            let subMethod        = val("SubtitleMethod")
+            let segContainer     = val("SegmentContainer")
+            let staticVal        = val("Static")
+
             if !hadApiKey {
                 items.append(.init(name: "api_key", value: token))
                 comps.queryItems = items
             }
             guard let url = comps.url else { return nil }
+
+            func present(_ v: String?, critical: Bool = false) -> String {
+                if let v { return "✅ \(v)" }
+                return critical ? "❌ MISSING" : "— not set"
+            }
+
             print("""
 [Playback] \(label)
-[Playback]   path:           \(comps.path)
-[Playback]   wasRelative:    \(wasRelative)
-[Playback]   api_key:        \(hadApiKey ? "✅ present" : "➕ appended")
-[Playback]   MediaSourceId:  \(hasMediaSrcId  ? "✅ present" : "❌ MISSING")
-[Playback]   PlaySessionId:  \(hasPlaySession ? "✅ present" : "❌ missing")
-[Playback]   static=true:    \(hasStaticTrue  ? "✅ present" : "— not set")
-[Playback]   total length:   \(url.absoluteString.count) chars
+[Playback]   path:                \(comps.path)
+[Playback]   wasRelative:         \(wasRelative)
+[Playback]   api_key:             \(hadApiKey ? "✅ present" : "➕ appended")
+[Playback]   MediaSourceId:       \(present(mediaSourceId, critical: true))
+[Playback]   DeviceId:            \(present(deviceId))
+[Playback]   PlaySessionId:       \(present(playSessionId, critical: true))
+[Playback]   VideoCodec:          \(present(videoCodecVal))
+[Playback]   AudioCodec:          \(present(audioCodecVal))
+[Playback]   AudioStreamIndex:    \(present(audioStreamIdx))
+[Playback]   SubtitleStreamIndex: \(present(subStreamIdx))
+[Playback]   SubtitleMethod:      \(present(subMethod))
+[Playback]   SegmentContainer:    \(present(segContainer))
+[Playback]   Static:              \(present(staticVal))
+[Playback]   total length:        \(url.absoluteString.count) chars
 """)
             return url
         }
@@ -515,7 +631,7 @@ actor EmbyAPI {
             // Build the standard native direct-play path exactly per spec
             var comps = try urlComponents(server, path: "/Videos/\(itemId)/stream")
             comps.queryItems = [
-                .init(name: "MediaSourceId", value: source.id),
+                .init(name: "MediaSourceId", value: activeSource.id),
                 .init(name: "api_key",       value: token),
                 .init(name: "DeviceId",      value: "CinemaScope-AppleTV"),
                 .init(name: "Static",        value: "true"),
@@ -571,7 +687,7 @@ actor EmbyAPI {
                 // Manual direct-play fallback
                 var comps = try urlComponents(server, path: "/Videos/\(itemId)/stream")
                 comps.queryItems = [
-                    .init(name: "MediaSourceId", value: source.id),
+                    .init(name: "MediaSourceId", value: activeSource.id),
                     .init(name: "api_key",       value: token),
                     .init(name: "DeviceId",      value: "CinemaScope-AppleTV"),
                     .init(name: "Static",        value: "true"),
@@ -586,7 +702,7 @@ actor EmbyAPI {
                 // Manual transcode fallback
                 var comps = try urlComponents(server, path: "/Videos/\(itemId)/stream.mp4")
                 comps.queryItems = [
-                    .init(name: "MediaSourceId",   value: source.id),
+                    .init(name: "MediaSourceId",   value: activeSource.id),
                     .init(name: "api_key",         value: token),
                     .init(name: "DeviceId",        value: "CinemaScope-AppleTV"),
                     .init(name: "VideoCodec",      value: "h264"),
@@ -616,8 +732,10 @@ actor EmbyAPI {
 [Playback] Item:                 \(itemName.isEmpty ? itemId : itemName)
 [Playback] Container:            \(container)
 [Playback] Video codec:          \(videoCodec)
-[Playback] Audio codecs:         \(audioCodecs.isEmpty ? "none" : audioCodecs)
-[Playback] Subtitle codecs:      \(subCodecs.isEmpty ? "none" : subCodecs)
+[Playback] Audio streams:        \(audioStreamsSummary.isEmpty ? "none" : audioStreamsSummary)
+[Playback] Sub streams:          \(subStreamsSummary.isEmpty ? "none" : subStreamsSummary)
+[Playback] Difficult file:       \(isDifficult ? "⚠️ yes (hasTrueHD=\(hasTrueHD) hasPGS=\(hasPGS))" : "no")
+[Playback] Stream re-fetch:      \(isDifficult ? (activeSource.id == source.id ? "attempted but used original" : "✅ used re-fetched source") : "n/a")
 [Playback] supportsDirectPlay:   \(supportsDP.map { "\($0)" } ?? "nil")
 [Playback] supportsDirectStream: \(supportsDS.map { "\($0)" } ?? "nil")
 [Playback] Emby DirectStreamUrl: \(embyDirectStreamUrl.map { String($0.prefix(80)) } ?? "nil")
@@ -625,8 +743,8 @@ actor EmbyAPI {
 [Playback] Codec check:          \(codecsSafe ? "✅ safe" : "⚠️ unsafe — codec(s) not in AVPlayer whitelist")
 [Playback] ─────────────────────────────────────────
 [Playback] Path chosen:          \(chosenPath)  (\(playMethod))
-[Playback] PlaySessionId:        \(playSessionId)
-[Playback] MediaSourceId:        \(source.id)
+[Playback] PlaySessionId:        \(activeSessionId)
+[Playback] MediaSourceId:        \(activeSource.id)
 [Playback] Reason:               \(reason.rawValue)
 [Playback] URL source:           \(isManual ? "⚠️ MANUALLY CONSTRUCTED" : "✅ from PlaybackInfo")
 [Playback] Final URL length:     \(url.absoluteString.count) chars
@@ -635,8 +753,8 @@ actor EmbyAPI {
 
         return PlaybackResult(
             url:           url,
-            playSessionId: playSessionId,
-            mediaSourceId: source.id,
+            playSessionId: activeSessionId,
+            mediaSourceId: activeSource.id,
             playMethod:    playMethod
         )
     }

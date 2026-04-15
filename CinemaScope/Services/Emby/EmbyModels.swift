@@ -309,6 +309,7 @@ struct EmbyMediaSource: Codable {
 }
 
 struct EmbyMediaStream: Codable {
+    let index:             Int?      // Emby's 0-based stream index — used for AudioStreamIndex / SubtitleStreamIndex params
     let type:              String    // "Video", "Audio", "Subtitle"
     let codec:             String?
     let width:             Int?
@@ -333,6 +334,7 @@ struct EmbyMediaStream: Codable {
     let supportsExternalStream: Bool?
 
     enum CodingKeys: String, CodingKey {
+        case index             = "Index"
         case type              = "Type"
         case codec             = "Codec"
         case width             = "Width"
