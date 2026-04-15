@@ -104,7 +104,13 @@ final class EmbyLibraryStore: ObservableObject {
         do {
             switch ribbon.type {
             case .continueWatching:
-                return try await EmbyAPI.fetchContinueWatching(server: server, userId: userId, token: token, limit: 25)
+                // Emby's /Items/Resume already filters to in-progress items, but
+                // apply a client-side guard too: drop items where PlaybackCTA
+                // resolves to .play (negligible progress OR effectively finished).
+                // This catches the 97%-complete edge case where Emby hasn't yet
+                // marked the item as played.
+                let raw = try await EmbyAPI.fetchContinueWatching(server: server, userId: userId, token: token, limit: 25)
+                return raw.filter { PlaybackCTA.shouldShowInContinueWatching($0) }
             case .recentMovies:
                 guard let id = movieLibraryId else { return [] }
                 return try await EmbyAPI.fetchRecentlyAdded(server: server, userId: userId, token: token, parentId: id, limit: 25)
@@ -132,6 +138,46 @@ final class EmbyLibraryStore: ObservableObject {
             }
         } catch {
             return []
+        }
+    }
+
+    // MARK: - Local userData patch
+    //
+    // After playback stops, immediately update the stored position so that
+    // Play/Resume CTAs and progress bars reflect reality without waiting for
+    // the next server fetch.  The server receives the authoritative stop report
+    // via EmbyAPI.reportPlaybackStop; this is purely a local UI update.
+
+    func updatePlaybackPosition(itemId: String, positionTicks: Int64) {
+        let patchedData = UserData(
+            playbackPositionTicks: positionTicks > 0 ? positionTicks : nil,
+            played: false
+        )
+
+        func patch(_ items: inout [EmbyItem]) {
+            if let idx = items.firstIndex(where: { $0.id == itemId }) {
+                items[idx] = items[idx].withUserData(patchedData)
+            }
+        }
+
+        patch(&movieItems)
+        patch(&showItems)
+        patch(&collections)
+        patch(&playlists)
+
+        // Patch inside ribbon arrays too (Continue Watching, Recently Added, etc.)
+        for key in ribbonItems.keys {
+            if var arr = ribbonItems[key] {
+                patch(&arr)
+                ribbonItems[key] = arr
+            }
+        }
+
+        // Re-apply the Continue Watching filter after patching so finished
+        // items drop out of the row immediately.
+        let cwKey = RibbonType.continueWatching.id
+        if let cwArr = ribbonItems[cwKey] {
+            ribbonItems[cwKey] = cwArr.filter { PlaybackCTA.shouldShowInContinueWatching($0) }
         }
     }
 

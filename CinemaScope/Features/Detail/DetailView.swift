@@ -24,7 +24,8 @@ struct DetailView: View {
     @FocusState private var focusedButton: DetailFocus?
 
     private var displayItem: EmbyItem { detail ?? item }
-    private var hasProgress: Bool { (displayItem.userData?.playbackPositionTicks ?? 0) > 0 }
+    /// Single source of truth for the Play / Resume / Restart decision.
+    private var cta: PlaybackCTA { PlaybackCTA.state(for: displayItem) }
 
     private var actors: [EmbyPerson] {
         (displayItem.people ?? []).filter { $0.type == "Actor" }
@@ -553,12 +554,12 @@ struct DetailView: View {
     private func actionButtons(scopeMode: Bool) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 14) {
-                DetailActionButton(icon: "play.fill", label: hasProgress ? "Resume" : "Play",
+                DetailActionButton(icon: "play.fill", label: cta.showsRestart ? "Resume" : "Play",
                     style: .primary, scopeMode: scopeMode, isFocused: focusedButton == .play,
                     colorMode: settings.colorMode) { onPlay(displayItem) }
                 .focused($focusedButton, equals: .play)
 
-                if hasProgress {
+                if cta.showsRestart {
                     DetailActionButton(icon: "arrow.counterclockwise", label: "Restart",
                         style: .secondary, scopeMode: scopeMode, isFocused: focusedButton == .restart,
                         colorMode: settings.colorMode) { onRestart(displayItem) }
@@ -577,12 +578,9 @@ struct DetailView: View {
             .focusSection()
             .onAppear { focusedButton = .play }
 
-            // Resume position hint
-            if hasProgress, let ticks = displayItem.userData?.playbackPositionTicks {
-                let secs = Int(ticks / 10_000_000)
-                let h = secs / 3600; let m = (secs % 3600) / 60
-                let timeStr = h > 0 ? "\(h)h \(m)m" : "\(m)m"
-                Text("Resuming from \(timeStr)")
+            // Resume position hint — only shown when there is meaningful progress
+            if let label = cta.resumeLabel {
+                Text(label)
                     .font(.system(size: scopeMode ? 12 : 14))
                     .foregroundStyle(CinemaTheme.tertiary(settings.colorMode))
             }
@@ -1241,9 +1239,9 @@ struct EpisodeThumbCard: View {
     }
 
     private var progress: Double? {
-        guard let ticks = episode.userData?.playbackPositionTicks,
-              let total = episode.runTimeTicks,
-              total > 0, ticks > 0 else { return nil }
+        // Only render the bar when there is meaningful, unfinished progress.
+        guard case .resume(let ticks) = PlaybackCTA.state(for: episode),
+              let total = episode.runTimeTicks, total > 0 else { return nil }
         return min(Double(ticks) / Double(total), 1.0)
     }
 

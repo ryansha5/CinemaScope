@@ -67,9 +67,17 @@ struct HomeView: View {
                     engine:  engine,
                     session: session,
                     onExit:  {
+                        // Capture position before stop() resets currentTime to 0
+                        let finalTicks = Int64(engine.currentTime * 10_000_000)
                         engine.stop()
+                        // Immediately patch local userData so CTAs and progress
+                        // bars are accurate when the user lands back on home/detail.
+                        store.updatePlaybackPosition(itemId: item.id, positionTicks: finalTicks)
                         withAnimation { destination = nil }
-                    }
+                    },
+                    // "Try Again" on the error screen fully re-initiates playback
+                    // so all URL resolution and retry logic runs fresh.
+                    onRetry: { play(item) }
                 )
                 .transition(.opacity)
 
@@ -385,7 +393,10 @@ struct HomeView: View {
                     server: server, userId: user.id, token: token,
                     itemId: item.id, itemName: item.name
                 )
-                let ticks = startTicks ?? (item.userData?.playbackPositionTicks ?? 0)
+                // Use PlaybackCTA to decide where to resume. If startTicks is
+                // explicitly supplied (e.g. restart) that takes precedence;
+                // otherwise use the shared CTA logic so threshold rules apply.
+                let ticks = startTicks ?? PlaybackCTA.state(for: item).primaryStartTicks
                 await MainActor.run {
                     engine.setReportingContext(
                         server: server, userId: user.id, token: token, itemId: item.id,
@@ -654,9 +665,9 @@ struct MediaCard: View {
                     .frame(width: cardWidth, height: cardHeight)
                     .clipShape(RoundedRectangle(cornerRadius: 8))
 
-                    // Progress bar
-                    if let ticks = item.userData?.playbackPositionTicks,
-                       let total = item.runTimeTicks, total > 0, ticks > 0 {
+                    // Progress bar — only for items with meaningful, unfinished progress
+                    if case .resume(let ticks) = PlaybackCTA.state(for: item),
+                       let total = item.runTimeTicks, total > 0 {
                         progressBar(ticks: ticks, total: total)
                     }
                 }

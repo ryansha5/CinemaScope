@@ -6,6 +6,7 @@ import Combine
 enum PlaybackState: Equatable {
     case idle
     case loading
+    case retrying(String)   // message shown during automatic fallback attempt
     case playing
     case paused
     case failed(String)
@@ -176,10 +177,13 @@ final class PlaybackEngine: ObservableObject {
                     print("[PlaybackEngine] ❌ Error \(code): \(msg)")
                     print("[PlaybackEngine] ❌ Underlying: \(under?.localizedDescription ?? "none")")
 
-                    // If we have a retry handler, try it before showing error
+                    // If we have a retry handler, try it before showing error.
+                    // Surface a .retrying state so the player shows feedback
+                    // during the fallback window (typically 2–5 s).
                     if let retry = self.retryHandler {
                         print("[PlaybackEngine] 🔄 Retrying with fallback...")
                         self.retryHandler = nil   // clear to prevent infinite loop
+                        self.playbackState = .retrying("Finding compatible format…")
                         Task { await retry() }
                         return
                     }

@@ -116,6 +116,24 @@ struct EmbyItem: Codable, Identifiable, Equatable {
         return Int(ticks / 600_000_000)
     }
 
+    /// Returns a copy of this item with its `userData` replaced.
+    /// Used for local playback-position patching without a server round-trip.
+    func withUserData(_ newData: UserData) -> EmbyItem {
+        EmbyItem(
+            id: id, name: name, type: type, productionYear: productionYear,
+            imageTags: imageTags, backdropImageTags: backdropImageTags,
+            overview: overview, runTimeTicks: runTimeTicks,
+            userData: newData,
+            genres: genres, people: people, communityRating: communityRating,
+            officialRating: officialRating, taglines: taglines, studios: studios,
+            parentId: parentId, seriesId: seriesId, seriesName: seriesName,
+            seasonId: seasonId, seasonName: seasonName,
+            episodeCount: episodeCount, childCount: childCount,
+            indexNumber: indexNumber, parentIndexNumber: parentIndexNumber,
+            providerIds: providerIds
+        )
+    }
+
     /// Returns true for Christmas / holiday content that should be excluded from recommendations.
     /// Matches on genre "Holiday" or common Christmas keywords in the title.
     var isChristmasContent: Bool {
