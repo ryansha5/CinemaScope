@@ -79,7 +79,34 @@ struct SeasonDetailView: View {
                     .foregroundStyle(CinemaTheme.primary(settings.colorMode))
                     .lineLimit(1)
                     .animation(.easeInOut(duration: 0.2), value: activeSeason?.id)
-                if let count = activeSeason?.childCount ?? initialSeason.childCount, count > 0 {
+                // Show watched progress when episodes are loaded, otherwise fall back to total count
+                if !episodes.isEmpty {
+                    let watched = episodes.filter { $0.userData?.played == true }.count
+                    let total   = episodes.count
+                    HStack(spacing: 6) {
+                        Text(watched == total ? "All watched" : "\(watched) of \(total) watched")
+                            .font(CinemaTheme.captionFont)
+                            .foregroundStyle(
+                                watched == total
+                                    ? CinemaTheme.accentGold.opacity(0.8)
+                                    : CinemaTheme.secondary(settings.colorMode)
+                            )
+                        if watched > 0 && watched < total {
+                            // Mini progress bar
+                            GeometryReader { g in
+                                ZStack(alignment: .leading) {
+                                    RoundedRectangle(cornerRadius: 2)
+                                        .fill(Color.white.opacity(0.15))
+                                        .frame(height: 3)
+                                    RoundedRectangle(cornerRadius: 2)
+                                        .fill(CinemaTheme.accentGold.opacity(0.7))
+                                        .frame(width: g.size.width * CGFloat(watched) / CGFloat(total), height: 3)
+                                }
+                            }
+                            .frame(width: 60, height: 3)
+                        }
+                    }
+                } else if let count = activeSeason?.childCount ?? initialSeason.childCount, count > 0 {
                     Text("\(count) Episode\(count == 1 ? "" : "s")")
                         .font(CinemaTheme.captionFont)
                         .foregroundStyle(CinemaTheme.secondary(settings.colorMode))
@@ -135,6 +162,19 @@ struct SeasonDetailView: View {
         .background(CinemaTheme.peacockDeep.opacity(0.4))
     }
 
+    // MARK: - Next Up
+
+    /// The ID of the episode the user should watch next:
+    /// — first in-progress episode, or failing that, first unwatched episode.
+    private var nextUpId: String? {
+        guard !episodes.isEmpty else { return nil }
+        if let ep = episodes.first(where: {
+            if case .resume = PlaybackCTA.state(for: $0) { return true }
+            return false
+        }) { return ep.id }
+        return episodes.first(where: { $0.userData?.played != true })?.id
+    }
+
     // MARK: - Episode Panel
 
     @ViewBuilder
@@ -163,12 +203,14 @@ struct SeasonDetailView: View {
         } else {
             ScrollView(.vertical, showsIndicators: false) {
                 LazyVStack(spacing: 0) {
+                    let nextUp = nextUpId
                     ForEach(episodes) { episode in
                         EpisodeRow(
                             episode:   episode,
                             session:   session,
                             colorMode: settings.colorMode,
-                            scopeMode: settings.scopeUIEnabled
+                            scopeMode: settings.scopeUIEnabled,
+                            isNextUp:  episode.id == nextUp
                         ) { onSelect(episode) }
 
                         if episode.id != episodes.last?.id {
@@ -303,6 +345,7 @@ struct EpisodeRow: View {
     let session:   EmbySession
     let colorMode: ColorMode
     let scopeMode: Bool
+    var isNextUp:  Bool = false
     let onTap:     () -> Void
 
     @FocusState private var isFocused: Bool
@@ -385,6 +428,14 @@ struct EpisodeRow: View {
                             .font(.system(size: scopeMode ? 15 : 18, weight: .semibold))
                             .foregroundStyle(CinemaTheme.primary(colorMode))
                             .lineLimit(1)
+                        if isNextUp {
+                            Text("NEXT UP")
+                                .font(.system(size: scopeMode ? 9 : 11, weight: .bold))
+                                .foregroundStyle(CinemaTheme.bg(colorMode))
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 3)
+                                .background(CinemaTheme.accentGold, in: RoundedRectangle(cornerRadius: 4))
+                        }
                     }
                     if let mins = episode.runtimeMinutes {
                         Text(formatRuntime(mins))

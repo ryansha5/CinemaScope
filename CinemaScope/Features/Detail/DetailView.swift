@@ -27,6 +27,19 @@ struct DetailView: View {
     /// Single source of truth for the Play / Resume / Restart decision.
     private var cta: PlaybackCTA { PlaybackCTA.state(for: displayItem) }
 
+    /// Next episode to watch for Series items.
+    /// Uses singleSeasonEpisodes (populated for single-season shows).
+    /// Returns the first in-progress episode, or the first unwatched one.
+    private var nextEpisode: EmbyItem? {
+        guard displayItem.type == "Series" else { return nil }
+        guard !singleSeasonEpisodes.isEmpty else { return nil }
+        if let inProgress = singleSeasonEpisodes.first(where: {
+            if case .resume = PlaybackCTA.state(for: $0) { return true }
+            return false
+        }) { return inProgress }
+        return singleSeasonEpisodes.first(where: { $0.userData?.played != true })
+    }
+
     private var actors: [EmbyPerson] {
         (displayItem.people ?? []).filter { $0.type == "Actor" }
     }
@@ -324,6 +337,11 @@ struct DetailView: View {
             default:
                 badge("Movie")
             }
+            // Technical quality badges — resolution and HDR from loaded media info
+            if let video = mediaInfo?.videoStream {
+                if let res = video.resolutionLabel { badge(res) }
+                if let hdr = video.hdrLabel        { badge(hdr, gold: true) }
+            }
         }
     }
 
@@ -554,16 +572,29 @@ struct DetailView: View {
     private func actionButtons(scopeMode: Bool) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 14) {
-                DetailActionButton(icon: "play.fill", label: cta.showsRestart ? "Resume" : "Play",
-                    style: .primary, scopeMode: scopeMode, isFocused: focusedButton == .play,
-                    colorMode: settings.colorMode) { onPlay(displayItem) }
-                .focused($focusedButton, equals: .play)
 
-                if cta.showsRestart {
-                    DetailActionButton(icon: "arrow.counterclockwise", label: "Restart",
-                        style: .secondary, scopeMode: scopeMode, isFocused: focusedButton == .restart,
-                        colorMode: settings.colorMode) { onRestart(displayItem) }
-                    .focused($focusedButton, equals: .restart)
+                // ── Series: primary CTA is "Continue" / "Play" for the next episode ──
+                if displayItem.type == "Series", let next = nextEpisode {
+                    let nextCTA   = PlaybackCTA.state(for: next)
+                    let playLabel = nextCTA.showsRestart ? "Continue" : "Play"
+                    DetailActionButton(icon: "play.fill", label: playLabel,
+                        style: .primary, scopeMode: scopeMode, isFocused: focusedButton == .play,
+                        colorMode: settings.colorMode) { onPlay(next) }
+                    .focused($focusedButton, equals: .play)
+
+                } else {
+                    // ── Movie / Episode: standard Play / Resume ──
+                    DetailActionButton(icon: "play.fill", label: cta.showsRestart ? "Resume" : "Play",
+                        style: .primary, scopeMode: scopeMode, isFocused: focusedButton == .play,
+                        colorMode: settings.colorMode) { onPlay(displayItem) }
+                    .focused($focusedButton, equals: .play)
+
+                    if cta.showsRestart {
+                        DetailActionButton(icon: "arrow.counterclockwise", label: "Restart",
+                            style: .secondary, scopeMode: scopeMode, isFocused: focusedButton == .restart,
+                            colorMode: settings.colorMode) { onRestart(displayItem) }
+                        .focused($focusedButton, equals: .restart)
+                    }
                 }
 
                 if hasTrailer, let trailer = tmdb?.trailer {
@@ -578,8 +609,19 @@ struct DetailView: View {
             .focusSection()
             .onAppear { focusedButton = .play }
 
-            // Resume position hint — only shown when there is meaningful progress
-            if let label = cta.resumeLabel {
+            // ── Next episode context line for Series ──
+            if displayItem.type == "Series", let next = nextEpisode {
+                let s  = next.parentIndexNumber.map { "S\($0)" } ?? ""
+                let e  = next.indexNumber.map      { "E\($0)" } ?? ""
+                let se = [s, e].filter { !$0.isEmpty }.joined(separator: "·")
+                Text("\(se.isEmpty ? "" : "\(se)  —  ")\(next.name)")
+                    .font(.system(size: scopeMode ? 12 : 14))
+                    .foregroundStyle(CinemaTheme.tertiary(settings.colorMode))
+                    .lineLimit(1)
+            }
+
+            // ── Resume position hint for movies / episodes ──
+            if displayItem.type != "Series", let label = cta.resumeLabel {
                 Text(label)
                     .font(.system(size: scopeMode ? 12 : 14))
                     .foregroundStyle(CinemaTheme.tertiary(settings.colorMode))
