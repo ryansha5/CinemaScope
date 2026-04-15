@@ -33,7 +33,7 @@
 		34190BC12F8D53480047656A /* Exceptions for "CinemaScope" folder in "CinemaScope" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
-				Info.plist,
+				App/Info.plist,
 			);
 			target = 34190B592F8D4AD00047656A /* CinemaScope */;
 		};
@@ -208,6 +208,8 @@
 			);
 			mainGroup = 34190B512F8D4AD00047656A;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 34190B5B2F8D4AD00047656A /* Products */;
 			projectDirPath = "";
@@ -413,7 +415,7 @@
 				DEVELOPMENT_TEAM = 58CT99M3QP;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_FILE = CinemaScope/Info.plist;
+				INFOPLIST_FILE = CinemaScope/App/Info.plist;
 				INFOPLIST_KEY_LSApplicationCategoryType = "";
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UIUserInterfaceStyle = Automatic;
@@ -440,7 +442,7 @@
 				DEVELOPMENT_TEAM = 58CT99M3QP;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_FILE = CinemaScope/Info.plist;
+				INFOPLIST_FILE = CinemaScope/App/Info.plist;
 				INFOPLIST_KEY_LSApplicationCategoryType = "";
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UIUserInterfaceStyle = Automatic;

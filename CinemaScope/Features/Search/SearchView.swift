@@ -257,23 +257,98 @@ struct SearchResultCard: View {
                     .foregroundStyle(CinemaTheme.primary(colorMode))
                     .lineLimit(2)
 
-                // Year + rating
-                HStack(spacing: 6) {
-                    if let year = item.productionYear {
-                        Text("\(year)")
-                            .font(.system(size: scopeMode ? 10 : 13))
-                            .foregroundStyle(CinemaTheme.tertiary(colorMode))
-                    }
-                    if let rating = item.communityRating {
-                        Text(String(format: "★ %.1f", rating))
-                            .font(.system(size: scopeMode ? 10 : 13))
-                            .foregroundStyle(CinemaTheme.accentGold.opacity(0.85))
-                    }
-                }
+                // Metadata row: year · runtime · official rating · ★ score
+                searchMetaRow(scopeMode: scopeMode)
             }
         }
         .focusRingFree()
         .focused($isFocused)
+    }
+
+    // Dot-separated metadata: year · runtime · official rating · ★ score
+    @ViewBuilder
+    private func searchMetaRow(scopeMode: Bool) -> some View {
+        let fontSize: CGFloat = scopeMode ? 10 : 13
+        let parts: [AnyView] = buildMetaParts(fontSize: fontSize)
+        if !parts.isEmpty {
+            HStack(spacing: 4) {
+                ForEach(parts.indices, id: \.self) { i in
+                    if i > 0 {
+                        Text("·")
+                            .font(.system(size: fontSize))
+                            .foregroundStyle(CinemaTheme.tertiary(colorMode).opacity(0.5))
+                    }
+                    parts[i]
+                }
+            }
+        }
+    }
+
+    private func buildMetaParts(fontSize: CGFloat) -> [AnyView] {
+        var parts: [AnyView] = []
+
+        if let year = item.productionYear {
+            parts.append(AnyView(
+                Text("\(year)")
+                    .font(.system(size: fontSize))
+                    .foregroundStyle(CinemaTheme.tertiary(colorMode))
+            ))
+        }
+
+        // Runtime — movies and episodes only
+        if let mins = item.runtimeMinutes, item.type != "Series" && item.type != "BoxSet" {
+            let str = mins >= 60 ? "\(mins / 60)h \(mins % 60)m" : "\(mins)m"
+            parts.append(AnyView(
+                Text(str)
+                    .font(.system(size: fontSize))
+                    .foregroundStyle(CinemaTheme.tertiary(colorMode))
+            ))
+        }
+
+        // Series: season/episode count
+        if item.type == "Series" {
+            if let s = item.childCount, s > 0 {
+                parts.append(AnyView(
+                    Text("\(s) Season\(s == 1 ? "" : "s")")
+                        .font(.system(size: fontSize))
+                        .foregroundStyle(CinemaTheme.tertiary(colorMode))
+                ))
+            }
+        }
+
+        // BoxSet: child count
+        if item.type == "BoxSet", let c = item.childCount, c > 0 {
+            parts.append(AnyView(
+                Text("\(c) Films")
+                    .font(.system(size: fontSize))
+                    .foregroundStyle(CinemaTheme.tertiary(colorMode))
+            ))
+        }
+
+        // Official rating (PG, R, TV-14, etc.)
+        if let r = item.officialRating {
+            parts.append(AnyView(
+                Text(r)
+                    .font(.system(size: fontSize, weight: .medium))
+                    .foregroundStyle(CinemaTheme.tertiary(colorMode))
+                    .padding(.horizontal, 5).padding(.vertical, 2)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 3)
+                            .strokeBorder(CinemaTheme.tertiary(colorMode).opacity(0.4), lineWidth: 1)
+                    )
+            ))
+        }
+
+        // Community rating
+        if let rating = item.communityRating {
+            parts.append(AnyView(
+                Text(String(format: "★ %.1f", rating))
+                    .font(.system(size: fontSize))
+                    .foregroundStyle(CinemaTheme.accentGold.opacity(0.85))
+            ))
+        }
+
+        return parts
     }
 
     private var placeholder: some View {

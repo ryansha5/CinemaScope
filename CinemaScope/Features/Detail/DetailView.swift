@@ -240,6 +240,19 @@ struct DetailView: View {
                             .foregroundStyle(CinemaTheme.accentGold.opacity(0.85))
                             .lineLimit(1)
                     }
+                    // Season + episode number line (e.g. "Season 2  ·  Episode 4")
+                    if displayItem.type == "Episode" {
+                        let parts: [String] = [
+                            displayItem.seasonName,
+                            displayItem.indexNumber.map { "Episode \($0)" }
+                        ].compactMap { $0 }
+                        if !parts.isEmpty {
+                            Text(parts.joined(separator: "  ·  "))
+                                .font(.system(size: scopeMode ? 12 : 15, weight: .medium))
+                                .foregroundStyle(CinemaTheme.tertiary(settings.colorMode))
+                                .lineLimit(1)
+                        }
+                    }
                     Text(displayItem.name)
                         .font(.system(size: scopeMode ? 28 : 46, weight: .bold))
                         .foregroundStyle(CinemaTheme.primary(settings.colorMode))
@@ -437,7 +450,8 @@ struct DetailView: View {
                             episode:   episode,
                             session:   session,
                             scopeMode: scopeMode,
-                            colorMode: settings.colorMode
+                            colorMode: settings.colorMode,
+                            isCurrent: false
                         ) { onSelectSeason(displayItem, seasons[0]) }
                         // Tapping goes to SeasonDetailView so user can
                         // navigate episodes with the full player context
@@ -490,12 +504,13 @@ struct DetailView: View {
 
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: scopeMode ? 16 : 24) {
-                    ForEach(collectionItems.filter { $0.id != displayItem.id && $0.type == "Episode" }) { ep in
+                    ForEach(collectionItems.filter { $0.type == "Episode" }) { ep in
                         EpisodeThumbCard(
                             episode:   ep,
                             session:   session,
                             scopeMode: scopeMode,
-                            colorMode: settings.colorMode
+                            colorMode: settings.colorMode,
+                            isCurrent: ep.id == displayItem.id
                         ) { onNavigate(ep) }
                     }
                 }
@@ -614,8 +629,13 @@ struct DetailView: View {
     }
 
     private func openTrailer(_ trailer: TMDBVideo) {
-        guard let url = URL(string: "https://www.youtube.com/watch?v=\(trailer.key)") else { return }
-        UIApplication.shared.open(url)
+        let appURL = URL(string: "youtube://\(trailer.key)")
+        let webURL = URL(string: "https://www.youtube.com/watch?v=\(trailer.key)")
+        if let appURL, UIApplication.shared.canOpenURL(appURL) {
+            UIApplication.shared.open(appURL)
+        } else if let webURL {
+            UIApplication.shared.open(webURL)
+        }
     }
 
     // MARK: - Tech Specs
@@ -1127,6 +1147,7 @@ struct EpisodeThumbCard: View {
     let session:   EmbySession
     let scopeMode: Bool
     let colorMode: ColorMode
+    var isCurrent: Bool = false   // true when this card is the episode currently being viewed
     let onTap:     () -> Void
 
     @FocusState private var isFocused: Bool
@@ -1168,11 +1189,24 @@ struct EpisodeThumbCard: View {
                     .overlay {
                         RoundedRectangle(cornerRadius: 7)
                             .strokeBorder(
-                                isFocused
-                                    ? CinemaTheme.focusRimGradient(colorMode)
-                                    : LinearGradient(colors: [.clear], startPoint: .top, endPoint: .bottom),
-                                lineWidth: isFocused ? 2.5 : 0
+                                isCurrent
+                                    ? LinearGradient(colors: [CinemaTheme.accentGold, CinemaTheme.accentGold.opacity(0.6)], startPoint: .topLeading, endPoint: .bottomTrailing)
+                                    : (isFocused
+                                        ? CinemaTheme.focusRimGradient(colorMode)
+                                        : LinearGradient(colors: [.clear], startPoint: .top, endPoint: .bottom)),
+                                lineWidth: (isCurrent || isFocused) ? 2.5 : 0
                             )
+                    }
+
+                    // "NOW PLAYING" pill for the current episode
+                    if isCurrent {
+                        Text("NOW PLAYING")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundStyle(.black)
+                            .padding(.horizontal, 7).padding(.vertical, 3)
+                            .background(CinemaTheme.accentGold, in: RoundedRectangle(cornerRadius: 4))
+                            .padding(6)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                     }
 
                     // Progress bar
