@@ -14,11 +14,14 @@ struct DetailView: View {
     @State private var detail:            EmbyItem?   = nil
     @State private var tmdb:              TMDBMetadata? = nil
     @State private var mediaInfo:          EmbyMediaSource? = nil
-    @State private var collectionItems:   [EmbyItem]  = []
+    @State private var collectionItems:      [EmbyItem]  = []
     @State private var seasons:              [EmbyItem]  = []
     @State private var singleSeasonEpisodes: [EmbyItem]  = []   // populated when series has exactly 1 season
     @State private var loadingCollection                 = false
     @State private var selectedSeason:       EmbyItem?   = nil
+    // Episode detail — all seasons for the series (drives the season picker in More Episodes)
+    @State private var episodeSeasons:       [EmbyItem]  = []
+    @State private var selectedEpisodeSeason: EmbyItem?  = nil
 
     enum DetailFocus { case play, restart, trailer }
     @FocusState private var focusedButton: DetailFocus?
@@ -517,10 +520,51 @@ struct DetailView: View {
 
     private func moreEpisodesSection(scopeMode: Bool) -> some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("More Episodes")
-                .font(.system(size: scopeMode ? 18 : 22, weight: .semibold))
-                .foregroundStyle(CinemaTheme.primary(settings.colorMode))
 
+            // ── Header row: title + season picker ──
+            HStack(alignment: .center, spacing: 16) {
+                Text("More Episodes")
+                    .font(.system(size: scopeMode ? 18 : 22, weight: .semibold))
+                    .foregroundStyle(CinemaTheme.primary(settings.colorMode))
+
+                // Season picker — only shown when there are multiple seasons
+                if episodeSeasons.count > 1 {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            ForEach(episodeSeasons) { season in
+                                let isSelected = selectedEpisodeSeason?.id == season.id
+                                Button {
+                                    guard !isSelected else { return }
+                                    Task { await loadEpisodesForSeason(season) }
+                                } label: {
+                                    Text(season.name)
+                                        .font(.system(size: scopeMode ? 12 : 14,
+                                                      weight: isSelected ? .semibold : .regular))
+                                        .foregroundStyle(
+                                            isSelected
+                                                ? CinemaTheme.bg(settings.colorMode)
+                                                : CinemaTheme.secondary(settings.colorMode)
+                                        )
+                                        .padding(.horizontal, 12)
+                                        .padding(.vertical, 6)
+                                        .background(
+                                            isSelected
+                                                ? CinemaTheme.accentGold
+                                                : CinemaTheme.surfaceNav(settings.colorMode),
+                                            in: RoundedRectangle(cornerRadius: 16)
+                                        )
+                                }
+                                .buttonStyle(.plain)
+                                .animation(.easeInOut(duration: 0.18), value: isSelected)
+                            }
+                        }
+                    }
+                }
+
+                Spacer(minLength: 0)
+            }
+
+            // ── Episode thumb ribbon ──
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: scopeMode ? 16 : 24) {
                     ForEach(collectionItems.filter { $0.type == "Episode" }) { ep in
@@ -537,9 +581,10 @@ struct DetailView: View {
                 .padding(.trailing, scopeMode ? 28 : 80)
             }
             .clipped(antialiased: false)
+            .id(selectedEpisodeSeason?.id ?? "")   // reset scroll position when season changes
         }
         .opacity(loadingCollection ? 0 : 1)
-        .animation(.easeIn(duration: 0.3), value: loadingCollection)
+        .animation(.easeIn(duration: 0.25), value: loadingCollection)
     }
 
     private func collectionSection(scopeMode: Bool) -> some View {
@@ -788,16 +833,28 @@ struct DetailView: View {
         }
 
         // Step 2a: If this is an episode, load sibling episodes from same season
+        //          AND all seasons for the series (for the season picker).
         if (detail?.type ?? item.type) == "Episode" {
             if let seriesId = detail?.seriesId ?? item.seriesId,
                let seasonId = detail?.seasonId ?? item.seasonId {
                 loadingCollection = true
-                if let eps = try? await EmbyAPI.fetchEpisodes(
+
+                // Load all seasons so the picker above the ribbon is populated
+                async let seasonsLoad = EmbyAPI.fetchSeasons(
+                    server: server, userId: user.id, token: token, seriesId: seriesId)
+                async let episodesLoad = EmbyAPI.fetchEpisodes(
                     server: server, userId: user.id, token: token,
-                    seriesId: seriesId, seasonId: seasonId) {
-                    collectionItems   = eps
-                    loadingCollection = false
+                    seriesId: seriesId, seasonId: seasonId)
+
+                if let fetched = try? await seasonsLoad {
+                    episodeSeasons        = fetched
+                    selectedEpisodeSeason = fetched.first(where: { $0.id == seasonId })
                 }
+                if let eps = try? await episodesLoad {
+                    // Sort in episode order — the API doesn't guarantee it
+                    collectionItems = eps.sorted { ($0.indexNumber ?? 0) < ($1.indexNumber ?? 0) }
+                }
+                loadingCollection = false
             }
         }
 
@@ -828,8 +885,11 @@ struct DetailView: View {
             mediaInfo = info
         }
 
-        // Step 4: Load collection siblings if applicable
-        if let pid = detail?.parentId, !pid.isEmpty {
+        // Step 4: Load collection siblings for movies/shows.
+        // Skip for Episodes — their siblings were loaded correctly in Step 2a
+        // and we don't want to overwrite them with unordered fetchCollectionItems results.
+        let resolvedType = detail?.type ?? item.type
+        if resolvedType != "Episode", let pid = detail?.parentId, !pid.isEmpty {
             loadingCollection = true
             if let siblings = try? await EmbyAPI.fetchCollectionItems(
                 server: server, userId: user.id, token: token, collectionId: pid) {
@@ -846,6 +906,24 @@ struct DetailView: View {
             let metadata = await TMDBAPI.metadata(for: enrichItem)
             await MainActor.run { self.tmdb = metadata }
         }
+    }
+
+    // MARK: - Episode season switch
+
+    /// Called when the user picks a different season from the More Episodes season picker.
+    private func loadEpisodesForSeason(_ season: EmbyItem) async {
+        guard let server = session.server,
+              let user   = session.user,
+              let token  = session.token else { return }
+        guard let seriesId = detail?.seriesId ?? item.seriesId else { return }
+        withAnimation(.easeInOut(duration: 0.2)) { loadingCollection = true }
+        selectedEpisodeSeason = season
+        if let eps = try? await EmbyAPI.fetchEpisodes(
+            server: server, userId: user.id, token: token,
+            seriesId: seriesId, seasonId: season.id) {
+            collectionItems = eps.sorted { ($0.indexNumber ?? 0) < ($1.indexNumber ?? 0) }
+        }
+        withAnimation { loadingCollection = false }
     }
 
     // MARK: - Helpers
