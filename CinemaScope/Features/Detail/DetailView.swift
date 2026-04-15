@@ -180,11 +180,8 @@ struct DetailView: View {
         return VStack(alignment: .leading, spacing: scopeMode ? 28 : 48) {
 
             // ── Hero row: poster + title/meta/buttons ──
-            // focusSection lets the focus engine jump here from any horizontal
-            // position in the content below (up-arrow always finds the buttons).
             heroRow(scopeMode: scopeMode)
                 .padding(.horizontal, pad)
-                .focusSection()
 
             // ── Overview ──
             if let overview = displayItem.overview, !overview.isEmpty {
