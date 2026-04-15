@@ -47,11 +47,12 @@ struct DimensionsOverlay: View {
 
     private var stateLabel: String {
         switch state {
-        case .idle:           return "IDLE"
-        case .loading:        return "LOADING…"
-        case .playing:        return "PLAYING"
-        case .paused:         return "PAUSED"
-        case .failed(let e):  return "ERROR: \(e)"
+        case .idle:              return "IDLE"
+        case .loading:           return "LOADING…"
+        case .retrying(let msg): return "RETRYING: \(msg)"
+        case .playing:           return "PLAYING"
+        case .paused:            return "PAUSED"
+        case .failed(let e):     return "ERROR: \(e)"
         }
     }
 
