@@ -366,19 +366,30 @@ struct HomeView: View {
         }
     }
 
-    private func play(_ item: EmbyItem) {
+    private func play(_ item: EmbyItem, startTicks: Int64? = nil) {
         guard let server = session.server,
               let user   = session.user,
               let token  = session.token else { return }
         Task {
             do {
                 let url = try await EmbyAPI.playbackURL(
-                    server: server, userId: user.id, token: token, itemId: item.id
+                    server: server, userId: user.id, token: token,
+                    itemId: item.id, itemName: item.name
                 )
-                let resumeTicks = item.userData?.playbackPositionTicks ?? 0
+                let ticks = startTicks ?? (item.userData?.playbackPositionTicks ?? 0)
                 await MainActor.run {
                     engine.setReportingContext(server: server, userId: user.id, token: token, itemId: item.id)
-                    engine.load(url: url, startTicks: resumeTicks)
+                    // Retry handler: if primary URL fails, force transcode
+                    engine.setRetryHandler {
+                        print("[HomeView] 🔄 Primary failed — forcing transcode for \(item.name)")
+                        guard let tUrl = try? await EmbyAPI.forcedTranscodeURL(
+                            server: server, userId: user.id, token: token, itemId: item.id) else { return }
+                        await MainActor.run {
+                            engine.setReportingContext(server: server, userId: user.id, token: token, itemId: item.id)
+                            engine.load(url: tUrl, startTicks: ticks)
+                        }
+                    }
+                    engine.load(url: url, startTicks: ticks)
                     withAnimation { destination = .player(item) }
                 }
             } catch { print("[HomeView] Playback error: \(error)") }
@@ -386,21 +397,7 @@ struct HomeView: View {
     }
 
     private func restart(_ item: EmbyItem) {
-        guard let server = session.server,
-              let user   = session.user,
-              let token  = session.token else { return }
-        Task {
-            do {
-                let url = try await EmbyAPI.playbackURL(
-                    server: server, userId: user.id, token: token, itemId: item.id
-                )
-                await MainActor.run {
-                    engine.setReportingContext(server: server, userId: user.id, token: token, itemId: item.id)
-                    engine.load(url: url, startTicks: 0)
-                    withAnimation { destination = .player(item) }
-                }
-            } catch { print("[HomeView] Restart error: \(error)") }
-        }
+        play(item, startTicks: 0)
     }
 }
 

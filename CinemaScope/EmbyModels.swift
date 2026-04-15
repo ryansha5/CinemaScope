@@ -215,29 +215,49 @@ struct EmbyUsersResponse: Codable {
 // MARK: - Playback Info
 
 struct EmbyPlaybackInfo: Codable {
-    let mediaSources: [EmbyMediaSource]
-    enum CodingKeys: String, CodingKey { case mediaSources = "MediaSources" }
+    let mediaSources:   [EmbyMediaSource]
+    let playSessionId:  String?
+    enum CodingKeys: String, CodingKey {
+        case mediaSources  = "MediaSources"
+        case playSessionId = "PlaySessionId"
+    }
 }
 
 struct EmbyMediaSource: Codable {
     let id:                   String
     let directStreamUrl:      String?
+    let transcodingUrl:       String?    // Emby-generated transcode URL
+    let transcodingSubProtocol: String?  // "hls", "http"
+    let transcodingContainer: String?    // "ts", "mp4"
+    let supportsDirectPlay:   Bool?
     let supportsDirectStream: Bool?
+    let supportsTranscoding:  Bool?
+    let requiresOpening:      Bool?
+    let requiresClosing:      Bool?
     let mediaStreams:          [EmbyMediaStream]?
-    let container:            String?    // "mkv", "mp4", "avi", etc.
-    let bitrate:              Int?       // overall bitrate in bps
-    let size:                 Int64?     // file size in bytes
-    let videoType:            String?    // "VideoFile", "BluRay", etc.
+    let container:            String?
+    let bitrate:              Int?
+    let size:                 Int64?
+    let videoType:            String?
+    let eTag:                 String?
 
     enum CodingKeys: String, CodingKey {
-        case id                   = "Id"
-        case directStreamUrl      = "DirectStreamUrl"
-        case supportsDirectStream = "SupportsDirectStream"
-        case mediaStreams          = "MediaStreams"
-        case container            = "Container"
-        case bitrate              = "Bitrate"
-        case size                 = "Size"
-        case videoType            = "VideoType"
+        case id                     = "Id"
+        case directStreamUrl        = "DirectStreamUrl"
+        case transcodingUrl         = "TranscodingUrl"
+        case transcodingSubProtocol = "TranscodingSubProtocol"
+        case transcodingContainer   = "TranscodingContainer"
+        case supportsDirectPlay     = "SupportsDirectPlay"
+        case supportsDirectStream   = "SupportsDirectStream"
+        case supportsTranscoding    = "SupportsTranscoding"
+        case requiresOpening        = "RequiresOpening"
+        case requiresClosing        = "RequiresClosing"
+        case mediaStreams            = "MediaStreams"
+        case container              = "Container"
+        case bitrate                = "Bitrate"
+        case size                   = "Size"
+        case videoType              = "VideoType"
+        case eTag                   = "ETag"
     }
 
     // Convenience

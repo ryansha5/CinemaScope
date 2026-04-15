@@ -334,110 +334,255 @@ actor EmbyAPI {
         return info.mediaSources.first
     }
 
-    private static let appleTVVideoCodecs: Set<String> = [
-        "h264", "avc", "hevc", "h265", "vp9", "av1", "mpeg4", "mpeg2video"
+    // ─────────────────────────────────────────────────────────────────
+    // MARK: - AVPlayer Codec Tables (advisory only)
+    // Used to assess client-side safety. NOT used to override Emby's decision.
+    // ─────────────────────────────────────────────────────────────────
+
+    private static let avpVideoCodecs: Set<String> = [
+        "h264", "avc", "avc1",
+        "hevc", "h265", "hvc1", "hev1",
+        "mpeg4", "mp4v",
     ]
 
-    private static let appleTVAudioCodecs: Set<String> = [
-        "aac", "mp3", "ac3", "eac3", "alac", "flac", "opus", "pcm_s16le", "pcm_s24le"
+    private static let avpDirectPlayContainers: Set<String> = [
+        "mp4", "m4v", "mov"
     ]
+
+    private static let avpAudioCodecs: Set<String> = [
+        "aac", "mp3", "mp2", "ac3", "eac3",
+        "alac", "flac",
+        "pcm_s16le", "pcm_s16be", "pcm_s24le", "pcm_s24be",
+        "opus",
+    ]
+
+    // ─────────────────────────────────────────────────────────────────
+    // MARK: - Client-side codec safety assessment (advisory)
+    // Returns true only if all codecs are known safe for AVPlayer.
+    // This is used to CONFIRM a path Emby already offers — not to choose one.
+    // ─────────────────────────────────────────────────────────────────
+
+    private static func codecsAreSafeForAVPlayer(_ source: EmbyMediaSource) -> Bool {
+        let videoCodec  = (source.videoStream?.codec ?? "").lowercased()
+        let audioCodecs = source.audioStreams.map { ($0.codec ?? "").lowercased() }
+
+        // Video must be known-safe (empty = unknown = treat as unsafe)
+        guard !videoCodec.isEmpty, avpVideoCodecs.contains(videoCodec) else { return false }
+
+        // At least one audio track must be safe
+        let hasSafeAudio = audioCodecs.isEmpty || audioCodecs.contains { avpAudioCodecs.contains($0) }
+        return hasSafeAudio
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // MARK: - playbackURL
+    // Emby PlaybackInfo is the primary source of truth.
+    // Client codec analysis is advisory — used only to confirm, not override.
+    // ─────────────────────────────────────────────────────────────────
 
     static func playbackURL(
-        server: EmbyServer, userId: String, token: String, itemId: String
+        server: EmbyServer, userId: String, token: String,
+        itemId: String, itemName: String = ""
     ) async throws -> URL {
-        // Ask Emby for playback info — send Apple TV device profile so
-        // Emby can make the right direct-play/transcode decision itself
+
+        // ── Step 1: Fetch PlaybackInfo ──────────────────────────────
         var infoComps = try urlComponents(server, path: "/Items/\(itemId)/PlaybackInfo")
         infoComps.queryItems = [.init(name: "UserId", value: userId)]
         guard let infoURL = infoComps.url else { throw EmbyError.invalidURL }
 
-        let deviceProfile = appleTVDeviceProfile()
         let info = try decode(EmbyPlaybackInfo.self,
-                              from: try await postJSON(url: infoURL, body: deviceProfile, token: token))
+                              from: try await postJSON(url: infoURL,
+                                                       body: appleTVDeviceProfile(),
+                                                       token: token))
         guard let source = info.mediaSources.first else { throw EmbyError.noMediaSource }
 
-        // Always direct stream — server has transcoding disabled.
-        // Emby remuxes MKV/AVI/etc to HTTP byte stream at zero CPU cost with Static=true.
-        // The container doesn't matter — only the codec matters for Apple TV compatibility.
-        let container = (source.container ?? "unknown").lowercased()
-        print("[EmbyAPI] ✅ Direct Stream — \(container) container")
+        // ── Step 2: Gather facts from PlaybackInfo ──────────────────
+        let container          = source.container ?? "unknown"
+        let videoCodec         = source.videoStream?.codec ?? "unknown"
+        let audioCodecs        = source.audioStreams.compactMap { $0.codec }.joined(separator: ", ")
+        let subCodecs          = source.subtitleStreams.compactMap { $0.codec }.joined(separator: ", ")
+        let supportsDP         = source.supportsDirectPlay
+        let supportsDS         = source.supportsDirectStream
+        let embyTranscodeUrl   = source.transcodingUrl
+        let embyDirectStreamUrl = source.directStreamUrl
+        let codecsSafe         = codecsAreSafeForAVPlayer(source)
+        let nativeContainer    = avpDirectPlayContainers.contains(container.lowercased())
 
-        var comps = try urlComponents(server, path: "/Videos/\(itemId)/stream")
-        let params: [URLQueryItem] = [
-            .init(name: "MediaSourceId", value: source.id),
-            .init(name: "api_key",       value: token),
-            .init(name: "DeviceId",      value: "CinemaScope-AppleTV"),
-            .init(name: "Static",        value: "true"),
-        ]
-        comps.queryItems = params
-        guard let url = comps.url else { throw EmbyError.invalidURL }
+        // ── Step 3: Decision logic (Emby is authoritative) ─────────
+        //
+        // Rule 1: Direct Play — Emby says it's safe AND container is native AND codecs are safe
+        // Rule 2: Direct Stream — Emby provides a valid direct stream URL AND codecs are safe
+        // Rule 3: Transcode — use Emby's transcodingUrl (preferred) or fall back to manual
+        // Rule 4: If no valid URL can be constructed, throw
+
+        enum Reason: String {
+            case embySaysDP         = "Emby supportsDirectPlay=true, native container, safe codecs"
+            case embySaysDS         = "Emby supportsDirectStream=true, safe codecs, DirectStreamUrl provided"
+            case embyDSUrlOnly      = "Emby DirectStreamUrl provided, safe codecs (supportsDirectStream nil/false)"
+            case embyTranscode      = "Emby-provided TranscodingUrl used"
+            case manualTranscode    = "Manual transcode URL constructed (no Emby URL available)"
+            case unsafeCodecs       = "Client codec check: codecs not safe for AVPlayer"
+            case noDirectPath       = "Emby did not provide a direct play or stream path"
+        }
+
+        var chosenPath = "transcode"
+        var reason: Reason = .noDirectPath
+        var finalURL: URL? = nil
+
+        // Rule 1: Direct Play
+        if supportsDP == true && nativeContainer && codecsSafe {
+            var comps = try urlComponents(server, path: "/Videos/\(itemId)/stream")
+            comps.queryItems = [
+                .init(name: "MediaSourceId", value: source.id),
+                .init(name: "api_key",       value: token),
+                .init(name: "DeviceId",      value: "CinemaScope-AppleTV"),
+                .init(name: "Static",        value: "true"),
+            ]
+            if let url = comps.url {
+                chosenPath = "direct-play"
+                reason     = .embySaysDP
+                finalURL   = url
+            }
+        }
+
+        // Rule 2: Direct Stream — Emby says OK and provides a URL
+        if finalURL == nil && codecsSafe {
+            if supportsDS == true, let dsUrl = embyDirectStreamUrl {
+                // Use Emby's DirectStreamUrl, ensuring api_key is present
+                let base = dsUrl.hasPrefix("http") ? dsUrl : server.url + dsUrl
+                if var comps = URLComponents(string: base) {
+                    var items = comps.queryItems ?? []
+                    if !items.contains(where: { $0.name == "api_key" }) {
+                        items.append(.init(name: "api_key", value: token))
+                    }
+                    comps.queryItems = items
+                    if let url = comps.url {
+                        chosenPath = "direct-stream"
+                        reason     = .embySaysDS
+                        finalURL   = url
+                    }
+                }
+            } else if let dsUrl = embyDirectStreamUrl {
+                // Emby provided a DirectStreamUrl even though supportsDirectStream
+                // is nil/false — trust the URL over the flag, but note it
+                let base = dsUrl.hasPrefix("http") ? dsUrl : server.url + dsUrl
+                if var comps = URLComponents(string: base) {
+                    var items = comps.queryItems ?? []
+                    if !items.contains(where: { $0.name == "api_key" }) {
+                        items.append(.init(name: "api_key", value: token))
+                    }
+                    comps.queryItems = items
+                    if let url = comps.url {
+                        chosenPath = "direct-stream"
+                        reason     = .embyDSUrlOnly
+                        finalURL   = url
+                    }
+                }
+            }
+        }
+
+        // Rule 3: Transcode — use Emby's URL first, manual fallback only if none
+        if finalURL == nil {
+            if !codecsSafe { reason = .unsafeCodecs }
+            if let tcUrl = embyTranscodeUrl {
+                let base = tcUrl.hasPrefix("http") ? tcUrl : server.url + tcUrl
+                if var comps = URLComponents(string: base) {
+                    var items = comps.queryItems ?? []
+                    if !items.contains(where: { $0.name == "api_key" }) {
+                        items.append(.init(name: "api_key", value: token))
+                    }
+                    comps.queryItems = items
+                    if let url = comps.url {
+                        chosenPath = "transcode"
+                        reason     = .embyTranscode
+                        finalURL   = url
+                    }
+                }
+            }
+        }
+
+        // Rule 4: Manual transcode — last resort, log clearly that we constructed it
+        if finalURL == nil {
+            var comps = try urlComponents(server, path: "/Videos/\(itemId)/stream.mp4")
+            comps.queryItems = [
+                .init(name: "MediaSourceId",   value: source.id),
+                .init(name: "api_key",         value: token),
+                .init(name: "DeviceId",        value: "CinemaScope-AppleTV"),
+                .init(name: "VideoCodec",      value: "h264"),
+                .init(name: "AudioCodec",      value: "aac,ac3"),
+                .init(name: "MaxVideoBitrate", value: "8000000"),
+                .init(name: "AudioBitrate",    value: "192000"),
+                .init(name: "AudioChannels",   value: "6"),
+                .init(name: "MaxWidth",        value: "1920"),
+                .init(name: "MaxHeight",       value: "1080"),
+                .init(name: "Static",          value: "false"),
+            ]
+            if let url = comps.url {
+                chosenPath = "transcode-manual"
+                reason     = .manualTranscode
+                finalURL   = url
+            }
+        }
+
+        guard let url = finalURL else { throw EmbyError.invalidURL }
+
+        // ── Step 4: Log everything ──────────────────────────────────
+        print("""
+[Playback] ══════════════════════════════════════════
+[Playback] Item:               \(itemName.isEmpty ? itemId : itemName)
+[Playback] Container:          \(container)
+[Playback] Video codec:        \(videoCodec)
+[Playback] Audio codecs:       \(audioCodecs.isEmpty ? "none" : audioCodecs)
+[Playback] Subtitle codecs:    \(subCodecs.isEmpty ? "none" : subCodecs)
+[Playback] supportsDirectPlay: \(supportsDP.map { "\($0)" } ?? "nil")
+[Playback] supportsDirectStream: \(supportsDS.map { "\($0)" } ?? "nil")
+[Playback] Emby DirectStreamUrl: \(embyDirectStreamUrl ?? "nil")
+[Playback] Emby TranscodingUrl:  \(embyTranscodeUrl?.prefix(80) ?? "nil")
+[Playback] Codec check:        \(codecsSafe ? "✅ safe" : "⚠️ unsafe")
+[Playback] ─────────────────────────────────────────
+[Playback] Path chosen:        \(chosenPath)
+[Playback] Reason:             \(reason.rawValue)
+[Playback] URL type:           \(chosenPath.contains("manual") ? "⚠️ MANUALLY CONSTRUCTED" : "✅ from PlaybackInfo")
+[Playback] ══════════════════════════════════════════
+""")
+
         return url
     }
 
 
+    // ─────────────────────────────────────────────────────────────────
+    // MARK: - Device Profile
+
     private static func appleTVDeviceProfile() -> [String: Any] {
-        // Use a JSON string to avoid Swift type inference issues with mixed [String: Any] dicts
         let json = """
         {
             "DeviceProfile": {
-                "Name": "Apple TV 4K - CinemaScope",
+                "Name": "CinemaScope Apple TV 4K",
                 "MaxStreamingBitrate": 120000000,
-                "MaxStaticBitrate": 120000000,
                 "DirectPlayProfiles": [
                     {
                         "Type": "Video",
-                        "Container": "mp4,m4v,mov,mkv,m2ts,ts,avi,webm",
-                        "VideoCodec": "h264,hevc,h265,mpeg4,vp9,av1",
-                        "AudioCodec": "aac,mp3,ac3,eac3,alac,flac,opus,pcm_s16le,pcm_s24le"
+                        "Container": "mp4,m4v,mov",
+                        "VideoCodec": "h264,hevc,h265",
+                        "AudioCodec": "aac,mp3,ac3,eac3,alac,flac,opus"
                     }
                 ],
                 "TranscodingProfiles": [
                     {
                         "Type": "Video",
                         "Container": "mp4",
-                        "VideoCodec": "h264,hevc",
+                        "VideoCodec": "h264",
                         "AudioCodec": "aac,ac3",
                         "Protocol": "http",
                         "Context": "Streaming",
-                        "MaxAudioChannels": "6",
-                        "TranscodeSeekInfo": "Auto",
-                        "EstimateContentLength": false
+                        "MaxAudioChannels": "6"
                     }
                 ],
                 "ContainerProfiles": [],
-                "CodecProfiles": [
-                    {
-                        "Type": "Video",
-                        "Codec": "h264",
-                        "Conditions": [
-                            {
-                                "Condition": "LessThanEqual",
-                                "Property": "VideoLevel",
-                                "Value": "52",
-                                "IsRequired": false
-                            }
-                        ]
-                    },
-                    {
-                        "Type": "Video",
-                        "Codec": "hevc,h265",
-                        "Conditions": [
-                            {
-                                "Condition": "LessThanEqual",
-                                "Property": "VideoLevel",
-                                "Value": "60",
-                                "IsRequired": false
-                            }
-                        ]
-                    }
-                ],
+                "CodecProfiles": [],
                 "SubtitleProfiles": [
                     { "Format": "vtt", "Method": "External" },
-                    { "Format": "srt", "Method": "External" },
-                    { "Format": "ass", "Method": "External" }
-                ],
-                "ResponseProfiles": [
-                    { "Type": "Video", "Container": "m4v", "MimeType": "video/mp4" }
+                    { "Format": "srt", "Method": "External" }
                 ]
             }
         }
@@ -446,6 +591,62 @@ actor EmbyAPI {
               let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return [:] }
         return dict
+    }
+
+    // MARK: - Forced Transcode URL
+    // Called by PlaybackEngine retry handler when primary path fails.
+    // Always asks Emby to transcode to a safe H.264/AAC MP4.
+    // ─────────────────────────────────────────────────────────────────
+
+    static func forcedTranscodeURL(
+        server: EmbyServer, userId: String, token: String, itemId: String
+    ) async throws -> URL {
+        // Re-fetch PlaybackInfo to get a fresh transcode session
+        var infoComps = try urlComponents(server, path: "/Items/\(itemId)/PlaybackInfo")
+        infoComps.queryItems = [.init(name: "UserId", value: userId)]
+        guard let infoURL = infoComps.url else { throw EmbyError.invalidURL }
+
+        let info = try decode(EmbyPlaybackInfo.self,
+                              from: try await postJSON(url: infoURL,
+                                                       body: appleTVDeviceProfile(),
+                                                       token: token))
+        guard let source = info.mediaSources.first else { throw EmbyError.noMediaSource }
+
+        // Prefer Emby's own transcode URL — it accounts for subtitle burning etc.
+        if let tcUrl = source.transcodingUrl {
+            let fullUrl = tcUrl.hasPrefix("http") ? tcUrl : server.url + tcUrl
+            if var comps = URLComponents(string: fullUrl) {
+                var items = comps.queryItems ?? []
+                if !items.contains(where: { $0.name == "api_key" }) {
+                    items.append(.init(name: "api_key", value: token))
+                }
+                comps.queryItems = items
+                if let url = comps.url {
+                    print("[Playback] 🆘 Forced transcode URL from Emby: \(url.absoluteString.prefix(80))")
+                    return url
+                }
+            }
+        }
+
+        // Manual fallback — conservative settings for maximum compatibility
+        var comps = try urlComponents(server, path: "/Videos/\(itemId)/stream.mp4")
+        comps.queryItems = [
+            .init(name: "MediaSourceId",   value: source.id),
+            .init(name: "api_key",         value: token),
+            .init(name: "DeviceId",        value: "CinemaScope-AppleTV"),
+            .init(name: "VideoCodec",      value: "h264"),
+            .init(name: "AudioCodec",      value: "aac"),
+            .init(name: "MaxVideoBitrate", value: "10000000"),
+            .init(name: "VideoBitrate",    value: "6000000"),
+            .init(name: "AudioBitrate",    value: "192000"),
+            .init(name: "AudioChannels",   value: "2"),
+            .init(name: "MaxWidth",        value: "1920"),
+            .init(name: "MaxHeight",       value: "1080"),
+            .init(name: "Static",          value: "false"),
+        ]
+        guard let url = comps.url else { throw EmbyError.invalidURL }
+        print("[Playback] 🆘 Forced transcode URL (manual): \(url.absoluteString.prefix(80))")
+        return url
     }
 
     // MARK: - Image URLs

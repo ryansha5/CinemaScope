@@ -54,6 +54,9 @@ final class PlaybackEngine: ObservableObject {
     private var progressReportTimer: Timer?     = nil
     private var hasReportedStart                = false
 
+    // Retry context — used for automatic fallback on failure
+    private var retryHandler: (() async -> Void)? = nil
+
     // MARK: - Load
 
     func load(url: URL, startTicks: Int64 = 0) {
@@ -78,6 +81,11 @@ final class PlaybackEngine: ObservableObject {
         observeStatus(of: item)
         observeDimensions(of: item)
         observeTime()
+    }
+
+    /// Optional: provide a fallback handler called automatically on playback failure
+    func setRetryHandler(_ handler: @escaping () async -> Void) {
+        retryHandler = handler
     }
 
     /// Call this before load() to enable Emby progress reporting
@@ -158,15 +166,20 @@ final class PlaybackEngine: ObservableObject {
                     let code  = err?.code ?? 0
                     print("[PlaybackEngine] ❌ Error \(code): \(msg)")
                     print("[PlaybackEngine] ❌ Underlying: \(under?.localizedDescription ?? "none")")
-                    print("[PlaybackEngine] ❌ UserInfo: \(err?.userInfo ?? [:])")
-                    // Common error codes:
-                    // -11800 = cannot open, -11850 = unsupported format
-                    // -11819 = cannot decode, -11828 = no decoders
+
+                    // If we have a retry handler, try it before showing error
+                    if let retry = self.retryHandler {
+                        print("[PlaybackEngine] 🔄 Retrying with fallback...")
+                        self.retryHandler = nil   // clear to prevent infinite loop
+                        Task { await retry() }
+                        return
+                    }
+
                     let friendly: String
                     switch code {
-                    case -11800: friendly = "Cannot open this file. It may be an unsupported format or the server is unreachable."
-                    case -11850: friendly = "Unsupported media format. Try enabling transcoding in your Emby server settings."
-                    case -11819, -11828: friendly = "Cannot decode this video. The codec may not be supported on Apple TV."
+                    case -11800: friendly = "Cannot open this file. The server may be unreachable."
+                    case -11850: friendly = "Unsupported format. Check your Emby server transcoding settings."
+                    case -11819, -11828: friendly = "Cannot decode this video on Apple TV."
                     default: friendly = msg
                     }
                     self.playbackState = .failed(friendly)
