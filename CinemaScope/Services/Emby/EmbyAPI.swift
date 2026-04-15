@@ -457,12 +457,12 @@ actor EmbyAPI {
             case embySaysDP             = "Emby supportsDirectPlay=true — used Emby-provided direct-play path"
             case embySaysDPManualPath   = "Emby supportsDirectPlay=true — no explicit URL, used manual direct-play fallback"
             case embySaysDS             = "Emby supportsDirectStream=true — used Emby DirectStreamUrl exactly"
-            case embyDSUrlOnly          = "Emby DirectStreamUrl provided (supportsDirectStream nil/false) — trusted URL over flag"
             case embyTranscode          = "Used Emby-provided TranscodingUrl exactly"
             case manualDirectPlay       = "⚠️ EMERGENCY: manual direct-play URL constructed — PlaybackInfo gave no usable URL"
             case manualTranscode        = "⚠️ EMERGENCY: manual transcode URL constructed — PlaybackInfo gave no usable URL"
             case unsafeCodecs           = "Client codec check: codecs not safe for AVPlayer — falling through to transcode"
             case noDirectPath           = "Emby did not provide a direct-play or direct-stream path"
+            case dsSkipped              = "supportsDirectStream != true — skipped DirectStreamUrl, falling through to transcode"
         }
 
         var chosenPath   = "transcode"
@@ -472,7 +472,8 @@ actor EmbyAPI {
 
         // Helper: resolve a raw Emby URL string (relative or absolute) → URL,
         // appending api_key if absent. Returns nil if the string is malformed.
-        // Logs whether the original was relative and whether api_key was appended.
+        // Logs path, and explicitly flags the presence of api_key, MediaSourceId,
+        // PlaySessionId, and Static=true so 404 root causes are easy to spot.
         func resolveEmbyURL(_ raw: String, label: String) -> URL? {
             let wasRelative = !raw.hasPrefix("http")
             let absolute    = wasRelative ? server.url + raw : raw
@@ -481,13 +482,27 @@ actor EmbyAPI {
                 return nil
             }
             var items = comps.queryItems ?? []
-            let hadApiKey = items.contains(where: { $0.name == "api_key" })
+            let hadApiKey       = items.contains(where: { $0.name.lowercased() == "api_key" })
+            let hasMediaSrcId   = items.contains(where: { $0.name.lowercased() == "mediasourceid" })
+            let hasPlaySession  = items.contains(where: { $0.name.lowercased() == "playsessionid" })
+            let hasStaticTrue   = items.contains(where: {
+                $0.name.lowercased() == "static" && ($0.value ?? "").lowercased() == "true"
+            })
             if !hadApiKey {
                 items.append(.init(name: "api_key", value: token))
                 comps.queryItems = items
             }
             guard let url = comps.url else { return nil }
-            print("[Playback] \(label): source=PlaybackInfo, wasRelative=\(wasRelative), apiKeyAppended=\(!hadApiKey), length=\(url.absoluteString.count)")
+            print("""
+[Playback] \(label)
+[Playback]   path:           \(comps.path)
+[Playback]   wasRelative:    \(wasRelative)
+[Playback]   api_key:        \(hadApiKey ? "✅ present" : "➕ appended")
+[Playback]   MediaSourceId:  \(hasMediaSrcId  ? "✅ present" : "❌ MISSING")
+[Playback]   PlaySessionId:  \(hasPlaySession ? "✅ present" : "❌ missing")
+[Playback]   static=true:    \(hasStaticTrue  ? "✅ present" : "— not set")
+[Playback]   total length:   \(url.absoluteString.count) chars
+""")
             return url
         }
 
@@ -514,18 +529,23 @@ actor EmbyAPI {
             }
         }
 
-        // ── Rule 2: Direct Stream — use Emby's URL exactly ──────────
+        // ── Rule 2: Direct Stream — only when Emby explicitly says so ──
+        // supportsDirectStream must be true. If it is nil or false the
+        // DirectStreamUrl is unreliable (Emby returns it for structural
+        // reasons but it 404s), so we skip it and fall through to transcode.
         if finalURL == nil && codecsSafe {
-            if let dsUrl = embyDirectStreamUrl {
-                // supportsDirectStream may be true, nil, or even false —
-                // if Emby gave us a DirectStreamUrl we trust the URL over the flag.
-                let flagNote = supportsDS == true ? "supportsDirectStream=true" : "supportsDirectStream=\(supportsDS.map{"\($0)"} ?? "nil") (trusting URL)"
-                if let url = resolveEmbyURL(dsUrl, label: "direct-stream (\(flagNote))") {
+            if supportsDS == true, let dsUrl = embyDirectStreamUrl {
+                if let url = resolveEmbyURL(dsUrl, label: "direct-stream (supportsDirectStream=true)") {
                     chosenPath = "direct-stream"
                     playMethod = "DirectStream"
-                    reason     = supportsDS == true ? .embySaysDS : .embyDSUrlOnly
+                    reason     = .embySaysDS
                     finalURL   = url
                 }
+            } else if embyDirectStreamUrl != nil {
+                // URL exists but flag is nil/false — log and skip to avoid 404
+                let flagVal = supportsDS.map { "\($0)" } ?? "nil"
+                print("[Playback] ⏭️ Skipping DirectStreamUrl: supportsDirectStream=\(flagVal) — falling through to transcode")
+                reason = .dsSkipped
             }
         }
 
