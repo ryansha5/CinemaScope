@@ -178,8 +178,11 @@ struct DetailView: View {
         return VStack(alignment: .leading, spacing: scopeMode ? 28 : 48) {
 
             // ── Hero row: poster + title/meta/buttons ──
+            // focusSection lets the focus engine jump here from any horizontal
+            // position in the content below (up-arrow always finds the buttons).
             heroRow(scopeMode: scopeMode)
                 .padding(.horizontal, pad)
+                .focusSection()
 
             // ── Overview ──
             if let overview = displayItem.overview, !overview.isEmpty {
@@ -226,6 +229,7 @@ struct DetailView: View {
             if displayItem.type == "Episode" && !collectionItems.isEmpty {
                 moreEpisodesSection(scopeMode: scopeMode)
                     .padding(.leading, pad)
+                    .focusSection()
             // ── Collection siblings (movies/shows) ──
             } else if displayItem.type != "Episode" && !collectionItems.isEmpty {
                 collectionSection(scopeMode: scopeMode)
@@ -532,30 +536,15 @@ struct DetailView: View {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 8) {
                             ForEach(episodeSeasons) { season in
-                                let isSelected = selectedEpisodeSeason?.id == season.id
-                                Button {
-                                    guard !isSelected else { return }
+                                SeasonPickerPill(
+                                    season:     season,
+                                    isSelected: selectedEpisodeSeason?.id == season.id,
+                                    scopeMode:  scopeMode,
+                                    colorMode:  settings.colorMode
+                                ) {
+                                    guard selectedEpisodeSeason?.id != season.id else { return }
                                     Task { await loadEpisodesForSeason(season) }
-                                } label: {
-                                    Text(season.name)
-                                        .font(.system(size: scopeMode ? 12 : 14,
-                                                      weight: isSelected ? .semibold : .regular))
-                                        .foregroundStyle(
-                                            isSelected
-                                                ? CinemaTheme.bg(settings.colorMode)
-                                                : CinemaTheme.secondary(settings.colorMode)
-                                        )
-                                        .padding(.horizontal, 12)
-                                        .padding(.vertical, 6)
-                                        .background(
-                                            isSelected
-                                                ? CinemaTheme.accentGold
-                                                : CinemaTheme.surfaceNav(settings.colorMode),
-                                            in: RoundedRectangle(cornerRadius: 16)
-                                        )
                                 }
-                                .buttonStyle(.plain)
-                                .animation(.easeInOut(duration: 0.18), value: isSelected)
                             }
                         }
                     }
@@ -585,18 +574,13 @@ struct DetailView: View {
                     .padding(.trailing, scopeMode ? 28 : 80)
                 }
                 .clipped(antialiased: false)
-                // When collectionItems changes (initial load or season switch),
-                // scroll to the current episode if it's present; otherwise
-                // scroll to the first episode so the new season starts at ep 1.
+                // Helper — works for both onAppear and onChange
+                .onAppear {
+                    scrollToTarget(in: collectionItems, proxy: proxy)
+                }
+                // Season switch: collectionItems changes while the view is live
                 .onChange(of: collectionItems) { episodes in
-                    let targetId = episodes.first(where: { $0.id == displayItem.id })?.id
-                                   ?? episodes.first?.id
-                    guard let targetId else { return }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                        withAnimation(.easeInOut(duration: 0.35)) {
-                            proxy.scrollTo(targetId, anchor: .center)
-                        }
-                    }
+                    scrollToTarget(in: episodes, proxy: proxy)
                 }
             }
         }
@@ -922,6 +906,23 @@ struct DetailView: View {
         Task.detached(priority: .background) {
             let metadata = await TMDBAPI.metadata(for: enrichItem)
             await MainActor.run { self.tmdb = metadata }
+        }
+    }
+
+    // MARK: - Episode ribbon scroll helper
+
+    /// Scrolls the More Episodes ribbon to the current episode if it is in `episodes`,
+    /// or to episode 1 when the user has switched to a different season.
+    /// The brief delay lets SwiftUI finish layout before scrollTo runs.
+    private func scrollToTarget(in episodes: [EmbyItem], proxy: ScrollViewProxy) {
+        let episodes = episodes.filter { $0.type == "Episode" }
+        let targetId = episodes.first(where: { $0.id == displayItem.id })?.id
+                       ?? episodes.first?.id
+        guard let targetId else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+            withAnimation(.easeInOut(duration: 0.35)) {
+                proxy.scrollTo(targetId, anchor: .center)
+            }
         }
     }
 
@@ -1484,5 +1485,53 @@ struct EpisodeThumbCard: View {
                 .font(.system(size: scopeMode ? 20 : 26))
                 .foregroundStyle(CinemaTheme.tertiary(colorMode))
         }
+    }
+}
+
+// MARK: - SeasonPickerPill
+//
+// A single pill in the More Episodes season picker.
+// Owns its own @FocusState so it can apply focus styling without
+// the default tvOS white-box highlight that .buttonStyle(.plain) doesn't suppress.
+
+private struct SeasonPickerPill: View {
+    let season:     EmbyItem
+    let isSelected: Bool
+    let scopeMode:  Bool
+    let colorMode:  ColorMode
+    let onTap:      () -> Void
+
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        Button(action: onTap) {
+            Text(season.name)
+                .font(.system(size: scopeMode ? 12 : 14,
+                              weight: isSelected ? .semibold : .regular))
+                .foregroundStyle(
+                    isSelected ? CinemaTheme.bg(colorMode) :
+                    isFocused  ? CinemaTheme.primary(colorMode) :
+                                 CinemaTheme.secondary(colorMode)
+                )
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(
+                    isSelected ? CinemaTheme.accentGold :
+                    isFocused  ? CinemaTheme.surfaceRaised(colorMode) :
+                                 CinemaTheme.surfaceNav(colorMode),
+                    in: RoundedRectangle(cornerRadius: 16)
+                )
+                .overlay {
+                    if isSelected {
+                        RoundedRectangle(cornerRadius: 16)
+                            .strokeBorder(CinemaTheme.accentGold.opacity(0.4), lineWidth: 1)
+                    }
+                }
+                .scaleEffect(isFocused ? 1.06 : 1.0)
+                .animation(.spring(response: 0.22, dampingFraction: 0.7), value: isFocused)
+                .animation(.easeInOut(duration: 0.18), value: isSelected)
+        }
+        .focusRingFree()
+        .focused($isFocused)
     }
 }
