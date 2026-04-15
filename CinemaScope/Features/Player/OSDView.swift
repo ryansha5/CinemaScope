@@ -125,7 +125,22 @@ struct OSDView: View {
                 .font(.system(size: 28))
                 .foregroundStyle(.white)
                 .frame(width: 64, height: 64)
-                .background(.white.opacity(0.12), in: Circle())
+                .background {
+                    ZStack {
+                        Circle().fill(Color.white.opacity(0.15))
+                        // Top specular
+                        LinearGradient(
+                            stops: [
+                                .init(color: Color.white.opacity(0.40), location: 0.0),
+                                .init(color: Color.white.opacity(0.08), location: 0.5),
+                                .init(color: Color.clear,               location: 0.8),
+                            ],
+                            startPoint: .top, endPoint: .bottom
+                        )
+                        .clipShape(Circle())
+                    }
+                }
+                .overlay { Circle().strokeBorder(Color.white.opacity(0.30), lineWidth: 1) }
         }
         .buttonStyle(.plain)
     }
@@ -140,13 +155,30 @@ struct OSDView: View {
                 } label: {
                     Text(m.label)
                         .font(.system(size: 18, weight: .medium))
-                        .foregroundStyle(mode == m ? .black : .white)
+                        .foregroundStyle(mode == m ? Color.black : Color.white)
                         .padding(.horizontal, 24)
                         .padding(.vertical, 14)
-                        .background(
-                            mode == m ? Color.white : Color.white.opacity(0.12),
-                            in: RoundedRectangle(cornerRadius: 10)
-                        )
+                        .background {
+                            ZStack {
+                                RoundedRectangle(cornerRadius: 24)
+                                    .fill(mode == m ? Color.white.opacity(0.90) : Color.white.opacity(0.12))
+                                if mode != m {
+                                    // Glass specular on inactive buttons
+                                    LinearGradient(
+                                        stops: [
+                                            .init(color: Color.white.opacity(0.30), location: 0.0),
+                                            .init(color: Color.clear,               location: 0.6),
+                                        ],
+                                        startPoint: .top, endPoint: .bottom
+                                    )
+                                    .clipShape(RoundedRectangle(cornerRadius: 24))
+                                }
+                            }
+                        }
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 24)
+                                .strokeBorder(Color.white.opacity(mode == m ? 0 : 0.25), lineWidth: 1)
+                        }
                 }
                 .buttonStyle(.plain)
             }
@@ -162,10 +194,26 @@ struct OSDView: View {
                 Text("Library")
             }
             .font(.system(size: 18, weight: .medium))
-            .foregroundStyle(.white.opacity(0.6))
+            .foregroundStyle(.white)
             .padding(.horizontal, 24)
             .padding(.vertical, 14)
-            .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+            .background {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 24).fill(Color.white.opacity(0.10))
+                    LinearGradient(
+                        stops: [
+                            .init(color: Color.white.opacity(0.28), location: 0.0),
+                            .init(color: Color.clear,               location: 0.65),
+                        ],
+                        startPoint: .top, endPoint: .bottom
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: 24))
+                }
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: 24)
+                    .strokeBorder(Color.white.opacity(0.22), lineWidth: 1)
+            }
         }
         .buttonStyle(.plain)
     }

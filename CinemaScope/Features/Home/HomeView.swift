@@ -183,9 +183,7 @@ struct HomeView: View {
 
     private var standardNavBar: some View {
         HStack(spacing: 0) {
-            Text("CS")
-                .font(.system(size: 22, weight: .black, design: .rounded))
-                .foregroundStyle(CinemaTheme.accentGold)
+            PinneaWordmark(colorMode: settings.colorMode, fontSize: 22)
                 .padding(.trailing, 40)
 
             HStack(spacing: 8) {
@@ -218,9 +216,7 @@ struct HomeView: View {
 
     private var scopeNavRail: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("CS")
-                .font(.system(size: 20, weight: .black, design: .rounded))
-                .foregroundStyle(CinemaTheme.accentGold)
+            PinneaWordmark(colorMode: settings.colorMode, fontSize: 18)
                 .padding(.bottom, 16)
 
             ForEach(NavTab.allCases) { tab in
@@ -305,17 +301,31 @@ struct HomeView: View {
                     }
 
                     ForEach(settings.homeRibbons.filter(\.enabled)) { ribbon in
-                        let items = store.ribbonItems[ribbon.type.id] ?? []
-                        if !items.isEmpty {
-                            MediaRow(
-                                title:     ribbon.type.displayName,
-                                items:     items,
-                                session:   session,
-                                cardSize:  ribbon.type.preferredCardSize,
-                                scopeMode: scopeMode,
-                                onSelect:  { showDetail($0) },
-                                onViewAll: viewAllAction(for: ribbon)
-                            )
+                        if ribbon.type == .recommended {
+                            // Personalized recommendations use their own large-card row
+                            if !store.recommendationItems.isEmpty {
+                                RecommendationRow(
+                                    title:     ribbon.type.displayName,
+                                    items:     store.recommendationItems,
+                                    session:   session,
+                                    scopeMode: scopeMode,
+                                    colorMode: settings.colorMode,
+                                    onSelect:  { showDetail($0) }
+                                )
+                            }
+                        } else {
+                            let items = store.ribbonItems[ribbon.type.id] ?? []
+                            if !items.isEmpty {
+                                MediaRow(
+                                    title:     ribbon.type.displayName,
+                                    items:     items,
+                                    session:   session,
+                                    cardSize:  ribbon.type.preferredCardSize,
+                                    scopeMode: scopeMode,
+                                    onSelect:  { showDetail($0) },
+                                    onViewAll: viewAllAction(for: ribbon)
+                                )
+                            }
                         }
                     }
                 }
@@ -324,8 +334,7 @@ struct HomeView: View {
                 .padding(.top, 32)
                 .padding(.bottom, 60)
             }
-            // Allow content to overflow scroll view bounds so scaled cards aren't clipped
-            .clipped(antialiased: false)
+            .scrollClipDisabled()
         }
     }
 
@@ -495,7 +504,7 @@ struct MediaRow: View {
                 .padding(.vertical, 20)
                 .padding(.horizontal, 4)
             }
-            .clipped(antialiased: false)
+            .scrollClipDisabled()
         }
     }
 }
@@ -506,6 +515,7 @@ struct ViewAllCard: View {
     let cardSize:  CardSize
     let scopeMode: Bool
     let onTap:     () -> Void
+    @EnvironmentObject var settings: AppSettings
     @FocusState private var isFocused: Bool
 
     private var cardWidth: CGFloat {
@@ -543,8 +553,7 @@ struct ViewAllCard: View {
                             RoundedRectangle(cornerRadius: 8)
                                 .strokeBorder(
                                     isFocused
-                                        ? LinearGradient(colors: [CinemaTheme.accentGold, CinemaTheme.teal.opacity(0.7)],
-                                                         startPoint: .topLeading, endPoint: .bottomTrailing)
+                                        ? CinemaTheme.focusRimGradient(settings.colorMode)
                                         : LinearGradient(colors: [CinemaTheme.peacockLight.opacity(0.3)],
                                                          startPoint: .top, endPoint: .bottom),
                                     lineWidth: isFocused ? 2 : 1
@@ -553,7 +562,7 @@ struct ViewAllCard: View {
                     VStack(spacing: 12) {
                         Image(systemName: "rectangle.grid.2x2")
                             .font(.system(size: scopeMode ? 22 : 32, weight: .light))
-                            .foregroundStyle(isFocused ? CinemaTheme.accentGold : .white.opacity(0.5))
+                            .foregroundStyle(isFocused ? CinemaTheme.focusAccent(settings.colorMode) : .white.opacity(0.5))
                         Text("View All")
                             .font(.system(size: scopeMode ? 13 : 16, weight: .semibold))
                             .foregroundStyle(isFocused ? .white : .white.opacity(0.6))
@@ -561,7 +570,7 @@ struct ViewAllCard: View {
                 }
                 .frame(width: cardWidth, height: cardHeight)
                 .scaleEffect(isFocused ? 1.06 : 1.0, anchor: .bottom)
-                .shadow(color: isFocused ? CinemaTheme.accentGold.opacity(0.4) : .clear, radius: 20, x: 0, y: 10)
+                .shadow(color: isFocused ? CinemaTheme.focusAccent(settings.colorMode).opacity(0.55) : .clear, radius: 20, x: 0, y: 10)
                 .animation(.spring(response: 0.28, dampingFraction: 0.68), value: isFocused)
 
                 Text("View All")

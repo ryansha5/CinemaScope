@@ -115,6 +115,16 @@ struct EmbyItem: Codable, Identifiable, Equatable {
         guard let ticks = runTimeTicks else { return nil }
         return Int(ticks / 600_000_000)
     }
+
+    /// Returns true for Christmas / holiday content that should be excluded from recommendations.
+    /// Matches on genre "Holiday" or common Christmas keywords in the title.
+    var isChristmasContent: Bool {
+        let nameLower   = name.lowercased()
+        let genresLower = (genres ?? []).map { $0.lowercased() }
+        if genresLower.contains("holiday") { return true }
+        let terms = ["christmas", "xmas", "santa", "nutcracker", "noel", "jingle"]
+        return terms.contains { nameLower.contains($0) }
+    }
 }
 
 struct ImageTags: Codable, Equatable {
@@ -203,6 +213,16 @@ struct EmbyItemsResponse: Codable {
         case items            = "Items"
         case totalRecordCount = "TotalRecordCount"
     }
+}
+
+// MARK: - Personalized Recommendation
+
+/// A single recommendation card: one movie to watch, paired with the recently-watched
+/// movie that seeded it ("Because you watched X").
+struct RecommendationItem: Identifiable {
+    let id:             String      // == recommendation.id
+    let recommendation: EmbyItem
+    let becauseOf:      EmbyItem
 }
 
 // MARK: - Users Response

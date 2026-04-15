@@ -12,6 +12,9 @@ final class EmbyLibraryStore: ObservableObject {
     // Dynamic ribbon data keyed by RibbonType.id
     @Published private(set) var ribbonItems: [String: [EmbyItem]] = [:]
 
+    // Personalized recommendation cards (paired recommendation + seed)
+    @Published private(set) var recommendationItems: [RecommendationItem] = []
+
     // Available genres from the library
     @Published private(set) var availableGenres: [String] = []
 
@@ -55,8 +58,12 @@ final class EmbyLibraryStore: ObservableObject {
             let sg = await showGenres
             availableGenres = Array(Set(mg + sg)).sorted()
 
-            // Load ribbon data
-            await loadRibbons(ribbons, server: server, userId: userId, token: token)
+            // Load ribbon data + personalized recommendations in parallel
+            async let ribbonLoad = loadRibbons(ribbons, server: server, userId: userId, token: token)
+            async let recsLoad   = (try? EmbyAPI.fetchPersonalizedRecommendations(
+                server: server, userId: userId, token: token, limit: 5)) ?? []
+            await ribbonLoad
+            recommendationItems = await recsLoad
 
             isLoading = false
         } catch {
@@ -119,7 +126,9 @@ final class EmbyLibraryStore: ObservableObject {
             case .genre(let name, let itemType):
                 return try await EmbyAPI.fetchByGenre(server: server, userId: userId, token: token, genre: name, itemType: itemType, limit: 25)
             case .recommended:
-                return try await EmbyAPI.fetchRecommended(server: server, userId: userId, token: token, limit: 25)
+                // Recommendation cards are loaded separately into recommendationItems;
+                // return empty here so the generic MediaRow path is never triggered.
+                return []
             }
         } catch {
             return []

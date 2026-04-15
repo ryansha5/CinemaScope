@@ -31,6 +31,9 @@ enum CinemaTheme {
     static let darkBg3     = Color(red: 0.016, green: 0.30,  blue: 0.36)
     static let darkBg4     = Color(red: 0.004, green: 0.10,  blue: 0.13)
 
+    // Super Blue — primary brand blue, focus accents, CTA buttons (#1D6BFF)
+    static let superBlue    = Color(red: 0.114, green: 0.420, blue: 1.000)
+
     // Peacock accent (shared)
     static let peacock      = Color(red: 0.016, green: 0.376, blue: 0.416)
     static let peacockDeep  = Color(red: 0.008, green: 0.196, blue: 0.235)
@@ -85,16 +88,18 @@ enum CinemaTheme {
 
     static func focusRim(_ mode: ColorMode) -> LinearGradient {
         mode == .dark
-            ? LinearGradient(colors: [gold, teal.opacity(0.7)], startPoint: .topLeading, endPoint: .bottomTrailing)
+            // Iridescent peacock: bright teal → luminous peacock-light (feather shimmer)
+            ? LinearGradient(colors: [teal, peacockLight], startPoint: .topLeading, endPoint: .bottomTrailing)
             : LinearGradient(colors: [peacock, peacockLight], startPoint: .topLeading, endPoint: .bottomTrailing)
     }
 
     static func focusShadowColor(_ mode: ColorMode) -> Color {
-        mode == .dark ? gold.opacity(0.5) : peacock.opacity(0.45)
+        // Dark: teal glow replaces gold — peacock-feather hover signature
+        mode == .dark ? teal.opacity(0.65) : peacock.opacity(0.45)
     }
 
     static func focusShadowAlt(_ mode: ColorMode) -> Color {
-        mode == .dark ? teal.opacity(0.3) : peacockLight.opacity(0.3)
+        mode == .dark ? peacockLight.opacity(0.40) : peacockLight.opacity(0.3)
     }
 
     // Full alias set matching HomeView's token API
@@ -220,7 +225,7 @@ enum CinemaTheme {
     // MARK: Spacing (mode-independent)
     // ─────────────────────────────────────────────
 
-    static let pagePadding:    CGFloat = 80
+    static let pagePadding:    CGFloat = 24
     static let rowSpacing:     CGFloat = 56
     static let cardSpacing:    CGFloat = 28
     static let sectionSpacing: CGFloat = 20

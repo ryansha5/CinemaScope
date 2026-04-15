@@ -255,45 +255,71 @@ actor EmbyAPI {
     }
 
     // MARK: - Recommendations
-    // Uses Emby's similar items endpoint seeded by the user's most-played content
+    // Multi-seed personalized recommendations.
+    // Seeds come from recently-watched movies (by DatePlayed), not all-time play count.
+    // Each result is paired with the seed that generated it for "Because you watched X" UI.
+    // Christmas content is always excluded.
 
-    static func fetchRecommended(
+    static func fetchPersonalizedRecommendations(
         server: EmbyServer,
         userId: String,
         token: String,
-        limit: Int = 25
-    ) async throws -> [EmbyItem] {
-        // 1. Get the user's most-played items
-        var playedComps = try urlComponents(server, path: "/Users/\(userId)/Items")
-        playedComps.queryItems = [
-            .init(name: "SortBy",           value: "PlayCount"),
+        limit: Int = 20
+    ) async throws -> [RecommendationItem] {
+
+        // 1. Fetch the 8 most-recently-watched movies as seeds
+        var recentComps = try urlComponents(server, path: "/Users/\(userId)/Items")
+        recentComps.queryItems = [
+            .init(name: "SortBy",           value: "DatePlayed"),
             .init(name: "SortOrder",        value: "Descending"),
             .init(name: "Filters",          value: "IsPlayed"),
-            .init(name: "IncludeItemTypes", value: "Movie,Series"),
+            .init(name: "IncludeItemTypes", value: "Movie"),
             .init(name: "Recursive",        value: "true"),
-            .init(name: "Limit",            value: "5"),
+            .init(name: "Limit",            value: "8"),
             .init(name: "Fields",           value: "Genres"),
             .init(name: "ImageTypeLimit",   value: "1"),
-            .init(name: "EnableImageTypes",  value: "Primary,Thumb,Backdrop"),
+            .init(name: "EnableImageTypes", value: "Primary,Thumb,Backdrop"),
         ]
-        guard let playedURL = playedComps.url else { throw EmbyError.invalidURL }
-        let played = try decode(EmbyItemsResponse.self,
-                                from: try await get(url: playedURL, token: token)).items
+        guard let recentURL = recentComps.url else { throw EmbyError.invalidURL }
+        let recentlyWatched = try decode(EmbyItemsResponse.self,
+                                         from: try await get(url: recentURL, token: token)).items
 
-        guard let seed = played.first else { return [] }
+        guard !recentlyWatched.isEmpty else { return [] }
 
-        // 2. Fetch similar items to the most-played
-        var simComps = try urlComponents(server, path: "/Items/\(seed.id)/Similar")
-        simComps.queryItems = [
-            .init(name: "UserId",           value: userId),
-            .init(name: "Limit",            value: "\(limit)"),
-            .init(name: "Fields",           value: "PrimaryImageAspectRatio,Overview,RunTimeTicks,UserData"),
-            .init(name: "ImageTypeLimit",   value: "1"),
-            .init(name: "EnableImageTypes",  value: "Primary,Thumb,Backdrop"),
-        ]
-        guard let simURL = simComps.url else { throw EmbyError.invalidURL }
-        return try decode(EmbyItemsResponse.self,
-                          from: try await get(url: simURL, token: token)).items
+        // 2. For each seed, fetch similar movies and pair them
+        var results:  [RecommendationItem] = []
+        var seenIds = Set<String>()
+
+        // Shuffle seeds so the row varies across sessions
+        for seed in recentlyWatched.shuffled() {
+            guard results.count < limit else { break }
+
+            var simComps = try urlComponents(server, path: "/Items/\(seed.id)/Similar")
+            simComps.queryItems = [
+                .init(name: "UserId",           value: userId),
+                .init(name: "Limit",            value: "6"),
+                .init(name: "Fields",           value: "PrimaryImageAspectRatio,Overview,RunTimeTicks,UserData,Genres,BackdropImageTags"),
+                .init(name: "ImageTypeLimit",   value: "1"),
+                .init(name: "EnableImageTypes", value: "Primary,Thumb,Backdrop"),
+            ]
+            guard let simURL = simComps.url else { continue }
+
+            let similars = (try? decode(EmbyItemsResponse.self,
+                                        from: try await get(url: simURL, token: token)).items) ?? []
+
+            // Take at most one recommendation per seed
+            for movie in similars {
+                guard results.count < limit else { break }
+                guard !seenIds.contains(movie.id) else { continue }
+                guard !movie.isChristmasContent    else { continue }
+                seenIds.insert(movie.id)
+                results.append(RecommendationItem(id: movie.id, recommendation: movie, becauseOf: seed))
+                break   // one per seed — move on to the next watched movie
+            }
+        }
+
+        // Final shuffle so seed groupings aren't visible to the user
+        return results.shuffled()
     }
 
 
