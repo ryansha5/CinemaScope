@@ -33,20 +33,52 @@ struct VideoDimensions: Equatable {
 @MainActor
 final class PlaybackEngine: ObservableObject {
 
-    @Published private(set) var playbackState:    PlaybackState = .idle
-    @Published private(set) var videoDimensions:  VideoDimensions? = nil
-    @Published private(set) var aspectBucket:     AspectBucket = .unclassified
-    @Published              var presentationMode: PresentationMode = .fitInsideScope
-    @Published private(set) var currentTime:      Double = 0
-    @Published private(set) var duration:         Double = 0
+    // MARK: - Published state
+
+    @Published private(set) var playbackState:      PlaybackState = .idle
+    @Published private(set) var videoDimensions:    VideoDimensions? = nil
+    @Published private(set) var aspectBucket:       AspectBucket = .unclassified
+    @Published              var presentationMode:   PresentationMode = .fullScreen
+    @Published private(set) var aspectRatioOverride: AspectRatioOverride = .auto
+    @Published private(set) var detectedContentRatio: Double? = nil
+    @Published private(set) var currentTime:        Double = 0
+    @Published private(set) var duration:           Double = 0
+    /// True when ≤ 12 seconds remain — triggers the autoplay countdown overlay.
+    @Published private(set) var nearingEnd:         Bool   = false
+
+    // MARK: - Effective content ratio
+    //
+    // This is the SINGLE source of truth for the video's aspect ratio.
+    // Priority: user override > black-bar detection > metadata dimensions.
+    //
+    // ScopeCanvasGeometry reads this value — nothing else touches raw dimensions.
+
+    var effectiveContentRatio: Double {
+        // 1. User override (highest priority)
+        if let fixed = aspectRatioOverride.fixedRatio { return fixed }
+        // 2. Black-bar detection
+        if let detected = detectedContentRatio { return detected }
+        // 3. Raw container/presentation metadata
+        return videoDimensions?.aspectRatio ?? AspectBucket.scopeRatio
+    }
+
+    // MARK: - Scope UI context (set before each load via setPlaybackContext)
+
+    private(set) var scopeUIEnabled: Bool = false
+    private var serverURL:           String = ""
+    private var itemId:              String = ""
+
+    // MARK: - AVFoundation
 
     private(set) var player: AVPlayer = AVPlayer()
-    private var dimensionObserver: AnyCancellable?
-    private var statusObserver:    AnyCancellable?
-    private var timeObserver:      Any?
-    private var pendingStartTicks: Int64 = 0
+    private var dimensionObserver:     AnyCancellable?
+    private var statusObserver:        AnyCancellable?
+    private var timeObserver:          Any?
+    private var pendingStartTicks:     Int64 = 0
+    private var blackBarDetectionTask: Task<Void, Never>? = nil
 
-    // Reporting context — set before playback starts
+    // MARK: - Progress reporting context
+
     private var reportingServer:        EmbyServer? = nil
     private var reportingToken:         String?     = nil
     private var reportingItemId:        String?     = nil
@@ -57,25 +89,51 @@ final class PlaybackEngine: ObservableObject {
     private var progressReportTimer:    Timer?      = nil
     private var hasReportedStart                    = false
 
-    // Retry context — used for automatic fallback on failure
+    // MARK: - Retry context
+
     private var retryHandler: (() async -> Void)? = nil
+
+    // MARK: - Playback context (must be called before load())
+
+    /// Set the UI context so the engine can choose the correct default viewport.
+    /// Also loads any persisted aspect ratio override for this item.
+    func setPlaybackContext(scopeUIEnabled: Bool, serverURL: String, itemId: String) {
+        self.scopeUIEnabled = scopeUIEnabled
+        self.serverURL      = serverURL
+        self.itemId         = itemId
+        // Restore any stored override (or .auto if none)
+        self.aspectRatioOverride = AspectRatioStore.shared.override(
+            serverURL: serverURL, itemId: itemId
+        )
+        print("[PlaybackEngine] context — scopeUI=\(scopeUIEnabled) item=\(itemId) override=\(aspectRatioOverride.label)")
+    }
 
     // MARK: - Load
 
     func load(url: URL, startTicks: Int64 = 0) {
         stopProgressTimer()
+        blackBarDetectionTask?.cancel()
+        blackBarDetectionTask = nil
 
         if let token = timeObserver {
             player.removeTimeObserver(token)
             timeObserver = nil
         }
 
-        playbackState   = .loading
-        videoDimensions = nil
-        aspectBucket    = .unclassified
-        currentTime     = 0
-        duration        = 0
-        hasReportedStart = false
+        playbackState        = .loading
+        videoDimensions      = nil
+        aspectBucket         = .unclassified
+        detectedContentRatio = nil
+        currentTime          = 0
+        duration             = 0
+        nearingEnd           = false
+        hasReportedStart     = false
+
+        // Mode follows UI setting — not aspect ratio
+        presentationMode = PresentationMode.defaultMode(scopeUIEnabled: scopeUIEnabled)
+
+        // Preserve any user override already set via setPlaybackContext
+        // (aspectRatioOverride is NOT reset here)
 
         pendingStartTicks = startTicks
         let item = AVPlayerItem(url: url)
@@ -86,14 +144,12 @@ final class PlaybackEngine: ObservableObject {
         observeTime()
     }
 
-    /// Optional: provide a fallback handler called automatically on playback failure
+    /// Optional: provide a fallback handler called automatically on playback failure.
     func setRetryHandler(_ handler: @escaping () async -> Void) {
         retryHandler = handler
     }
 
-    /// Call this before load() to enable Emby progress reporting.
-    /// Pass the PlaybackResult values so session/source IDs are correctly
-    /// echoed back to Emby in all progress reports.
+    /// Set Emby progress-reporting context before load().
     func setReportingContext(
         server: EmbyServer, userId: String, token: String, itemId: String,
         mediaSourceId: String, playSessionId: String, playMethod: String
@@ -105,6 +161,29 @@ final class PlaybackEngine: ObservableObject {
         reportingSessionId     = playSessionId
         reportingMediaSourceId = mediaSourceId
         reportingPlayMethod    = playMethod
+    }
+
+    // MARK: - Aspect ratio override (called from OSD)
+
+    /// Apply a user-selected aspect ratio override and persist it.
+    func setAspectRatioOverride(_ override: AspectRatioOverride) {
+        aspectRatioOverride = override
+
+        // Persist so the same title is never mislabelled again
+        if !serverURL.isEmpty {
+            AspectRatioStore.shared.setOverride(override, serverURL: serverURL, itemId: itemId)
+        }
+
+        // Update the bucket badge to match the override (for OSD display)
+        if let bucket = override.bucket {
+            aspectBucket = bucket
+        } else if let dims = videoDimensions {
+            // Reset to what the classifier says from metadata
+            let effectiveRatio = detectedContentRatio ?? dims.aspectRatio
+            aspectBucket = AspectRatioClassifier.classify(effectiveRatio)
+        }
+
+        print("[PlaybackEngine] AR override set to \(override.label)")
     }
 
     // MARK: - Transport
@@ -138,10 +217,18 @@ final class PlaybackEngine: ObservableObject {
     }
 
     func stop() {
+        blackBarDetectionTask?.cancel()
+        blackBarDetectionTask = nil
         stopProgressTimer()
         reportStop()
         player.pause()
+        nearingEnd    = false
         playbackState = .idle
+    }
+
+    /// Cancel the nearing-end signal so the countdown won't re-appear after the user dismisses it.
+    func suppressNearingEnd() {
+        nearingEnd = false
     }
 
     // MARK: - Private: observation
@@ -154,7 +241,7 @@ final class PlaybackEngine: ObservableObject {
                 switch status {
                 case .readyToPlay:
                     if self.pendingStartTicks > 0 {
-                        let seconds = Double(self.pendingStartTicks) / 10_000_000.0
+                        let seconds  = Double(self.pendingStartTicks) / 10_000_000.0
                         let seekTime = CMTime(seconds: seconds, preferredTimescale: 600)
                         self.player.seek(to: seekTime, toleranceBefore: .zero, toleranceAfter: .zero)
                         self.pendingStartTicks = 0
@@ -163,7 +250,11 @@ final class PlaybackEngine: ObservableObject {
                     Task {
                         if let dur = try? await asset.load(.duration),
                            dur.seconds.isFinite, dur.seconds > 0 {
-                            await MainActor.run { self.duration = dur.seconds }
+                            await MainActor.run {
+                                self.duration = dur.seconds
+                                // Kick off black-bar detection once we have duration
+                                self.scheduleBlackBarDetection(asset: asset, duration: dur.seconds)
+                            }
                         }
                     }
                     self.reportStart()
@@ -177,12 +268,9 @@ final class PlaybackEngine: ObservableObject {
                     print("[PlaybackEngine] ❌ Error \(code): \(msg)")
                     print("[PlaybackEngine] ❌ Underlying: \(under?.localizedDescription ?? "none")")
 
-                    // If we have a retry handler, try it before showing error.
-                    // Surface a .retrying state so the player shows feedback
-                    // during the fallback window (typically 2–5 s).
                     if let retry = self.retryHandler {
                         print("[PlaybackEngine] 🔄 Retrying with fallback...")
-                        self.retryHandler = nil   // clear to prevent infinite loop
+                        self.retryHandler  = nil
                         self.playbackState = .retrying("Finding compatible format…")
                         Task { await retry() }
                         return
@@ -213,9 +301,14 @@ final class PlaybackEngine: ObservableObject {
             .sink { [weak self] dims in
                 guard let self else { return }
                 self.videoDimensions = dims
-                let bucket = AspectRatioClassifier.classify(dims)
-                self.aspectBucket     = bucket
-                self.presentationMode = PresentationMode.automatic(for: bucket)
+                // Classify the raw metadata ratio for badge display
+                self.aspectBucket = AspectRatioClassifier.classify(dims.aspectRatio)
+                // If the user has an override, apply its bucket instead
+                if let overrideBucket = self.aspectRatioOverride.bucket {
+                    self.aspectBucket = overrideBucket
+                }
+                // Mode is already set from scopeUIEnabled in load() — don't override it here
+                print("[PlaybackEngine] dims=\(dims.debugDescription) bucket=\(self.aspectBucket.label) mode=\(self.presentationMode.label)")
             }
     }
 
@@ -231,6 +324,46 @@ final class PlaybackEngine: ObservableObject {
                let d = self.player.currentItem?.duration.seconds,
                d.isFinite, d > 0 {
                 self.duration = d
+            }
+            if !self.nearingEnd,
+               self.duration > 30,
+               self.duration - self.currentTime <= 12 {
+                self.nearingEnd = true
+            }
+        }
+    }
+
+    // MARK: - Black-bar detection
+
+    private func scheduleBlackBarDetection(asset: AVAsset, duration: Double) {
+        // Skip if user already has a manual override
+        guard aspectRatioOverride == .auto else { return }
+
+        blackBarDetectionTask = Task { [weak self] in
+            guard let self else { return }
+            guard let detected = await BlackBarDetector.detectFrom(
+                asset: asset, duration: duration
+            ) else {
+                print("[PlaybackEngine] Black-bar detection: no bars found")
+                return
+            }
+
+            guard !Task.isCancelled else { return }
+
+            let metadataRatio = self.videoDimensions?.aspectRatio ?? 0
+            let delta = abs(detected - metadataRatio) / max(metadataRatio, 0.001)
+
+            // Only apply if the detected ratio differs from metadata by >5%
+            // (avoids false positives from dark opening scenes)
+            if delta > 0.05 {
+                print("[PlaybackEngine] Black-bar detection: \(String(format: "%.3f", detected)) (metadata: \(String(format: "%.3f", metadataRatio))) — applying")
+                await MainActor.run { [weak self] in
+                    guard let self, self.aspectRatioOverride == .auto else { return }
+                    self.detectedContentRatio = detected
+                    self.aspectBucket = AspectRatioClassifier.classify(detected)
+                }
+            } else {
+                print("[PlaybackEngine] Black-bar detection: \(String(format: "%.3f", detected)) — within 5%% of metadata, not applying")
             }
         }
     }
@@ -295,7 +428,6 @@ final class PlaybackEngine: ObservableObject {
 
     private func startProgressTimer() {
         stopProgressTimer()
-        // Report every 10 seconds during playback
         progressReportTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.reportProgress(isPaused: false)
