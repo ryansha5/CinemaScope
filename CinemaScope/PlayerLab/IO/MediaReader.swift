@@ -4,7 +4,7 @@ import Foundation
 
 enum MediaReaderError: Error, LocalizedError {
     case notOpened
-    case invalidRange(offset: Int, length: Int, fileSize: Int)
+    case invalidRange(offset: Int64, length: Int, fileSize: Int64)
     case httpError(statusCode: Int)
     case byteRangesNotSupported
     case readFailed(underlying: Error)
@@ -35,14 +35,17 @@ enum MediaReaderError: Error, LocalizedError {
 // logic.  Correctness and observability first.
 //
 // Lifecycle:
-//   1. init(url:)                 — describe the source
-//   2. await open()               — resolve headers / file attributes
-//   3. await read(offset:length:) — request arbitrary byte ranges
+//   1. init(url:)                       — describe the source
+//   2. await open()                     — resolve headers / file attributes
+//   3. await read(offset:length:)       — request arbitrary byte ranges
 //
 // After open(), the following properties are populated:
-//   • contentLength   — total byte count, or -1 if unknown
-//   • contentType     — MIME type (HTTP only)
+//   • contentLength      — total byte count as Int64, or -1 if unknown
+//   • contentType        — MIME type (HTTP only, nil for local files)
 //   • supportsByteRanges — true if server sends Accept-Ranges: bytes OR it's local
+//
+// Offset type is Int64 throughout so reads past the 2 GB boundary are safe on
+// all platforms, including 32-bit simulators.
 
 final class MediaReader {
 
@@ -51,7 +54,7 @@ final class MediaReader {
     let url: URL
 
     /// Total file/resource size in bytes.  -1 means unknown (e.g. live stream).
-    private(set) var contentLength: Int = -1
+    private(set) var contentLength: Int64 = -1
 
     /// MIME type from HTTP Content-Type header.  nil for local files.
     private(set) var contentType: String? = nil
@@ -70,6 +73,26 @@ final class MediaReader {
         return URLSession(configuration: config)
     }()
 
+    // MARK: - Simple read-ahead buffer
+    //
+    // Caches the last read result.  When the next request falls within the
+    // cached window we return immediately without hitting disk or network.
+    // This is intentionally minimal — one slot, no eviction policy.
+    // Purpose: avoid redundant re-reads of the same range (e.g. stability checks).
+
+    private struct ReadCache {
+        let offset: Int64
+        let data: Data
+        var endOffset: Int64 { offset + Int64(data.count) }
+
+        func slice(offset: Int64, length: Int) -> Data? {
+            guard offset >= self.offset, offset + Int64(length) <= endOffset else { return nil }
+            let start = Int(offset - self.offset)
+            return data[start ..< start + length]
+        }
+    }
+    private var readCache: ReadCache? = nil
+
     // MARK: - Init
 
     init(url: URL) {
@@ -79,8 +102,8 @@ final class MediaReader {
 
     // MARK: - Open
     //
-    // For local files: stat the file, populate contentLength, set supportsByteRanges = true.
-    // For HTTP:        issue a HEAD request, parse response headers.
+    // Local files: stat for size, set supportsByteRanges = true.
+    // HTTP:        HEAD request to resolve Content-Length, Content-Type, Accept-Ranges.
 
     func open() async throws {
         log(.info, "open() called")
@@ -96,19 +119,23 @@ final class MediaReader {
     }
 
     private func openLocalFile() throws {
-        let path = url.path
         do {
-            let attrs = try FileManager.default.attributesOfItem(atPath: path)
-            if let size = attrs[.size] as? Int {
-                contentLength    = size
+            let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+            if let size = attrs[.size] as? Int64 {
+                contentLength      = size
                 supportsByteRanges = true
-                log(.info, "Local file: \(formatBytes(size))")
+                log(.info, "Local file size: \(formatBytes(size))")
+            } else if let size = attrs[.size] as? Int {
+                // FileManager returns Int on some platforms
+                contentLength      = Int64(size)
+                supportsByteRanges = true
+                log(.info, "Local file size: \(formatBytes(contentLength))")
             } else {
-                contentLength    = -1
+                contentLength      = -1
                 supportsByteRanges = false
                 log(.warning, "Could not determine local file size")
             }
-            contentType = nil   // not meaningful for local files
+            contentType = nil
         } catch {
             log(.error, "File attribute read failed: \(error)")
             throw MediaReaderError.readFailed(underlying: error)
@@ -116,74 +143,74 @@ final class MediaReader {
     }
 
     private func openRemoteURL() async throws {
-        log(.info, "Issuing HEAD request to \(url.absoluteString)")
+        log(.info, "Issuing HEAD to \(url.absoluteString)")
 
         var headRequest = URLRequest(url: url)
         headRequest.httpMethod = "HEAD"
 
         let (_, response) = try await session.data(for: headRequest)
 
-        guard let httpResponse = response as? HTTPURLResponse else {
+        guard let http = response as? HTTPURLResponse else {
             throw MediaReaderError.readFailed(underlying: URLError(.badServerResponse))
         }
 
-        let statusCode = httpResponse.statusCode
-        log(.info, "HEAD response: HTTP \(statusCode)")
-
-        guard (200...299).contains(statusCode) else {
-            throw MediaReaderError.httpError(statusCode: statusCode)
-        }
+        let status = http.statusCode
+        log(.info, "HEAD → HTTP \(status)")
+        guard (200...299).contains(status) else { throw MediaReaderError.httpError(statusCode: status) }
 
         // Content-Length
-        if let lengthStr = httpResponse.value(forHTTPHeaderField: "Content-Length"),
-           let length = Int(lengthStr) {
-            contentLength = length
-            log(.info, "Content-Length: \(formatBytes(length))")
+        if let s = http.value(forHTTPHeaderField: "Content-Length"), let n = Int64(s) {
+            contentLength = n
+            log(.info, "Content-Length: \(formatBytes(n))")
         } else {
             contentLength = -1
-            log(.warning, "Content-Length header missing or unparseable")
+            log(.warning, "Content-Length missing or unparseable")
         }
 
         // Content-Type
-        if let ct = httpResponse.value(forHTTPHeaderField: "Content-Type") {
+        if let ct = http.value(forHTTPHeaderField: "Content-Type") {
             contentType = ct
             log(.info, "Content-Type: \(ct)")
         }
 
         // Accept-Ranges
-        if let acceptRanges = httpResponse.value(forHTTPHeaderField: "Accept-Ranges") {
-            supportsByteRanges = acceptRanges.lowercased().contains("bytes")
-            log(.info, "Accept-Ranges: \(acceptRanges) → supportsByteRanges = \(supportsByteRanges)")
+        if let ar = http.value(forHTTPHeaderField: "Accept-Ranges") {
+            supportsByteRanges = ar.lowercased().contains("bytes")
+            log(.info, "Accept-Ranges: \(ar) → supportsByteRanges = \(supportsByteRanges)")
         } else {
             supportsByteRanges = false
-            log(.warning, "Accept-Ranges header missing — byte-range reads may fail")
+            log(.warning, "Accept-Ranges header absent — byte-range reads may fail")
         }
     }
 
     // MARK: - Read
     //
-    // Returns exactly `length` bytes starting at `offset` (or fewer at EOF).
-    // Validates the range against contentLength when it is known.
+    // Returns up to `length` bytes starting at `offset` (may be fewer at EOF).
+    // Validates range against contentLength when known.
+    // Checks the single-slot read cache before hitting disk/network.
 
-    func read(offset: Int, length: Int) async throws -> Data {
+    func read(offset: Int64, length: Int) async throws -> Data {
         guard isOpen else { throw MediaReaderError.notOpened }
         guard length > 0 else { return Data() }
 
-        // Range validation when size is known
+        // Range validation
         if contentLength > 0 {
             guard offset < contentLength else {
                 throw MediaReaderError.invalidRange(offset: offset, length: length, fileSize: contentLength)
             }
         }
 
-        let clampedLength: Int
-        if contentLength > 0 {
-            clampedLength = min(length, contentLength - offset)
-        } else {
-            clampedLength = length
+        let clampedLength: Int = contentLength > 0
+            ? Int(min(Int64(length), contentLength - offset))
+            : length
+
+        // Cache hit?
+        if let cached = readCache?.slice(offset: offset, length: clampedLength) {
+            log(.data, "read(offset: \(offset), length: \(clampedLength)) → cache hit, \(cached.count) bytes")
+            return cached
         }
 
-        log(.info, "read(offset: \(offset), length: \(clampedLength)) requested")
+        log(.info, "read(offset: \(offset), length: \(clampedLength)) — fetching")
 
         let data: Data
         if url.isFileURL {
@@ -198,22 +225,25 @@ final class MediaReader {
             log(.warning, "Short read: expected \(clampedLength), got \(data.count) — likely at EOF")
         }
 
+        // Populate cache
+        readCache = ReadCache(offset: offset, data: data)
+
         return data
     }
 
-    // MARK: - Local byte-range read
+    // MARK: - Local byte-range read (FileHandle)
     //
-    // Uses FileHandle for random-access seeks — avoids loading the full file.
+    // Opens a new FileHandle per call — simple and safe for random access.
+    // Avoids loading the full file into memory.
 
-    private func readLocalRange(offset: Int, length: Int) throws -> Data {
+    private func readLocalRange(offset: Int64, length: Int) throws -> Data {
         do {
             let fh = try FileHandle(forReadingFrom: url)
             defer { try? fh.close() }
 
             if #available(tvOS 13.4, iOS 13.4, macOS 10.15.4, *) {
                 try fh.seek(toOffset: UInt64(offset))
-                let data = fh.readData(ofLength: length)
-                return data
+                return fh.readData(ofLength: length)
             } else {
                 fh.seek(toFileOffset: UInt64(offset))
                 return fh.readData(ofLength: length)
@@ -224,15 +254,15 @@ final class MediaReader {
         }
     }
 
-    // MARK: - HTTP byte-range read
+    // MARK: - HTTP byte-range read (RFC 7233)
     //
-    // RFC 7233 Range header: "bytes=<offset>-<offset+length-1>"
-    // Expects HTTP 206 Partial Content.
-    // Falls back to a full GET + slice if byte ranges aren't supported
-    // (only for small reads; large files without Accept-Ranges will warn loudly).
+    // Range: bytes=<offset>-<offset+length-1>
+    // Expected response: HTTP 206 Partial Content.
+    // If the server returns 200 (ignores Range), we slice the body as a fallback —
+    // but log a loud warning since this won't be viable for large files.
 
-    private func readRemoteRange(offset: Int, length: Int) async throws -> Data {
-        let lastByte = offset + length - 1
+    private func readRemoteRange(offset: Int64, length: Int) async throws -> Data {
+        let lastByte = offset + Int64(length) - 1
         var request = URLRequest(url: url)
         request.setValue("bytes=\(offset)-\(lastByte)", forHTTPHeaderField: "Range")
 
@@ -241,29 +271,35 @@ final class MediaReader {
         do {
             let (data, response) = try await session.data(for: request)
 
-            guard let httpResponse = response as? HTTPURLResponse else {
+            guard let http = response as? HTTPURLResponse else {
                 throw MediaReaderError.readFailed(underlying: URLError(.badServerResponse))
             }
 
-            let statusCode = httpResponse.statusCode
-            log(.info, "Range response: HTTP \(statusCode), \(data.count) bytes")
+            let status = http.statusCode
+            log(.info, "Range response: HTTP \(status), body: \(data.count) bytes")
+            // Log response headers for observability
+            for key in ["Content-Range", "Content-Length", "Content-Type"] {
+                if let val = http.value(forHTTPHeaderField: key) {
+                    log(.info, "  \(key): \(val)")
+                }
+            }
 
-            switch statusCode {
+            switch status {
             case 206:
-                // Normal partial-content response
                 return data
 
             case 200:
-                // Server ignored the Range header — slice manually
-                log(.warning, "Server returned 200 instead of 206 — slicing full response body")
-                guard data.count > offset else {
-                    throw MediaReaderError.invalidRange(offset: offset, length: length, fileSize: data.count)
+                log(.warning, "Server returned 200 instead of 206 — slicing full body (not viable for large files)")
+                let start = Int(offset)
+                guard data.count > start else {
+                    throw MediaReaderError.invalidRange(offset: offset, length: length,
+                                                        fileSize: Int64(data.count))
                 }
-                let end = min(offset + length, data.count)
-                return data[offset..<end]
+                let end = min(start + length, data.count)
+                return data[start ..< end]
 
             default:
-                throw MediaReaderError.httpError(statusCode: statusCode)
+                throw MediaReaderError.httpError(statusCode: status)
             }
         } catch let err as MediaReaderError {
             throw err
@@ -275,11 +311,9 @@ final class MediaReader {
 
     // MARK: - Logging
     //
-    // MediaReader has its own minimal logger so it does not depend on anything
-    // in PlayerLab/Diagnostics/.  Output format matches LabLogEntry so logs from
-    // both layers look uniform in the Xcode console.
-    //
-    // Prefix [PlayerLab/IO] makes it easy to filter with Xcode's console search.
+    // Self-contained — does NOT depend on anything in PlayerLab/Diagnostics/.
+    // Format matches LabLogEntry so output looks uniform in the Xcode console.
+    // Filter with "[PlayerLab/IO]" in the Xcode console search bar.
 
     private enum IOLogLevel: String {
         case info    = "ℹ️"
@@ -296,10 +330,11 @@ final class MediaReader {
 
     // MARK: - Utilities
 
-    private func formatBytes(_ count: Int) -> String {
-        if count < 0  { return "unknown" }
-        if count < 1024 { return "\(count) B" }
-        if count < 1024 * 1024 { return String(format: "%.1f KB", Double(count) / 1024) }
-        return String(format: "%.2f MB", Double(count) / (1024 * 1024))
+    private func formatBytes(_ count: Int64) -> String {
+        if count < 0              { return "unknown" }
+        if count < 1_024          { return "\(count) B" }
+        if count < 1_048_576      { return String(format: "%.1f KB", Double(count) / 1_024) }
+        if count < 1_073_741_824  { return String(format: "%.2f MB", Double(count) / 1_048_576) }
+        return String(format: "%.2f GB", Double(count) / 1_073_741_824)
     }
 }
