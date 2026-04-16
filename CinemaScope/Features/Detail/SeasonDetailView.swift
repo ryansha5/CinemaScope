@@ -374,7 +374,7 @@ struct EpisodeRow: View {
                 ZStack(alignment: .bottomLeading) {
                     Group {
                         if let url = thumbURL {
-                            AsyncImage(url: url) { img in img.resizable().scaledToFill() }
+                            CachedAsyncImage(url: url) { img in img.resizable().scaledToFill() }
                                 placeholder: { thumbPlaceholder }
                         } else { thumbPlaceholder }
                     }

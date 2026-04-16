@@ -79,7 +79,7 @@ struct CollectionDetailView: View {
             if let server = session.server,
                let tag    = collection.imageTags?.primary,
                let url    = EmbyAPI.primaryImageURL(server: server, itemId: collection.id, tag: tag, width: 200) {
-                AsyncImage(url: url) { img in img.resizable().scaledToFill() }
+                CachedAsyncImage(url: url) { img in img.resizable().scaledToFill() }
                     placeholder: { RoundedRectangle(cornerRadius: 8).fill(CinemaTheme.cardGradient(settings.colorMode)) }
                 .frame(width: settings.scopeUIEnabled ? 56 : 80,
                        height: settings.scopeUIEnabled ? 84 : 120)
@@ -159,7 +159,7 @@ struct CollectionDetailView: View {
             .padding(.horizontal, settings.scopeUIEnabled ? 24 : CinemaTheme.pagePadding)
             .padding(.vertical, 24).padding(.bottom, 60)
         }
-        .clipped(antialiased: false)
+        .scrollClipDisabled()
     }
 
     private func ribbon(title: String, items: [EmbyItem]) -> some View {
@@ -174,9 +174,9 @@ struct CollectionDetailView: View {
                                  scopeMode: settings.scopeUIEnabled) { onSelect(item) }
                     }
                 }
-                .padding(.vertical, 20).padding(.horizontal, 4)
+                .padding(.vertical, 24).padding(.horizontal, 4)
             }
-            .clipped(antialiased: false)
+            .scrollClipDisabled()
         }
     }
 
@@ -196,7 +196,7 @@ struct CollectionDetailView: View {
             .padding(.horizontal, scope ? 24 : CinemaTheme.pagePadding)
             .padding(.vertical, 24).padding(.bottom, 60)
         }
-        .clipped(antialiased: false)
+        .scrollClipDisabled()
     }
 
     // MARK: - Helpers
