@@ -5,16 +5,36 @@ import UIKit
 
 struct PlayerContainerView: UIViewControllerRepresentable {
 
-    let item:     EmbyItem
-    let engine:   PlaybackEngine
-    let session:  EmbySession
-    let onExit:   () -> Void
+    let item:             EmbyItem
+    let engine:           PlaybackEngine
+    let session:          EmbySession
+    let scopeUIEnabled:   Bool
+    let autoplay:         Bool
+    let onExit:           () -> Void
     /// Called when the user taps "Try Again" on the error screen.
-    /// HomeView passes `{ play(item) }` so playback is fully re-initiated.
-    let onRetry:  (() -> Void)?
+    let onRetry:          (() -> Void)?
+    /// Called when autoplay countdown completes or user taps "Play Next".
+    let onPlayNext:       (() -> Void)?
+
+    // MARK: - Backdrop URL
+
+    private var backdropURL: URL? {
+        guard let server = session.server else { return nil }
+        if item.type == "Episode", let seriesId = item.seriesId {
+            return URL(string: "\(server.url)/Items/\(seriesId)/Images/Backdrop?width=1920")
+        }
+        guard let tag = item.backdropImageTags?.first else { return nil }
+        return URL(string: "\(server.url)/Items/\(item.id)/Images/Backdrop?tag=\(tag)&width=1920")
+    }
 
     func makeUIViewController(context: Context) -> PlayerContainerViewController {
-        PlayerContainerViewController(item: item, engine: engine, onExit: onExit, onRetry: onRetry)
+        PlayerContainerViewController(
+            item: item, engine: engine,
+            scopeUIEnabled: scopeUIEnabled,
+            autoplay: autoplay,
+            backdropURL: backdropURL,
+            onExit: onExit, onRetry: onRetry, onPlayNext: onPlayNext
+        )
     }
 
     func updateUIViewController(_ vc: PlayerContainerViewController, context: Context) {}
@@ -24,25 +44,39 @@ struct PlayerContainerView: UIViewControllerRepresentable {
 
 final class PlayerContainerViewController: UIViewController {
 
-    private let item:    EmbyItem
-    private let engine:  PlaybackEngine
-    private let onExit:  () -> Void
-    private let onRetry: (() -> Void)?
+    private let item:           EmbyItem
+    private let engine:         PlaybackEngine
+    private let scopeUIEnabled: Bool
+    private let autoplay:       Bool
+    private let backdropURL:    URL?
+    private let onExit:         () -> Void
+    private let onRetry:        (() -> Void)?
+    private let onPlayNext:     (() -> Void)?
 
-    private var canvasVC:       ScopeCanvasViewController!
-    private var osdHostVC:      UIHostingController<AnyView>?
-    private var statusHostVC:   UIHostingController<AnyView>?   // loading / retrying / error
-    private var osdVisible = false
+    private var canvasVC:         ScopeCanvasViewController!
+    private var osdHostVC:        UIHostingController<AnyView>?
+    private var statusHostVC:     UIHostingController<AnyView>?
+    private var countdownHostVC:  UIHostingController<AnyView>?
+    private var backdropImageView: UIImageView?
+    private var osdVisible  = false
+    /// Mirrors the AR pop-up open state from OSDView so we don't accidentally
+    /// dismiss the OSD (and the menu) when the user navigates inside the menu.
+    private var arMenuOpen  = false
 
-    // Tracks how long select has been held
     private var selectPressStart: Date? = nil
     private let holdThreshold: TimeInterval = 0.4
 
-    init(item: EmbyItem, engine: PlaybackEngine, onExit: @escaping () -> Void, onRetry: (() -> Void)?) {
-        self.item    = item
-        self.engine  = engine
-        self.onExit  = onExit
-        self.onRetry = onRetry
+    init(item: EmbyItem, engine: PlaybackEngine, scopeUIEnabled: Bool, autoplay: Bool,
+         backdropURL: URL?,
+         onExit: @escaping () -> Void, onRetry: (() -> Void)?, onPlayNext: (() -> Void)?) {
+        self.item           = item
+        self.engine         = engine
+        self.scopeUIEnabled = scopeUIEnabled
+        self.autoplay       = autoplay
+        self.backdropURL    = backdropURL
+        self.onExit         = onExit
+        self.onRetry        = onRetry
+        self.onPlayNext     = onPlayNext
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -54,6 +88,12 @@ final class PlayerContainerViewController: UIViewController {
         super.viewDidLoad()
         view.backgroundColor = .black
 
+        // Opt out of any automatic safe-area insets so the player truly fills
+        // the screen — no overscan margin, no status-bar offset.
+        additionalSafeAreaInsets = .zero
+        view.insetsLayoutMarginsFromSafeArea = false
+
+        // ── Canvas ─────────────────────────────────────────────────────────────
         canvasVC = ScopeCanvasViewController(engine: engine)
         addChild(canvasVC)
         view.addSubview(canvasVC.view)
@@ -61,7 +101,40 @@ final class PlayerContainerViewController: UIViewController {
         canvasVC.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         canvasVC.didMove(toParent: self)
 
-        // Observe all meaningful playback state transitions
+        // ── Backdrop splash ────────────────────────────────────────────────────
+        // Added ABOVE the canvas so the item's artwork is visible during loading.
+        // Fades out once the first video frame is rendered.
+        // In scope UI mode the backdrop is constrained to the 2.39:1 canvas so
+        // it doesn't bleed into the letterbox bars above and below.
+        if let url = backdropURL {
+            let iv = UIImageView()
+            iv.contentMode = .scaleAspectFill
+            iv.clipsToBounds = true
+            iv.alpha = 0
+            iv.frame = backdropFrame
+            // No autoresizingMask when scope-constrained — viewDidLayoutSubviews
+            // recomputes the frame precisely. Full-screen mode can use the mask.
+            if !scopeUIEnabled {
+                iv.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            }
+            view.insertSubview(iv, aboveSubview: canvasVC.view)
+            backdropImageView = iv
+
+            Task { @MainActor in
+                if let cached = ImageCache.shared.image(for: url) {
+                    iv.image = cached
+                    UIView.animate(withDuration: 0.25) { iv.alpha = 0.85 }
+                } else {
+                    guard let (data, _) = try? await URLSession.shared.data(from: url),
+                          let img = UIImage(data: data) else { return }
+                    ImageCache.shared.store(img, for: url)
+                    iv.image = img
+                    UIView.animate(withDuration: 0.35) { iv.alpha = 0.85 }
+                }
+            }
+        }
+
+        // ── Observe playback state ─────────────────────────────────────────────
         Task { @MainActor in
             for await state in engine.$playbackState.values {
                 switch state {
@@ -71,10 +144,23 @@ final class PlayerContainerViewController: UIViewController {
                     self.showStatusOverlay(.retrying(msg))
                 case .playing, .paused:
                     self.removeStatusOverlay()
+                    if let iv = self.backdropImageView, iv.alpha > 0 {
+                        UIView.animate(withDuration: 0.5, delay: 0.15) { iv.alpha = 0 }
+                    }
                 case .failed(let msg):
                     self.showStatusOverlay(.error(msg))
                 case .idle:
                     break
+                }
+            }
+        }
+
+        // ── Autoplay countdown ─────────────────────────────────────────────────
+        if autoplay && item.type == "Episode" && onPlayNext != nil {
+            Task { @MainActor in
+                for await nearing in engine.$nearingEnd.values {
+                    if nearing { self.showCountdown() }
+                    else       { self.removeCountdown() }
                 }
             }
         }
@@ -84,7 +170,6 @@ final class PlayerContainerViewController: UIViewController {
 
     private func showStatusOverlay(_ state: PlayerStatusOverlay.OverlayState) {
         if let existing = statusHostVC {
-            // Update state in place when already showing (e.g. loading → retrying)
             existing.rootView = AnyView(
                 PlayerStatusOverlay(state: state,
                                     onRetry: onRetry,
@@ -107,7 +192,6 @@ final class PlayerContainerViewController: UIViewController {
         hostVC.didMove(toParent: self)
         statusHostVC = hostVC
 
-        // Prevent OSD from sitting on top of the loading overlay
         if osdVisible { hideOSD() }
     }
 
@@ -121,6 +205,63 @@ final class PlayerContainerViewController: UIViewController {
     private func exit() {
         engine.stop()
         onExit()
+    }
+
+    // MARK: - Autoplay countdown
+
+    private func showCountdown() {
+        guard countdownHostVC == nil else { return }
+        let countdown = NextEpisodeCountdown(
+            onPlayNext: { [weak self] in
+                self?.removeCountdown()
+                self?.engine.stop()
+                self?.onPlayNext?()
+            },
+            onCancel: { [weak self] in
+                self?.removeCountdown()
+                self?.engine.suppressNearingEnd()
+            }
+        )
+        let hostVC = UIHostingController(rootView: AnyView(countdown))
+        hostVC.view.backgroundColor = .clear
+        addChild(hostVC)
+        if let osd = osdHostVC?.view {
+            self.view.insertSubview(hostVC.view, aboveSubview: osd)
+        } else {
+            self.view.addSubview(hostVC.view)
+        }
+        hostVC.view.frame = self.view.bounds
+        hostVC.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        hostVC.didMove(toParent: self)
+        countdownHostVC = hostVC
+    }
+
+    private func removeCountdown() {
+        countdownHostVC?.willMove(toParent: nil)
+        countdownHostVC?.view.removeFromSuperview()
+        countdownHostVC?.removeFromParent()
+        countdownHostVC = nil
+        becomeFirstResponder()
+    }
+
+    // MARK: - Layout
+
+    /// The rect the backdrop image view should occupy.
+    /// Scope UI: constrained to the 2.39:1 canvas (black bars stay black).
+    /// Normal UI: full screen.
+    private var backdropFrame: CGRect {
+        scopeUIEnabled
+            ? ScopeCanvasGeometry.canvasRect(in: view.bounds.size)
+            : view.bounds
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        // Keep the scope-constrained backdrop in sync with the canvas rect
+        // if bounds change (e.g. first layout pass, rotation).
+        if scopeUIEnabled, let iv = backdropImageView {
+            iv.frame = backdropFrame
+        }
     }
 
     // MARK: - viewDidAppear
@@ -143,18 +284,8 @@ final class PlayerContainerViewController: UIViewController {
     @objc private func keyToggleOSD() { toggleOSD() }
 
     // MARK: - Remote press handling
-    //
-    // Remote button strategy:
-    //   Select (short tap)  → toggle OSD if hidden, or dismiss if visible
-    //   Select (hold 0.4s)  → toggle play/pause (feels natural mid-movie)
-    //   Play/Pause button   → always toggles play/pause
-    //   Menu button         → exit player (or dismiss OSD first if visible)
-    //
-    // Status overlays (loading/error) capture focus themselves, so remote
-    // presses during those states are handled by the SwiftUI overlay buttons.
 
     override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-        // Don't intercept presses while a status overlay has focus
         guard statusHostVC == nil else {
             super.pressesBegan(presses, with: event)
             return
@@ -168,17 +299,15 @@ final class PlayerContainerViewController: UIViewController {
                 engine.togglePlayPause()
                 return
             case .menu:
-                if osdVisible {
-                    hideOSD()
-                } else {
-                    exit()
-                }
+                if osdVisible { hideOSD() } else { exit() }
                 return
             case .upArrow:
                 if !osdVisible { showOSD() }
                 return
             case .downArrow:
-                if osdVisible { hideOSD() }
+                // Don't close the OSD while the AR menu is open — the user is
+                // navigating through the aspect ratio options, not dismissing.
+                if osdVisible && !arMenuOpen { hideOSD() }
                 return
             default:
                 break
@@ -203,11 +332,8 @@ final class PlayerContainerViewController: UIViewController {
             if press.type == .select, let start = selectPressStart {
                 let duration = Date().timeIntervalSince(start)
                 selectPressStart = nil
-                if duration >= holdThreshold {
-                    engine.togglePlayPause()
-                } else {
-                    toggleOSD()
-                }
+                if duration >= holdThreshold { engine.togglePlayPause() }
+                else                         { toggleOSD() }
                 return
             }
         }
@@ -228,20 +354,27 @@ final class PlayerContainerViewController: UIViewController {
         osdVisible = true
 
         let osdView = OSDView(
-            title:         item.name,
-            bucket:        engine.aspectBucket,
-            mode:          engine.presentationMode,
-            playbackState: engine.playbackState,
-            currentTime:   engine.currentTime,
-            duration:      engine.duration,
-            onModeChange:  { [weak self] mode in
-                self?.engine.presentationMode = mode
+            title:               item.name,
+            bucket:              engine.aspectBucket,
+            mode:                engine.presentationMode,
+            playbackState:       engine.playbackState,
+            currentTime:         engine.currentTime,
+            duration:            engine.duration,
+            aspectRatioOverride: engine.aspectRatioOverride,
+            scopeUIEnabled:      scopeUIEnabled,
+            onModeChange:  { [weak self] newMode in
+                self?.engine.presentationMode = newMode
+                self?.refreshOSD()
+            },
+            onAspectRatioChange: { [weak self] newOverride in
+                self?.engine.setAspectRatioOverride(newOverride)
                 self?.refreshOSD()
             },
             onPlayPause:   { [weak self] in self?.engine.togglePlayPause() },
             onSeek:        { [weak self] in self?.engine.seek(to: $0) },
             onDismiss:     { [weak self] in self?.hideOSD() },
-            onExit:        { [weak self] in self?.exit() }
+            onExit:        { [weak self] in self?.exit() },
+            onARMenuStateChange: { [weak self] open in self?.arMenuOpen = open }
         )
 
         let hostVC = UIHostingController(rootView: AnyView(osdView))
@@ -256,6 +389,7 @@ final class PlayerContainerViewController: UIViewController {
 
     private func hideOSD() {
         osdVisible = false
+        arMenuOpen = false          // reset since the SwiftUI view is being torn down
         osdHostVC?.willMove(toParent: nil)
         osdHostVC?.view.removeFromSuperview()
         osdHostVC?.removeFromParent()
@@ -270,126 +404,3 @@ final class PlayerContainerViewController: UIViewController {
     }
 }
 
-// MARK: - PlayerStatusOverlay
-//
-// SwiftUI view shown over the player canvas for loading, retrying, and error states.
-// Using SwiftUI here (rather than UIKit) gives us correct tvOS focus handling on buttons.
-
-struct PlayerStatusOverlay: View {
-
-    enum OverlayState: Equatable {
-        case loading(String)
-        case retrying(String)
-        case error(String)
-    }
-
-    let state:   OverlayState
-    let onRetry: (() -> Void)?
-    let onExit:  () -> Void
-
-    @FocusState private var focusedButton: OverlayButton?
-    enum OverlayButton { case retry, exit }
-
-    var body: some View {
-        ZStack {
-            Color.black.opacity(0.85).ignoresSafeArea()
-
-            VStack(spacing: 28) {
-                switch state {
-
-                // ── Loading ────────────────────────────────────────
-                case .loading(let msg):
-                    ProgressView()
-                        .progressViewStyle(.circular)
-                        .scaleEffect(1.6)
-                        .tint(.white)
-                    Text(msg)
-                        .font(.system(size: 24, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.85))
-
-                // ── Retrying ───────────────────────────────────────
-                case .retrying(let msg):
-                    ProgressView()
-                        .progressViewStyle(.circular)
-                        .scaleEffect(1.6)
-                        .tint(.white)
-                    VStack(spacing: 8) {
-                        Text(msg)
-                            .font(.system(size: 24, weight: .medium))
-                            .foregroundStyle(.white.opacity(0.85))
-                        Text("This may take a moment.")
-                            .font(.system(size: 18))
-                            .foregroundStyle(.white.opacity(0.45))
-                    }
-
-                // ── Error ──────────────────────────────────────────
-                case .error(let msg):
-                    Text("⚠️")
-                        .font(.system(size: 56))
-                    Text("Playback Error")
-                        .font(.system(size: 32, weight: .bold))
-                        .foregroundStyle(.white)
-                    Text(msg)
-                        .font(.system(size: 20))
-                        .foregroundStyle(.white.opacity(0.65))
-                        .multilineTextAlignment(.center)
-                        .frame(maxWidth: 640)
-
-                    HStack(spacing: 24) {
-                        if let onRetry {
-                            OverlayActionButton(label: "Try Again",
-                                               icon: "arrow.clockwise",
-                                               isFocused: focusedButton == .retry) {
-                                onRetry()
-                            }
-                            .focused($focusedButton, equals: .retry)
-                        }
-
-                        OverlayActionButton(label: "Go Back",
-                                           icon: "chevron.left",
-                                           isFocused: focusedButton == .exit) {
-                            onExit()
-                        }
-                        .focused($focusedButton, equals: .exit)
-                    }
-                    .focusSection()
-                    .onAppear {
-                        // Default focus: retry if available, otherwise back
-                        focusedButton = onRetry != nil ? .retry : .exit
-                    }
-                }
-            }
-        }
-    }
-}
-
-// MARK: - OverlayActionButton
-
-private struct OverlayActionButton: View {
-    let label:     String
-    let icon:      String
-    let isFocused: Bool
-    let action:    () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 10) {
-                Image(systemName: icon)
-                Text(label)
-            }
-            .font(.system(size: 22, weight: .semibold))
-            .foregroundStyle(isFocused ? .black : .white)
-            .padding(.horizontal, 32)
-            .padding(.vertical, 16)
-            .background(
-                isFocused
-                    ? Color.white
-                    : Color.white.opacity(0.12),
-                in: RoundedRectangle(cornerRadius: 12)
-            )
-        }
-        .buttonStyle(.plain)
-        .scaleEffect(isFocused ? 1.06 : 1.0)
-        .animation(.spring(response: 0.25, dampingFraction: 0.7), value: isFocused)
-    }
-}

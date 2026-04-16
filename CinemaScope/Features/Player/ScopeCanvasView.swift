@@ -32,20 +32,39 @@ final class ScopeCanvasViewController: UIViewController {
         super.viewDidLoad()
         view.backgroundColor = .black
         view.layer.backgroundColor = UIColor.black.cgColor
-        // Remove any default white/grey background the system might inject
-        view.layer.contentsGravity = .resizeAspect
+
         playerLayer.player = engine.player
         playerLayer.backgroundColor = UIColor.black.cgColor
-        playerLayer.videoGravity = .resizeAspect
+
+        // Use .resizeAspectFill so AVFoundation zooms the stream to fill
+        // the rect ScopeCanvasGeometry computes, preserving pixel aspect ratio.
+        // Any stream content outside that rect (embedded letterbox/pillarbox bars)
+        // is clipped by the layer's own bounds — no distortion, no double-scaling.
+        // The frame is always sized for the *effective content* ratio, so the
+        // "fill target" is already the correct shape; the gravity just handles
+        // the zoom-crop when the raw stream has a different ratio than the content.
+        playerLayer.videoGravity = .resizeAspectFill
+
         view.layer.addSublayer(playerLayer)
 
-        Publishers.CombineLatest(
+        // Subscribe to all three sources that can change the layout:
+        //   presentationMode  — user switched Scope Safe ↔ Full Screen in OSD
+        //   videoDimensions   — dimensions arrived from server stream
+        //   aspectRatioOverride — user set a manual override in OSD
+        Publishers.CombineLatest3(
             engine.$presentationMode,
-            engine.$videoDimensions
+            engine.$videoDimensions,
+            engine.$aspectRatioOverride
         )
         .receive(on: RunLoop.main)
         .sink { [weak self] _ in self?.updateLayout() }
         .store(in: &cancellables)
+
+        // Also react to black-bar detection completing
+        engine.$detectedContentRatio
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.updateLayout() }
+            .store(in: &cancellables)
     }
 
     override func viewDidLayoutSubviews() {
@@ -57,11 +76,9 @@ final class ScopeCanvasViewController: UIViewController {
         guard view.bounds.size != .zero else { return }
 
         let screen       = view.bounds.size
-        let contentRatio = engine.videoDimensions?.aspectRatio ?? AspectBucket.scopeRatio
+        let contentRatio = engine.effectiveContentRatio   // respects override > detection > metadata
         let mode         = engine.presentationMode
 
-        // Geometry computes the exact rect for this mode and ratio.
-        // We give that rect to the layer — no gravity scaling needed.
         let videoRect = ScopeCanvasGeometry.videoRect(
             for: mode,
             contentRatio: contentRatio,
