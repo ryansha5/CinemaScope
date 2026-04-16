@@ -570,6 +570,12 @@ private struct DiagnosticsPanel: View {
     @State private var pingMs:        Int?            = nil
     @State private var lastChecked:   Date?           = nil
 
+    // PlayerLab
+    @State private var labFilePath:   String = ""
+    @State private var labIsRunning:  Bool   = false
+    @State private var labLog:        String = ""
+    @State private var labSuccess:    Bool?  = nil
+
     private var appVersion: String {
         let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "—"
         let b = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "—"
@@ -639,9 +645,115 @@ private struct DiagnosticsPanel: View {
                         }
                     }
                 }
+
+                Divider().background(CinemaTheme.peacockLight.opacity(0.2)).padding(.vertical, 8)
+
+                // ── PlayerLab ────────────────────────────────────────────────
+                diagnosticsSection(title: "PlayerLab") {
+                    // Path input row
+                    HStack(spacing: 20) {
+                        Image(systemName: "doc.fill")
+                            .font(.system(size: 18))
+                            .foregroundStyle(CinemaTheme.accentGold)
+                            .frame(width: 28)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("MP4 File Path")
+                                .font(.system(size: 16, weight: .semibold))
+                                .foregroundStyle(CinemaTheme.primary(colorMode))
+                            Text("Local H.264 MP4 — use a simple HandBrake encode, no HEVC")
+                                .font(.system(size: 13))
+                                .foregroundStyle(CinemaTheme.tertiary(colorMode))
+                        }
+                        Spacer()
+                        TextField("/path/to/sample.mp4", text: $labFilePath)
+                            .font(.system(size: 14, design: .monospaced))
+                            .foregroundStyle(CinemaTheme.primary(colorMode))
+                            .multilineTextAlignment(.trailing)
+                            .autocorrectionDisabled()
+                            .textInputAutocapitalization(.never)
+                            .frame(width: 340)
+                    }
+                    .padding(.horizontal, 20).padding(.vertical, 16)
+                    .overlay(alignment: .bottom) {
+                        Rectangle()
+                            .fill(CinemaTheme.peacockLight.opacity(0.1))
+                            .frame(height: 1).padding(.horizontal, 20)
+                    }
+
+                    // Status row (shown after a run)
+                    if let success = labSuccess {
+                        HStack(spacing: 12) {
+                            Image(systemName: success ? "checkmark.circle.fill" : "xmark.circle.fill")
+                                .font(.system(size: 18))
+                                .foregroundStyle(success ? .green : .red)
+                            Text(success ? "Decoded frames confirmed — pipeline working" : "Pipeline test failed — check log below")
+                                .font(.system(size: 15, weight: .medium))
+                                .foregroundStyle(success ? .green : .red)
+                        }
+                        .padding(.horizontal, 20).padding(.vertical, 14)
+                        .overlay(alignment: .bottom) {
+                            Rectangle()
+                                .fill(CinemaTheme.peacockLight.opacity(0.1))
+                                .frame(height: 1).padding(.horizontal, 20)
+                        }
+                    }
+
+                    // Log output (shown after a run)
+                    if !labLog.isEmpty {
+                        ScrollView(.vertical, showsIndicators: false) {
+                            Text(labLog)
+                                .font(.system(size: 12, design: .monospaced))
+                                .foregroundStyle(CinemaTheme.secondary(colorMode))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(16)
+                        }
+                        .frame(height: 220)
+                        .overlay(alignment: .bottom) {
+                            Rectangle()
+                                .fill(CinemaTheme.peacockLight.opacity(0.1))
+                                .frame(height: 1)
+                        }
+                    }
+                }
+
+                // Run / Clear buttons
+                HStack(spacing: 16) {
+                    SettingsButton(
+                        icon:      labIsRunning ? "arrow.triangle.2.circlepath" : "play.circle.fill",
+                        label:     labIsRunning ? "Running…" : "Run Pipeline Test",
+                        style:     .accent,
+                        colorMode: colorMode
+                    ) {
+                        Task { await runPlayerLabTest() }
+                    }
+                    .disabled(labIsRunning || labFilePath.trimmingCharacters(in: .whitespaces).isEmpty)
+
+                    if !labLog.isEmpty {
+                        SettingsButton(icon: "trash", label: "Clear Log", style: .ghost, colorMode: colorMode) {
+                            labLog     = ""
+                            labSuccess = nil
+                        }
+                    }
+                }
             }
             .padding(48)
         }
+    }
+
+    private func runPlayerLabTest() async {
+        let path = labFilePath.trimmingCharacters(in: .whitespaces)
+        guard !path.isEmpty else { return }
+        labIsRunning = true
+        labLog       = ""
+        labSuccess   = nil
+
+        let url = URL(fileURLWithPath: path)
+        let harness = PlayerLabHarness()
+        await harness.runTest(mp4: url, packetCount: 10)
+
+        labLog     = harness.formattedLog
+        labSuccess = harness.log.contains { $0.message.contains("Sprint 9 milestone") }
+        labIsRunning = false
     }
 
     private func checkConnection() async {
