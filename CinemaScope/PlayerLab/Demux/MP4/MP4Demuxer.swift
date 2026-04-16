@@ -137,23 +137,24 @@ final class MP4Demuxer {
             let size32  = header.mp4UInt32BE(at: 0)
             let boxType = header.mp4FourCC(at: 4)
 
-            var headerSize:   Int
-            var boxTotalSize: Int64
+            // Initialize with the common case (normal 32-bit size, 8-byte header).
+            // The switch below overrides for the two special size32 values.
+            var headerSize:   Int   = 8
+            var boxTotalSize: Int64 = Int64(size32)
 
             switch size32 {
             case 1:
-                // Extended 64-bit size follows immediately after the 8-byte header
-                guard endOffset - offset >= 16 else { break }
+                // Extended 64-bit size in the 8 bytes immediately after the header.
+                // If there isn't room, skip the 8-byte stub and try to resync.
+                guard endOffset - offset >= 16 else { offset += 8; continue }
                 let ext      = try await reader.read(offset: offset + 8, length: 8)
                 boxTotalSize = Int64(bitPattern: ext.mp4UInt64BE(at: 0))
                 headerSize   = 16
             case 0:
-                // Extends to end of enclosing box (only valid at top level)
+                // size == 0 means the box extends to the end of its parent.
                 boxTotalSize = endOffset - offset
-                headerSize   = 8
             default:
-                boxTotalSize = Int64(size32)
-                headerSize   = 8
+                break   // already initialised above
             }
 
             guard boxTotalSize >= Int64(headerSize) else {
