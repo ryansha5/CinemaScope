@@ -1,5 +1,27 @@
 import SwiftUI
 
+// MARK: - Settings Section
+
+enum SettingsSection: String, CaseIterable, Identifiable {
+    case homeScreen  = "Home Screen"
+    case playback    = "Playback"
+    case startup     = "Startup"
+    case diagnostics = "Diagnostics"
+
+    var id: String { rawValue }
+
+    var icon: String {
+        switch self {
+        case .homeScreen:  return "rectangle.grid.1x2.fill"
+        case .playback:    return "play.circle.fill"
+        case .startup:     return "house.fill"
+        case .diagnostics: return "stethoscope"
+        }
+    }
+}
+
+// MARK: - SettingsView
+
 struct SettingsView: View {
 
     @EnvironmentObject var settings: AppSettings
@@ -7,6 +29,7 @@ struct SettingsView: View {
     let availableGenres: [String]
     let onDismiss: () -> Void
 
+    @State private var selectedSection: SettingsSection = .homeScreen
     @State private var showAddRibbon  = false
     @State private var savedFeedback  = false
 
@@ -15,12 +38,10 @@ struct SettingsView: View {
             CinemaBackground()
 
             HStack(alignment: .top, spacing: 0) {
-                // Left panel — nav
                 settingsSidebar
                     .focusSection()
 
-                // Right panel — content
-                ribbonEditor
+                contentPanel
                     .focusSection()
             }
         }
@@ -47,12 +68,17 @@ struct SettingsView: View {
                 .foregroundStyle(CinemaTheme.primary(settings.colorMode))
                 .padding(.bottom, 20)
 
-            sidebarItem(icon: "rectangle.grid.1x2.fill", label: "Home Screen")
+            ForEach(SettingsSection.allCases) { section in
+                SidebarNavButton(
+                    icon:      section.icon,
+                    label:     section.rawValue,
+                    isActive:  selectedSection == section,
+                    colorMode: settings.colorMode
+                ) { selectedSection = section }
+            }
 
             Spacer()
 
-            // Save button — settings auto-persist but this gives
-            // explicit confirmation and is a clear exit point
             Button {
                 savedFeedback = true
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
@@ -68,21 +94,32 @@ struct SettingsView: View {
                         .lineLimit(1)
                 }
                 .foregroundStyle(savedFeedback ? CinemaTheme.accentGold : CinemaTheme.primary(settings.colorMode))
-                .padding(.horizontal, 16)
-                .padding(.vertical, 14)
+                .padding(.horizontal, 16).padding(.vertical, 14)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .background(
-                    savedFeedback
-                        ? CinemaTheme.accentGold.opacity(0.15)
-                        : CinemaTheme.peacock.opacity(0.4),
-                    in: RoundedRectangle(cornerRadius: 10)
-                )
+                .background {
+                    ZStack {
+                        (savedFeedback ? CinemaTheme.accentGold : CinemaTheme.peacock)
+                            .opacity(savedFeedback ? 0.15 : 0.35)
+                        LinearGradient(
+                            stops: [
+                                .init(color: .white.opacity(0.30), location: 0),
+                                .init(color: .clear,               location: 0.55),
+                            ],
+                            startPoint: .top, endPoint: .bottom
+                        )
+                    }
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 10))
                 .overlay {
                     RoundedRectangle(cornerRadius: 10)
                         .strokeBorder(
-                            savedFeedback
-                                ? CinemaTheme.accentGold.opacity(0.5)
-                                : CinemaTheme.peacockLight.opacity(0.2),
+                            LinearGradient(
+                                stops: [
+                                    .init(color: .white.opacity(0.55), location: 0),
+                                    .init(color: .white.opacity(0.15), location: 1),
+                                ],
+                                startPoint: .topLeading, endPoint: .bottomTrailing
+                            ),
                             lineWidth: 1
                         )
                 }
@@ -91,111 +128,63 @@ struct SettingsView: View {
             .focusRingFree()
             .padding(.bottom, 8)
 
-            // Back without saving
             BackButton(colorMode: settings.colorMode, scopeMode: false, onTap: onDismiss)
         }
         .padding(32)
-        .frame(width: 260)
+        .frame(width: 280)
         .background(CinemaTheme.peacockDeep.opacity(0.6))
         .overlay(alignment: .trailing) {
             Rectangle().fill(CinemaTheme.peacockLight.opacity(0.15)).frame(width: 1)
         }
     }
 
-    private func sidebarItem(icon: String, label: String) -> some View {
-        HStack(spacing: 12) {
-            Image(systemName: icon).font(.system(size: 16))
-            Text(label).font(.system(size: 18, weight: .medium))
-        }
-        .foregroundStyle(CinemaTheme.accentGold)
-        .padding(.horizontal, 16).padding(.vertical, 12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(CinemaTheme.peacockDeep.opacity(0.6), in: RoundedRectangle(cornerRadius: 10))
-        .overlay {
-            RoundedRectangle(cornerRadius: 10)
-                .strokeBorder(CinemaTheme.accentGold.opacity(0.4), lineWidth: 1)
+    // MARK: - Content panel (switches per section)
+
+    @ViewBuilder
+    private var contentPanel: some View {
+        switch selectedSection {
+        case .homeScreen:  homeScreenPanel
+        case .playback:    playbackPanel
+        case .startup:     startupPanel
+        case .diagnostics: diagnosticsPanel
         }
     }
 
-    // MARK: - Ribbon Editor
+    // MARK: - Home Screen panel
 
-    private var ribbonEditor: some View {
+    private var homeScreenPanel: some View {
         ScrollView(.vertical, showsIndicators: false) {
             VStack(alignment: .leading, spacing: 24) {
-                // Header
-                HStack {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Home Screen")
-                            .font(.system(size: 36, weight: .bold))
-                            .foregroundStyle(CinemaTheme.primary(settings.colorMode))
-                        Text("Choose and arrange the rows that appear on your home screen.")
-                            .font(.system(size: 18))
-                            .foregroundStyle(CinemaTheme.secondary(settings.colorMode))
-                    }
-                    Spacer()
+                panelHeader(
+                    title:    "Home Screen",
+                    subtitle: "Choose and arrange the rows that appear on your home screen."
+                ) {
                     HStack(spacing: 16) {
-                        // Add ribbon
                         SettingsButton(icon: "plus.circle.fill", label: "Add Row", style: .accent, colorMode: settings.colorMode) {
                             showAddRibbon = true
                         }
-                        // Reset
                         SettingsButton(icon: "arrow.counterclockwise", label: "Reset", style: .ghost, colorMode: settings.colorMode) {
                             settings.resetToDefaults()
                         }
                     }
                 }
 
-                // Color Mode picker
-                VStack(alignment: .leading, spacing: 16) {
-                    Text("Appearance")
-                        .font(.system(size: 24, weight: .semibold))
-                        .foregroundStyle(CinemaTheme.primary(settings.colorMode))
+                settingsDivider
+                sectionTitle("Appearance")
 
-                    HStack(spacing: 16) {
-                        ForEach(ColorMode.allCases) { mode in
-                            ColorModeCard(
-                                mode:      mode,
-                                isActive:  settings.colorMode == mode,
-                                colorMode: settings.colorMode
-                            ) { settings.colorMode = mode }
+                HStack(spacing: 16) {
+                    ForEach(ColorMode.allCases) { mode in
+                        ColorModeCard(mode: mode, isActive: settings.colorMode == mode, colorMode: settings.colorMode) {
+                            settings.colorMode = mode
                         }
-                        Spacer()
                     }
+                    Spacer()
                 }
                 .padding(.bottom, 8)
 
-                Divider()
-                    .background(CinemaTheme.peacockLight.opacity(0.2))
-                    .padding(.bottom, 8)
+                settingsDivider
+                sectionTitle("Rows")
 
-                // Color Mode
-                VStack(alignment: .leading, spacing: 16) {
-                    Text("Appearance")
-                        .font(.system(size: 24, weight: .semibold))
-                        .foregroundStyle(CinemaTheme.primary(settings.colorMode))
-
-                    HStack(spacing: 16) {
-                        ForEach(ColorMode.allCases, id: \.rawValue) { mode in
-                            ColorModeCard(mode: mode, isActive: settings.colorMode == mode,
-                                          colorMode: settings.colorMode, onTap: {
-                                settings.colorMode = mode
-                            })
-                        }
-                    }
-                }
-                .padding(.bottom, 16)
-
-                Divider()
-                    .background(CinemaTheme.peacockLight.opacity(0.2))
-                    .padding(.bottom, 16)
-
-                Text("Home Screen")
-                    .font(.system(size: 24, weight: .semibold))
-                    .foregroundStyle(CinemaTheme.primary(settings.colorMode))
-                    .padding(.bottom, 4)
-
-                // Ribbon list — separate focusSection from header
-                // so navigating up from top row reaches Add/Reset buttons
                 VStack(spacing: 12) {
                     ForEach(settings.homeRibbons) { ribbon in
                         RibbonRow(
@@ -215,6 +204,505 @@ struct SettingsView: View {
             .padding(48)
         }
     }
+
+    // MARK: - Playback panel
+
+    private var playbackPanel: some View {
+        ScrollView(.vertical, showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 24) {
+                panelHeader(
+                    title:    "Playback",
+                    subtitle: "Control how the app behaves during and between episodes."
+                )
+
+                settingsDivider
+                sectionTitle("Episodes")
+
+                toggleRow(
+                    icon:    "play.circle.fill",
+                    title:   "Autoplay Next Episode",
+                    detail:  "When an episode ends, a countdown will appear and the next episode will start automatically.",
+                    value:   $settings.autoplayNextEpisode
+                )
+
+                settingsDivider
+                sectionTitle("Audio & Subtitles")
+
+                toggleRow(
+                    icon:    "captions.bubble.fill",
+                    title:   "Show Subtitles by Default",
+                    detail:  "When a subtitle track is available, enable it automatically on playback start.",
+                    value:   $settings.subtitlesEnabled
+                )
+
+                languageRow(
+                    icon:    "waveform",
+                    title:   "Preferred Audio Language",
+                    detail:  "Language code for audio track selection (e.g. \"en\", \"fr\"). Leave blank to use your server default.",
+                    value:   $settings.preferredAudioLanguage
+                )
+            }
+            .padding(48)
+        }
+    }
+
+    // MARK: - Startup panel
+
+    private var startupPanel: some View {
+        ScrollView(.vertical, showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 24) {
+                panelHeader(
+                    title:    "Startup",
+                    subtitle: "Choose where the app takes you when it first opens."
+                )
+
+                settingsDivider
+                sectionTitle("Opening Screen")
+
+                LazyVGrid(
+                    columns: Array(repeating: GridItem(.flexible(), spacing: 16), count: 3),
+                    spacing: 16
+                ) {
+                    ForEach(NavTab.allCases) { tab in
+                        StartupTabCard(
+                            tab:       tab,
+                            isActive:  settings.startupTab == tab,
+                            colorMode: settings.colorMode
+                        ) { settings.startupTab = tab }
+                    }
+                }
+                .focusSection()
+            }
+            .padding(48)
+        }
+    }
+
+    // MARK: - Diagnostics panel
+
+    private var diagnosticsPanel: some View {
+        DiagnosticsPanel(session: session, colorMode: settings.colorMode)
+    }
+
+    // MARK: - Shared panel helpers
+
+    private func panelHeader(title: String, subtitle: String, @ViewBuilder trailing: () -> some View = { EmptyView() }) -> some View {
+        HStack(alignment: .top) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(title)
+                    .font(.system(size: 36, weight: .bold))
+                    .foregroundStyle(CinemaTheme.primary(settings.colorMode))
+                Text(subtitle)
+                    .font(.system(size: 18))
+                    .foregroundStyle(CinemaTheme.secondary(settings.colorMode))
+            }
+            Spacer()
+            trailing()
+        }
+    }
+
+    private func sectionTitle(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 22, weight: .semibold))
+            .foregroundStyle(CinemaTheme.primary(settings.colorMode))
+            .padding(.bottom, 4)
+    }
+
+    private var settingsDivider: some View {
+        Divider()
+            .background(CinemaTheme.peacockLight.opacity(0.2))
+            .padding(.vertical, 8)
+    }
+
+    // Toggle row (icon + title + detail + toggle)
+    private func toggleRow(icon: String, title: String, detail: String, value: Binding<Bool>) -> some View {
+        HStack(spacing: 20) {
+            Image(systemName: icon)
+                .font(.system(size: 22))
+                .foregroundStyle(CinemaTheme.accentGold)
+                .frame(width: 32)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title)
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(CinemaTheme.primary(settings.colorMode))
+                Text(detail)
+                    .font(.system(size: 14))
+                    .foregroundStyle(CinemaTheme.tertiary(settings.colorMode))
+                    .lineLimit(2)
+                    .frame(maxWidth: 560, alignment: .leading)
+            }
+
+            Spacer()
+
+            SettingsToggle(isOn: value, colorMode: settings.colorMode)
+        }
+        .padding(.horizontal, 20).padding(.vertical, 16)
+        .background(CinemaTheme.peacockDeep.opacity(0.4), in: RoundedRectangle(cornerRadius: 12))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(CinemaTheme.peacockLight.opacity(0.15), lineWidth: 1)
+        }
+    }
+
+    // Language code text-input row
+    private func languageRow(icon: String, title: String, detail: String, value: Binding<String>) -> some View {
+        HStack(spacing: 20) {
+            Image(systemName: icon)
+                .font(.system(size: 22))
+                .foregroundStyle(CinemaTheme.accentGold)
+                .frame(width: 32)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title)
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(CinemaTheme.primary(settings.colorMode))
+                Text(detail)
+                    .font(.system(size: 14))
+                    .foregroundStyle(CinemaTheme.tertiary(settings.colorMode))
+                    .lineLimit(2)
+                    .frame(maxWidth: 480, alignment: .leading)
+            }
+
+            Spacer()
+
+            TextField("e.g. en", text: value)
+                .font(.system(size: 16, weight: .medium))
+                .foregroundStyle(CinemaTheme.primary(settings.colorMode))
+                .multilineTextAlignment(.trailing)
+                .autocorrectionDisabled()
+                .textInputAutocapitalization(.never)
+                .frame(width: 80)
+        }
+        .padding(.horizontal, 20).padding(.vertical, 16)
+        .background(CinemaTheme.peacockDeep.opacity(0.4), in: RoundedRectangle(cornerRadius: 12))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(CinemaTheme.peacockLight.opacity(0.15), lineWidth: 1)
+        }
+    }
+}
+
+// MARK: - SidebarNavButton
+
+private struct SidebarNavButton: View {
+    let icon:      String
+    let label:     String
+    let isActive:  Bool
+    let colorMode: ColorMode
+    let onTap:     () -> Void
+
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        Button(action: onTap) {
+            HStack(spacing: 12) {
+                Image(systemName: icon)
+                    .font(.system(size: 16, weight: isActive ? .semibold : .regular))
+                    .frame(width: 22)
+                Text(label)
+                    .font(.system(size: 17, weight: isActive ? .semibold : .regular))
+                    .lineLimit(1)
+                Spacer()
+            }
+            .foregroundStyle(
+                isActive  ? CinemaTheme.navActive(colorMode) :
+                isFocused ? CinemaTheme.primary(colorMode)   :
+                            CinemaTheme.secondary(colorMode)
+            )
+            .padding(.horizontal, 14).padding(.vertical, 12)
+            .background {
+                ZStack {
+                    (isActive ? CinemaTheme.navActive(colorMode) : Color.white)
+                        .opacity(
+                            isActive && isFocused ? 0.22 :
+                            isActive              ? 0.13 :
+                            isFocused             ? 0.13 : 0
+                        )
+                    if isActive || isFocused {
+                        LinearGradient(
+                            stops: [
+                                .init(color: .white.opacity(isFocused ? 0.40 : 0.16), location: 0),
+                                .init(color: .clear,                                   location: 0.6),
+                            ],
+                            startPoint: .top, endPoint: .bottom
+                        )
+                    }
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: 10)
+                    .strokeBorder(
+                        LinearGradient(
+                            stops: [
+                                .init(color: .white.opacity(isActive || isFocused ? (isFocused ? 0.65 : 0.35) : 0), location: 0),
+                                .init(color: .white.opacity(isActive || isFocused ? (isFocused ? 0.20 : 0.10) : 0), location: 1),
+                            ],
+                            startPoint: .topLeading, endPoint: .bottomTrailing
+                        ),
+                        lineWidth: (isActive || isFocused) ? 1.5 : 0
+                    )
+            }
+            .scaleEffect(isFocused ? 1.02 : 1.0, anchor: .leading)
+            .animation(.spring(response: 0.22, dampingFraction: 0.7), value: isFocused)
+        }
+        .focusRingFree()
+        .focused($isFocused)
+    }
+}
+
+// MARK: - SettingsToggle
+
+struct SettingsToggle: View {
+    @Binding var isOn: Bool
+    let colorMode: ColorMode
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        Button { isOn.toggle() } label: {
+            HStack(spacing: 8) {
+                Image(systemName: isOn ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: 20))
+                    .foregroundStyle(isOn ? CinemaTheme.accentGold : CinemaTheme.tertiary(colorMode))
+                Text(isOn ? "On" : "Off")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(isOn ? CinemaTheme.accentGold : CinemaTheme.tertiary(colorMode))
+            }
+            .padding(.horizontal, 16).padding(.vertical, 10)
+            .background {
+                ZStack {
+                    (isOn ? CinemaTheme.accentGold : Color.white)
+                        .opacity(isFocused ? 0.18 : (isOn ? 0.10 : 0.06))
+                    LinearGradient(
+                        stops: [
+                            .init(color: .white.opacity(isFocused ? 0.35 : 0.14), location: 0),
+                            .init(color: .clear,                                   location: 0.6),
+                        ],
+                        startPoint: .top, endPoint: .bottom
+                    )
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 10))
+            .overlay {
+                RoundedRectangle(cornerRadius: 10)
+                    .strokeBorder(
+                        LinearGradient(
+                            stops: [
+                                .init(color: .white.opacity(isFocused ? 0.60 : (isOn ? 0.30 : 0.15)), location: 0),
+                                .init(color: .white.opacity(isFocused ? 0.18 : 0.06), location: 1),
+                            ],
+                            startPoint: .topLeading, endPoint: .bottomTrailing
+                        ),
+                        lineWidth: isFocused ? 1.5 : 1
+                    )
+            }
+            .animation(.easeOut(duration: 0.15), value: isOn)
+            .animation(.spring(response: 0.22, dampingFraction: 0.7), value: isFocused)
+        }
+        .focusRingFree()
+        .focused($isFocused)
+    }
+}
+
+// MARK: - StartupTabCard
+
+private struct StartupTabCard: View {
+    let tab:       NavTab
+    let isActive:  Bool
+    let colorMode: ColorMode
+    let onTap:     () -> Void
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        Button(action: onTap) {
+            VStack(spacing: 14) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 12)
+                        .fill(
+                            isActive
+                                ? CinemaTheme.accentGold.opacity(0.18)
+                                : CinemaTheme.peacockDeep.opacity(0.5)
+                        )
+                        .frame(height: 70)
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 12)
+                                .strokeBorder(
+                                    isActive || isFocused
+                                        ? (isActive ? CinemaTheme.accentGold : CinemaTheme.peacock)
+                                        : Color.white.opacity(0.12),
+                                    lineWidth: isActive ? 2 : 1
+                                )
+                        }
+                    Image(systemName: tab.icon)
+                        .font(.system(size: 28, weight: .light))
+                        .foregroundStyle(isActive ? CinemaTheme.accentGold : CinemaTheme.secondary(colorMode))
+                }
+                .scaleEffect(isFocused ? 1.04 : 1.0)
+                .shadow(color: isFocused ? CinemaTheme.peacock.opacity(0.45) : .clear, radius: 14)
+                .animation(.spring(response: 0.25, dampingFraction: 0.7), value: isFocused)
+
+                HStack(spacing: 6) {
+                    if isActive {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 13))
+                            .foregroundStyle(CinemaTheme.accentGold)
+                    }
+                    Text(tab.rawValue)
+                        .font(.system(size: 15, weight: isActive ? .semibold : .regular))
+                        .foregroundStyle(isActive ? CinemaTheme.primary(colorMode) : CinemaTheme.secondary(colorMode))
+                }
+            }
+        }
+        .focusRingFree()
+        .focused($isFocused)
+    }
+}
+
+// MARK: - DiagnosticsPanel
+
+private struct DiagnosticsPanel: View {
+    let session:   EmbySession
+    let colorMode: ColorMode
+
+    @State private var systemInfo:    EmbySystemInfo? = nil
+    @State private var isLoading:     Bool            = false
+    @State private var pingResult:    String?         = nil
+    @State private var pingMs:        Int?            = nil
+    @State private var lastChecked:   Date?           = nil
+
+    private var appVersion: String {
+        let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "—"
+        let b = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "—"
+        return "\(v) (\(b))"
+    }
+
+    var body: some View {
+        ScrollView(.vertical, showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 24) {
+                // Header
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Diagnostics")
+                        .font(.system(size: 36, weight: .bold))
+                        .foregroundStyle(CinemaTheme.primary(colorMode))
+                    Text("Check your server connection and app status.")
+                        .font(.system(size: 18))
+                        .foregroundStyle(CinemaTheme.secondary(colorMode))
+                }
+
+                Divider().background(CinemaTheme.peacockLight.opacity(0.2)).padding(.vertical, 8)
+
+                // App info
+                diagnosticsSection(title: "App") {
+                    diagRow(label: "Version", value: appVersion)
+                    diagRow(label: "Device",  value: UIDevice.current.model)
+                }
+
+                Divider().background(CinemaTheme.peacockLight.opacity(0.2)).padding(.vertical, 8)
+
+                // Server info
+                diagnosticsSection(title: "Server") {
+                    if let url = session.server?.url {
+                        diagRow(label: "Address", value: url)
+                    }
+                    if let info = systemInfo {
+                        diagRow(label: "Name",    value: info.serverName    ?? "—")
+                        diagRow(label: "Version", value: info.version       ?? "—")
+                        diagRow(label: "OS",      value: info.operatingSystem ?? "—")
+                    }
+                    if let ms = pingMs {
+                        diagRow(label: "Ping",    value: "\(ms) ms", highlight: ms < 100 ? .green : (ms < 500 ? .yellow : .red))
+                    }
+                    if let err = pingResult {
+                        diagRow(label: "Status",  value: err, highlight: .red)
+                    }
+                    if let date = lastChecked {
+                        diagRow(label: "Checked", value: date.formatted(date: .omitted, time: .shortened))
+                    }
+                }
+
+                // Check connection button
+                HStack(spacing: 16) {
+                    SettingsButton(
+                        icon:      isLoading ? "arrow.triangle.2.circlepath" : "antenna.radiowaves.left.and.right",
+                        label:     isLoading ? "Checking…" : "Check Connection",
+                        style:     .accent,
+                        colorMode: colorMode
+                    ) { Task { await checkConnection() } }
+                    .disabled(isLoading)
+
+                    if systemInfo != nil || pingResult != nil {
+                        SettingsButton(icon: "arrow.counterclockwise", label: "Clear", style: .ghost, colorMode: colorMode) {
+                            systemInfo  = nil
+                            pingResult  = nil
+                            pingMs      = nil
+                            lastChecked = nil
+                        }
+                    }
+                }
+            }
+            .padding(48)
+        }
+    }
+
+    private func checkConnection() async {
+        guard let server = session.server, let token = session.token else { return }
+        isLoading   = true
+        pingResult  = nil
+        pingMs      = nil
+        systemInfo  = nil
+
+        let start = Date()
+        do {
+            let info  = try await EmbyAPI.fetchSystemInfo(server: server, token: token)
+            let ms    = Int(Date().timeIntervalSince(start) * 1000)
+            systemInfo  = info
+            pingMs      = ms
+            lastChecked = Date()
+        } catch {
+            pingResult  = error.localizedDescription
+            lastChecked = Date()
+        }
+        isLoading = false
+    }
+
+    @ViewBuilder
+    private func diagnosticsSection(title: String, @ViewBuilder content: () -> some View) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(title)
+                .font(.system(size: 20, weight: .semibold))
+                .foregroundStyle(CinemaTheme.primary(colorMode))
+            VStack(spacing: 0) {
+                content()
+            }
+            .background(CinemaTheme.peacockDeep.opacity(0.4), in: RoundedRectangle(cornerRadius: 12))
+            .overlay {
+                RoundedRectangle(cornerRadius: 12)
+                    .strokeBorder(CinemaTheme.peacockLight.opacity(0.15), lineWidth: 1)
+            }
+        }
+    }
+
+    private func diagRow(label: String, value: String, highlight: Color? = nil) -> some View {
+        HStack {
+            Text(label)
+                .font(.system(size: 16, weight: .medium))
+                .foregroundStyle(CinemaTheme.secondary(colorMode))
+                .frame(width: 100, alignment: .leading)
+            Text(value)
+                .font(.system(size: 16, design: .monospaced))
+                .foregroundStyle(highlight ?? CinemaTheme.primary(colorMode))
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+            Spacer()
+        }
+        .padding(.horizontal, 20).padding(.vertical, 14)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(CinemaTheme.peacockLight.opacity(0.1))
+                .frame(height: 1)
+                .padding(.horizontal, 20)
+        }
+    }
 }
 
 // MARK: - RibbonRow
@@ -231,13 +719,11 @@ struct RibbonRow: View {
 
     var body: some View {
         HStack(spacing: 16) {
-            // Icon + name
             HStack(spacing: 14) {
                 Image(systemName: ribbon.type.icon)
                     .font(.system(size: 18))
                     .foregroundStyle(ribbon.enabled ? CinemaTheme.accentGold : CinemaTheme.tertiary(colorMode))
                     .frame(width: 28)
-
                 Text(ribbon.type.displayName)
                     .font(.system(size: 20, weight: .medium))
                     .foregroundStyle(ribbon.enabled ? CinemaTheme.primary(colorMode) : CinemaTheme.tertiary(colorMode))
@@ -245,9 +731,7 @@ struct RibbonRow: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            // Controls
             HStack(spacing: 10) {
-                // Toggle enabled
                 SettingsButton(
                     icon:      ribbon.enabled ? "eye.fill" : "eye.slash",
                     label:     ribbon.enabled ? "Visible" : "Hidden",
@@ -255,28 +739,22 @@ struct RibbonRow: View {
                     colorMode: colorMode
                 ) { onToggle() }
 
-                // Move up
-                SettingsButton(icon: "chevron.up", label: "", style: .ghost, colorMode: colorMode) { onMoveUp() }
-                    .disabled(isFirst)
-                    .opacity(isFirst ? 0.3 : 1)
+                SettingsButton(icon: "chevron.up",   label: "", style: .ghost, colorMode: colorMode) { onMoveUp() }
+                    .disabled(isFirst).opacity(isFirst ? 0.3 : 1)
+                    .accessibilityLabel("Move \(ribbon.type.displayName) up")
 
-                // Move down
                 SettingsButton(icon: "chevron.down", label: "", style: .ghost, colorMode: colorMode) { onMoveDown() }
-                    .disabled(isLast)
-                    .opacity(isLast ? 0.3 : 1)
+                    .disabled(isLast).opacity(isLast ? 0.3 : 1)
+                    .accessibilityLabel("Move \(ribbon.type.displayName) down")
 
-                // Remove (only for user-added genre/custom ribbons)
                 if case .genre = ribbon.type {
                     SettingsButton(icon: "trash", label: "", style: .destructive, colorMode: colorMode) { onRemove() }
+                        .accessibilityLabel("Remove \(ribbon.type.displayName) row")
                 }
             }
         }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 16)
-        .background(
-            CinemaTheme.peacockDeep.opacity(ribbon.enabled ? 0.5 : 0.25),
-            in: RoundedRectangle(cornerRadius: 12)
-        )
+        .padding(.horizontal, 20).padding(.vertical, 16)
+        .background(CinemaTheme.peacockDeep.opacity(ribbon.enabled ? 0.5 : 0.25), in: RoundedRectangle(cornerRadius: 12))
         .overlay {
             RoundedRectangle(cornerRadius: 12)
                 .strokeBorder(
@@ -313,9 +791,7 @@ struct AddRibbonSheet: View {
     var body: some View {
         ZStack {
             CinemaBackground()
-
             VStack(alignment: .leading, spacing: 32) {
-                // Header
                 HStack {
                     VStack(alignment: .leading, spacing: 6) {
                         Text("Add a Row")
@@ -334,7 +810,6 @@ struct AddRibbonSheet: View {
                     .focusRingFree()
                 }
 
-                // Item type picker
                 HStack(spacing: 12) {
                     Text("Content type:")
                         .font(.system(size: 18))
@@ -349,7 +824,6 @@ struct AddRibbonSheet: View {
                     }
                 }
 
-                // Genre grid
                 if unusedGenres.isEmpty {
                     Text("All genres already added.")
                         .font(.system(size: 18))
@@ -359,15 +833,8 @@ struct AddRibbonSheet: View {
                     ScrollView(.vertical, showsIndicators: false) {
                         LazyVGrid(columns: cols, spacing: 16) {
                             ForEach(unusedGenres, id: \.self) { genre in
-                                GenrePickerCell(
-                                    genre:     genre,
-                                    isFocused: focusedGenre == genre,
-                                    colorMode: colorMode
-                                ) {
-                                    let ribbon = HomeRibbon(
-                                        type: .genre(name: genre, itemType: selectedItemType)
-                                    )
-                                    onAdd(ribbon)
+                                GenrePickerCell(genre: genre, isFocused: focusedGenre == genre, colorMode: colorMode) {
+                                    onAdd(HomeRibbon(type: .genre(name: genre, itemType: selectedItemType)))
                                 }
                                 .focused($focusedGenre, equals: genre)
                             }
@@ -391,8 +858,7 @@ struct GenrePickerCell: View {
             Text(genre)
                 .font(.system(size: 18, weight: .medium))
                 .foregroundStyle(isFocused ? .black : CinemaTheme.primary(colorMode))
-                .padding(.horizontal, 20)
-                .padding(.vertical, 14)
+                .padding(.horizontal, 20).padding(.vertical, 14)
                 .frame(maxWidth: .infinity)
                 .background(
                     isFocused ? CinemaTheme.accentGold : CinemaTheme.peacock.opacity(0.4),
@@ -434,12 +900,12 @@ struct SettingsButton: View {
             .foregroundStyle(foregroundColor)
             .padding(.horizontal, label.isEmpty ? 14 : 18)
             .padding(.vertical, 12)
-            .background(backgroundColor, in: RoundedRectangle(cornerRadius: 10))
-            .overlay {
-                RoundedRectangle(cornerRadius: 10)
-                    .strokeBorder(borderColor, lineWidth: isFocused ? 2 : 1)
-            }
+            .background { glassBackground }
+            .clipShape(RoundedRectangle(cornerRadius: 10))
+            .overlay { glassBorder }
             .scaleEffect(isFocused ? 1.05 : 1.0)
+            .shadow(color: glowColor.opacity(isFocused ? 0.55 : 0), radius: 22, x: 0, y: 0)
+            .shadow(color: .white.opacity(isFocused ? 0.16 : 0), radius: 6, x: 0, y: -4)
             .animation(.spring(response: 0.25, dampingFraction: 0.7), value: isFocused)
         }
         .focusRingFree()
@@ -450,44 +916,80 @@ struct SettingsButton: View {
         switch style {
         case .accent:      return isFocused ? .black : CinemaTheme.accentGold
         case .ghost:       return isFocused ? CinemaTheme.primary(colorMode) : CinemaTheme.secondary(colorMode)
-        case .destructive: return isFocused ? CinemaTheme.primary(colorMode) : .red.opacity(0.7)
+        case .destructive: return isFocused ? .white : .red.opacity(0.8)
         }
     }
 
-    private var backgroundColor: Color {
+    private var tintColor: Color {
         switch style {
-        case .accent:      return isFocused ? CinemaTheme.accentGold : CinemaTheme.accentGold.opacity(0.15)
-        case .ghost:       return isFocused ? CinemaTheme.peacock.opacity(0.5) : CinemaTheme.peacockDeep.opacity(0.5)
-        case .destructive: return isFocused ? Color.red.opacity(0.5) : Color.red.opacity(0.1)
+        case .accent:      return CinemaTheme.accentGold
+        case .ghost:       return CinemaTheme.peacock
+        case .destructive: return .red
         }
     }
 
-    private var borderColor: Color {
+    private var glowColor: Color {
         switch style {
-        case .accent:      return isFocused ? CinemaTheme.accentGold : CinemaTheme.accentGold.opacity(0.3)
-        case .ghost:       return isFocused ? .white.opacity(0.4) : CinemaTheme.peacockLight.opacity(0.2)
-        case .destructive: return isFocused ? .red.opacity(0.6) : .red.opacity(0.2)
+        case .accent:      return CinemaTheme.accentGold
+        case .ghost:       return CinemaTheme.teal
+        case .destructive: return .red
         }
+    }
+
+    @ViewBuilder private var glassBackground: some View {
+        ZStack {
+            tintColor.opacity(isFocused ? 0.45 : 0.12)
+            LinearGradient(
+                stops: [
+                    .init(color: .white.opacity(isFocused ? 0.52 : 0.22), location: 0.00),
+                    .init(color: .white.opacity(isFocused ? 0.14 : 0.05), location: 0.44),
+                    .init(color: .clear,                                   location: 0.72),
+                ],
+                startPoint: .top, endPoint: .bottom
+            )
+            LinearGradient(
+                stops: [
+                    .init(color: .clear,                                   location: 0.65),
+                    .init(color: .white.opacity(isFocused ? 0.12 : 0.04), location: 1.00),
+                ],
+                startPoint: .top, endPoint: .bottom
+            )
+        }
+    }
+
+    @ViewBuilder private var glassBorder: some View {
+        RoundedRectangle(cornerRadius: 10)
+            .strokeBorder(
+                LinearGradient(
+                    stops: [
+                        .init(color: .white.opacity(isFocused ? 0.80 : 0.38), location: 0.00),
+                        .init(color: .white.opacity(isFocused ? 0.32 : 0.16), location: 0.50),
+                        .init(color: .white.opacity(isFocused ? 0.12 : 0.06), location: 1.00),
+                    ],
+                    startPoint: .topLeading, endPoint: .bottomTrailing
+                ),
+                lineWidth: isFocused ? 1.5 : 1.0
+            )
     }
 }
+
+// MARK: - ColorModeCard
 
 struct ColorModeCard: View {
     let mode:      ColorMode
     let isActive:  Bool
-    let colorMode: ColorMode   // current active mode (for token colors)
+    let colorMode: ColorMode
     let onTap:     () -> Void
     @FocusState private var isFocused: Bool
 
     var body: some View {
         Button(action: onTap) {
             VStack(spacing: 14) {
-                // Preview swatch
                 ZStack {
                     RoundedRectangle(cornerRadius: 12)
                         .fill(previewBackground)
                         .frame(width: 160, height: 90)
                         .overlay {
-                            // Fake UI chrome in preview
                             VStack(spacing: 6) {
                                 HStack(spacing: 4) {
                                     ForEach(0..<4, id: \.self) { _ in
@@ -520,10 +1022,7 @@ struct ColorModeCard: View {
                         }
                 }
                 .scaleEffect(isFocused ? 1.04 : 1.0)
-                .shadow(
-                    color: isFocused ? CinemaTheme.peacock.opacity(0.5) : .clear,
-                    radius: 16
-                )
+                .shadow(color: isFocused ? CinemaTheme.peacock.opacity(0.5) : .clear, radius: 16)
                 .animation(.spring(response: 0.25, dampingFraction: 0.7), value: isFocused)
 
                 HStack(spacing: 8) {
@@ -544,17 +1043,9 @@ struct ColorModeCard: View {
 
     private var previewBackground: LinearGradient {
         mode == .dark
-            ? LinearGradient(
-                colors: [CinemaTheme.darkBg0, CinemaTheme.darkBg2, CinemaTheme.darkBg4],
-                startPoint: .topLeading, endPoint: .bottomTrailing
-              )
-            : LinearGradient(
-                colors: [CinemaTheme.frostBase, CinemaTheme.frostMid, CinemaTheme.frostDeep],
-                startPoint: .topLeading, endPoint: .bottomTrailing
-              )
+            ? LinearGradient(colors: [CinemaTheme.darkBg0, CinemaTheme.darkBg2, CinemaTheme.darkBg4], startPoint: .topLeading, endPoint: .bottomTrailing)
+            : LinearGradient(colors: [CinemaTheme.frostBase, CinemaTheme.frostMid, CinemaTheme.frostDeep], startPoint: .topLeading, endPoint: .bottomTrailing)
     }
 
-    private var previewAccent: Color {
-        mode == .dark ? CinemaTheme.gold : CinemaTheme.peacock
-    }
+    private var previewAccent: Color { mode == .dark ? CinemaTheme.gold : CinemaTheme.peacock }
 }

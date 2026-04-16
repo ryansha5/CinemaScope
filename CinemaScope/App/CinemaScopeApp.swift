@@ -14,10 +14,22 @@ struct CinemaScopeApp: App {
         WindowGroup {
             ZStack {
                 // ── App content (loads behind the splash) ───────────────────
+                // ignoresSafeArea here lets full-screen views (player, scope shell)
+                // extend into the tvOS overscan region without a 60 px border.
                 if session.isAuthenticated {
-                    HomeView()
-                        .environmentObject(session)
+                    if settings.hasCompletedOnboarding {
+                        HomeView()
+                            .environmentObject(session)
+                            .environmentObject(settings)
+                    } else {
+                        OnboardingView {
+                            withAnimation(.easeInOut(duration: 0.4)) {
+                                settings.hasCompletedOnboarding = true
+                            }
+                        }
                         .environmentObject(settings)
+                        .transition(.opacity)
+                    }
                 } else {
                     AuthFlowView()
                         .environmentObject(session)
@@ -37,6 +49,7 @@ struct CinemaScopeApp: App {
                         }
                 }
             }
+            .ignoresSafeArea()
             .animation(.easeOut(duration: 0.6), value: showSplash)
         }
     }

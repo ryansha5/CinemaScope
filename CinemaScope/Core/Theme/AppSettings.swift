@@ -23,13 +23,58 @@ final class AppSettings: ObservableObject {
         didSet { saveRibbons() }
     }
 
+    // MARK: - Recent Searches
+
+    @Published var recentSearches: [String] {
+        didSet { UserDefaults.standard.set(recentSearches, forKey: "recentSearches") }
+    }
+
+    // MARK: - Playback defaults
+
+    /// Auto-play the next episode after a countdown when an episode finishes.
+    @Published var autoplayNextEpisode: Bool {
+        didSet { UserDefaults.standard.set(autoplayNextEpisode, forKey: "autoplayNextEpisode") }
+    }
+
+    /// Show subtitles by default when a subtitle track is available.
+    @Published var subtitlesEnabled: Bool {
+        didSet { UserDefaults.standard.set(subtitlesEnabled, forKey: "subtitlesEnabled") }
+    }
+
+    /// Preferred audio language code (e.g. "en", "fr"). Empty = server default.
+    @Published var preferredAudioLanguage: String {
+        didSet { UserDefaults.standard.set(preferredAudioLanguage, forKey: "preferredAudioLanguage") }
+    }
+
+    // MARK: - Startup
+
+    /// The tab the app opens on at launch.
+    @Published var startupTab: NavTab {
+        didSet { UserDefaults.standard.set(startupTab.rawValue, forKey: "startupTab") }
+    }
+
+    // MARK: - Onboarding
+
+    /// True once the user has completed or skipped the first-run feature tour.
+    @Published var hasCompletedOnboarding: Bool {
+        didSet { UserDefaults.standard.set(hasCompletedOnboarding, forKey: "hasCompletedOnboarding") }
+    }
+
     // MARK: - Init
 
     private init() {
-        self.scopeUIEnabled = UserDefaults.standard.bool(forKey: "scopeUIEnabled")
-        self.homeRibbons    = Self.loadRibbons()
+        self.scopeUIEnabled  = UserDefaults.standard.bool(forKey: "scopeUIEnabled")
+        self.homeRibbons     = Self.loadRibbons()
+        self.recentSearches  = UserDefaults.standard.stringArray(forKey: "recentSearches") ?? []
         let raw = UserDefaults.standard.string(forKey: "colorMode") ?? ColorMode.dark.rawValue
         self.colorMode = ColorMode(rawValue: raw) ?? .dark
+        // Autoplay defaults to ON — use object(forKey:) to distinguish "not set yet" from false
+        self.autoplayNextEpisode    = UserDefaults.standard.object(forKey: "autoplayNextEpisode") as? Bool ?? true
+        self.subtitlesEnabled       = UserDefaults.standard.bool(forKey: "subtitlesEnabled")
+        self.preferredAudioLanguage = UserDefaults.standard.string(forKey: "preferredAudioLanguage") ?? ""
+        let tabRaw  = UserDefaults.standard.string(forKey: "startupTab") ?? NavTab.home.rawValue
+        self.startupTab = NavTab(rawValue: tabRaw) ?? .home
+        self.hasCompletedOnboarding = UserDefaults.standard.bool(forKey: "hasCompletedOnboarding")
     }
 
     // MARK: - Ribbon helpers
@@ -66,6 +111,20 @@ final class AppSettings: ObservableObject {
 
     func resetToDefaults() {
         homeRibbons = HomeRibbon.defaults
+    }
+
+    // MARK: - Recent Search helpers
+
+    func addRecentSearch(_ query: String) {
+        let trimmed = query.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return }
+        var updated = recentSearches.filter { $0.lowercased() != trimmed.lowercased() }
+        updated.insert(trimmed, at: 0)
+        recentSearches = Array(updated.prefix(8))
+    }
+
+    func clearRecentSearches() {
+        recentSearches = []
     }
 
     // MARK: - Persistence
