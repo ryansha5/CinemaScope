@@ -10,7 +10,7 @@ struct BackButton: View {
     let onTap:     () -> Void
     @FocusState private var isFocused: Bool
 
-    private var radius: CGFloat { scopeMode ? 22 : 28 }
+    private var radius: CGFloat { 10 }
 
     var body: some View {
         Button(action: onTap) {
