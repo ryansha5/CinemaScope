@@ -1,0 +1,60 @@
+// MARK: - PlayerLab / Demux / TrackInfo
+//
+// Metadata snapshot for a single track discovered during container parsing.
+// Populated by MP4Demuxer after parse() completes.
+// Read-only value type — safe to pass between contexts.
+
+import Foundation
+import CoreMedia
+
+struct TrackInfo {
+
+    // MARK: - Track type
+
+    enum TrackType: CustomStringConvertible {
+        case video
+        case audio
+        case other(String)      // raw handler FourCC e.g. "subt", "meta"
+
+        var description: String {
+            switch self {
+            case .video:          return "video"
+            case .audio:          return "audio"
+            case .other(let h):   return "other(\(h))"
+            }
+        }
+    }
+
+    // MARK: - Common fields
+
+    let trackID:        UInt32
+    let trackType:      TrackType
+    let timescale:      UInt32          // ticks per second (from mdhd)
+    let durationTicks:  UInt64          // duration in timescale units
+    let sampleCount:    Int             // total samples in this track
+
+    // MARK: - Video-specific (nil for audio tracks)
+
+    /// FourCC of the sample entry, e.g. "avc1", "hev1", "av01".
+    let codecFourCC:    String?
+
+    /// Display dimensions from the track header (tkhd), integer pixels.
+    let displayWidth:   UInt16?
+    let displayHeight:  UInt16?
+
+    /// Raw payload of the avcC box embedded inside the avc1 sample entry.
+    /// Contains the SPS and PPS NAL units needed to configure VideoToolbox.
+    /// nil for non-H.264 tracks.
+    let avcCData:       Data?
+
+    // MARK: - Derived
+
+    var durationSeconds: Double {
+        guard timescale > 0 else { return 0 }
+        return Double(durationTicks) / Double(timescale)
+    }
+
+    var isH264: Bool {
+        codecFourCC == "avc1" || codecFourCC == "avc3"
+    }
+}

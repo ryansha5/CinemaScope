@@ -1,4 +1,5 @@
 import Foundation
+import CoreMedia
 
 // MARK: - LabLogEntry
 //
@@ -76,6 +77,12 @@ final class PlayerLabHarness {
         } else {
             await runRemoteReadValidation(url: url)
         }
+    }
+
+    /// Full MP4 + H.264 + VideoToolbox pipeline test.
+    /// Pass a local H.264 MP4 file to drive all three sprints at once.
+    func runTest(mp4 url: URL, packetCount: Int = 10) async {
+        await runMP4PipelineTest(url: url, packetCount: packetCount)
     }
 
     // MARK: - Engine state cycle
@@ -302,6 +309,167 @@ final class PlayerLabHarness {
         record(.success, "Remote read validation complete")
     }
 
+    // MARK: - Sprint 7–9: Full pipeline test
+    //
+    // Drives the complete PlayerLab pipeline on a local MP4 file:
+    //   1. Open with MediaReader
+    //   2. Parse MP4 box structure (Sprint 7)
+    //   3. Log track metadata
+    //   4. Extract first N H.264 packets (Sprint 8)
+    //   5. Decode with VideoToolbox, confirm frame callbacks (Sprint 9)
+    //
+    // Use a simple H.264 MP4 — no HEVC, no MKV, no 4K remux.
+    // Call from a debug button or XCTest target.
+
+    func runMP4PipelineTest(url: URL, packetCount: Int = 10) async {
+        record(.info, "══════════════════════════════════════")
+        record(.info, "MP4 Pipeline Test")
+        record(.info, "File: \(url.lastPathComponent)")
+        record(.info, "══════════════════════════════════════")
+
+        // ── Step 1: Open ─────────────────────────────────────────────────────
+
+        record(.info, "[1] Opening MediaReader…")
+        let reader = MediaReader(url: url)
+        do {
+            try await reader.open()
+            record(.success, "Opened — \(formatBytes(reader.contentLength))")
+        } catch {
+            record(.error, "MediaReader.open() failed: \(error.localizedDescription)")
+            return
+        }
+
+        // ── Step 2: Parse MP4 box tree ────────────────────────────────────────
+
+        record(.info, "[2] Parsing MP4 box structure…")
+        let demuxer = MP4Demuxer(reader: reader)
+        do {
+            try await demuxer.parse()
+        } catch {
+            record(.error, "MP4Demuxer.parse() failed: \(error.localizedDescription)")
+            return
+        }
+
+        // ── Step 3: Log track metadata ────────────────────────────────────────
+
+        record(.info, "[3] Track summary — \(demuxer.tracks.count) track(s) found")
+        for track in demuxer.tracks {
+            record(.info, "  Track \(track.trackID): \(track.trackType)  " +
+                   "codec=\(track.codecFourCC ?? "n/a")  " +
+                   "timescale=\(track.timescale)  " +
+                   "samples=\(track.sampleCount)  " +
+                   "duration=\(String(format: "%.2f", track.durationSeconds))s")
+            if let w = track.displayWidth, let h = track.displayHeight {
+                record(.info, "    Display: \(w)×\(h)")
+            }
+            if let avcC = track.avcCData {
+                record(.info, "    avcC: \(avcC.count) bytes (SPS+PPS present)")
+                logAvcCSummary(avcC)
+            }
+        }
+
+        guard let vt = demuxer.videoTrack else {
+            record(.error, "No video track found in \(url.lastPathComponent)")
+            return
+        }
+        guard vt.isH264 else {
+            record(.warning, "Video track codec is '\(vt.codecFourCC ?? "?")' — H.264 required for Sprint 9 decode test")
+            return
+        }
+        guard let avcCData = vt.avcCData else {
+            record(.error, "H.264 video track has no avcC box — cannot configure decoder")
+            return
+        }
+
+        record(.success, "Video track ready: H.264  \(vt.sampleCount) samples  " +
+               "\(vt.displayWidth ?? 0)×\(vt.displayHeight ?? 0)")
+
+        // ── Step 4: Extract first N packets ──────────────────────────────────
+
+        record(.info, "[4] Extracting first \(packetCount) H.264 packets…")
+        let packets: [DemuxPacket]
+        do {
+            packets = try await demuxer.extractPackets(count: packetCount)
+        } catch {
+            record(.error, "extractPackets failed: \(error.localizedDescription)")
+            return
+        }
+
+        record(.success, "Extracted \(packets.count) packet(s)")
+        logPacketTable(packets)
+
+        // ── Step 5: VideoToolbox decode proof ─────────────────────────────────
+
+        record(.info, "[5] Configuring H264Decoder…")
+        let decoder = H264Decoder()
+        do {
+            try decoder.configure(avcCData: avcCData)
+            record(.success, "Decoder configured — nalUnitLength=\(avcCData.count > 4 ? Int(avcCData[4] & 0x03) + 1 : 4) byte(s)")
+        } catch {
+            record(.error, "configure(avcCData:) failed: \(error.localizedDescription)")
+            return
+        }
+
+        record(.info, "[5] Submitting \(packets.count) packet(s) to VideoToolbox…")
+        var submitErrors = 0
+        for pkt in packets {
+            do {
+                try decoder.decode(packet: pkt)
+            } catch {
+                submitErrors += 1
+                record(.warning, "  decode(packet:\(pkt.index)) error: \(error.localizedDescription)")
+            }
+        }
+
+        // Wait for all async callbacks to fire
+        decoder.waitForAll()
+
+        // ── Results ───────────────────────────────────────────────────────────
+
+        let decoded = decoder.decodedFrameCount
+        let errors  = decoder.decodeErrors
+        let dims    = decoder.lastFrameSize
+
+        record(.info, "──────────────────────────────────────")
+        record(decoded > 0 ? .success : .error,
+               "Decoded frames: \(decoded) / \(packets.count)  " +
+               "(decode errors: \(errors),  submit errors: \(submitErrors))")
+        if decoded > 0 {
+            record(.success, "Frame dimensions: \(Int(dims.width))×\(Int(dims.height))")
+            record(.success, "🎉 Sprint 9 milestone: VideoToolbox is producing decoded frames")
+        } else {
+            record(.error, "No frames decoded — check avcC or packet data")
+        }
+        record(.info, "══════════════════════════════════════")
+    }
+
+    // MARK: - Pipeline logging helpers
+
+    private func logAvcCSummary(_ data: Data) {
+        guard data.count >= 7 else { return }
+        let profile    = data[1]
+        let level      = data[3]
+        let nalLen     = Int(data[4] & 0x03) + 1
+        let numSPS     = Int(data[5] & 0x1F)
+        record(.data, "    avcC: profile=\(profile) level=\(level) NAL-len=\(nalLen) SPS-count=\(numSPS)")
+    }
+
+    private func logPacketTable(_ packets: [DemuxPacket]) {
+        let header = String(format: "  %-5s  %-8s  %-10s  %-10s  %-7s  %s",
+                            "idx", "bytes", "pts(s)", "dts(s)", "key", "offset")
+        record(.data, header)
+        for pkt in packets.prefix(10) {
+            let pts = pkt.pts.seconds.isNaN ? 0 : pkt.pts.seconds
+            let dts = pkt.dts.seconds.isNaN ? 0 : pkt.dts.seconds
+            let row = String(format: "  %-5d  %-8d  %-10.4f  %-10.4f  %-7s  %lld",
+                             pkt.index, pkt.data.count,
+                             pts, dts,
+                             pkt.isKeyframe ? "KEY" : "-",
+                             pkt.byteOffset)
+            record(.data, row)
+        }
+    }
+
     // MARK: - Log API
 
     func record(_ level: LabLogEntry.Level, _ message: String) {
@@ -360,18 +528,22 @@ final class PlayerLabHarness {
  Option A — Debug button in SettingsView (no extra target needed)
  ─────────────────────────────────────────────────────────────────
    #if DEBUG
+   // IO-only test (Sprints 4-6)
    Button("Run PlayerLab IO Test") {
        Task { @MainActor in
            let h = PlayerLabHarness()
-
-           // Local file:
            let local = URL(fileURLWithPath: "/path/to/test.mkv")
            await h.runTest(url: local)
+           print(h.formattedLog)
+       }
+   }
 
-           // Remote URL:
-           // let remote = URL(string: "https://example.com/sample.mp4")!
-           // await h.runTest(url: remote)
-
+   // Full pipeline test (Sprints 7-9) — use a simple H.264 MP4
+   Button("Run MP4 Pipeline Test") {
+       Task { @MainActor in
+           let h = PlayerLabHarness()
+           let mp4 = URL(fileURLWithPath: "/path/to/sample.mp4")
+           await h.runTest(mp4: mp4, packetCount: 10)
            print(h.formattedLog)
        }
    }

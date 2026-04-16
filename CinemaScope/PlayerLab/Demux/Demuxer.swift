@@ -1,10 +1,9 @@
-// MARK: - PlayerLab / Demux
+// MARK: - PlayerLab / Demux / Demuxer
 //
-// Responsible for container parsing and stream extraction:
-//   • Identify container format (MKV / MP4 / TS / …)
-//   • Extract elementary streams (video, audio, subtitle tracks)
-//   • Deliver time-stamped packets to the decode layer
+// Container parsing and elementary stream extraction.
 //
-// TODO: Sprint Demux-1 — define Demuxer protocol + PacketBuffer type
-// TODO: Sprint Demux-2 — MKV/EBML parser (no AudioToolbox / VideoToolbox yet)
-// TODO: Sprint Demux-3 — MP4/ISOBMFF parser
+// Concrete implementations:
+//   • MP4Demuxer  (Sprint 7-8)  — PlayerLab/Demux/MP4/MP4Demuxer.swift
+//
+// TODO: MKV/EBML demuxer
+// TODO: MPEG-TS demuxer

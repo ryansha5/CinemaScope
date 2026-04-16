@@ -1,9 +1,9 @@
-// MARK: - PlayerLab / Decode
+// MARK: - PlayerLab / Decode / VideoDecoder
 //
-// Responsible for turning compressed packets into decoded frames:
-//   • Video decode (H.264, H.265/HEVC, AV1 — via VideoToolbox when available)
-//   • Subtitle decode / rendering (SRT, ASS/SSA — software)
+// Compressed packet → decoded CVPixelBuffer.
 //
-// TODO: Sprint Decode-1 — define VideoDecoder protocol + DecodedFrame type
-// TODO: Sprint Decode-2 — VideoToolbox-backed H.264 / HEVC decoder
-// TODO: Sprint Decode-3 — software fallback decoder interface
+// Concrete implementations:
+//   • H264Decoder  (Sprint 9)  — PlayerLab/Decode/H264Decoder.swift
+//
+// TODO: HEVC decoder (VideoToolbox)
+// TODO: Software fallback decoder interface
