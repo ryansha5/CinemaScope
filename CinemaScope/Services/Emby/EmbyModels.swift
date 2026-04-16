@@ -162,9 +162,11 @@ struct ImageTags: Codable, Equatable {
 struct UserData: Codable, Equatable {
     let playbackPositionTicks: Int64?
     let played:                Bool?
+    let isFavorite:            Bool?
     enum CodingKeys: String, CodingKey {
         case playbackPositionTicks = "PlaybackPositionTicks"
         case played                = "Played"
+        case isFavorite            = "IsFavorite"
     }
 }
 
@@ -230,6 +232,22 @@ struct EmbyItemsResponse: Codable {
     enum CodingKeys: String, CodingKey {
         case items            = "Items"
         case totalRecordCount = "TotalRecordCount"
+    }
+}
+
+// MARK: - System Info (Diagnostics)
+
+struct EmbySystemInfo: Codable {
+    let serverName:      String?
+    let version:         String?
+    let operatingSystem: String?
+    let id:              String?
+
+    enum CodingKeys: String, CodingKey {
+        case serverName      = "ServerName"
+        case version         = "Version"
+        case operatingSystem = "OperatingSystem"
+        case id              = "Id"
     }
 }
 

@@ -104,13 +104,9 @@ final class EmbyLibraryStore: ObservableObject {
         do {
             switch ribbon.type {
             case .continueWatching:
-                // Emby's /Items/Resume already filters to in-progress items, but
-                // apply a client-side guard too: drop items where PlaybackCTA
-                // resolves to .play (negligible progress OR effectively finished).
-                // This catches the 97%-complete edge case where Emby hasn't yet
-                // marked the item as played.
-                let raw = try await EmbyAPI.fetchContinueWatching(server: server, userId: userId, token: token, limit: 25)
-                return raw.filter { PlaybackCTA.shouldShowInContinueWatching($0) }
+                return try await EmbyAPI.fetchContinueWatching(server: server, userId: userId, token: token, limit: 25)
+            case .nextUp:
+                return try await EmbyAPI.fetchNextUp(server: server, userId: userId, token: token)
             case .recentMovies:
                 guard let id = movieLibraryId else { return [] }
                 return try await EmbyAPI.fetchRecentlyAdded(server: server, userId: userId, token: token, parentId: id, limit: 25)
@@ -129,6 +125,8 @@ final class EmbyLibraryStore: ObservableObject {
             case .playlists:
                 guard let id = playlistLibraryId else { return [] }
                 return try await EmbyAPI.fetchItems(server: server, userId: userId, token: token, parentId: id, limit: 25).items
+            case .favorites:
+                return try await EmbyAPI.fetchFavorites(server: server, userId: userId, token: token)
             case .genre(let name, let itemType):
                 return try await EmbyAPI.fetchByGenre(server: server, userId: userId, token: token, genre: name, itemType: itemType, limit: 25)
             case .recommended:
@@ -141,6 +139,65 @@ final class EmbyLibraryStore: ObservableObject {
         }
     }
 
+    // MARK: - Favorites toggle
+
+    func toggleFavorite(
+        item: EmbyItem, server: EmbyServer, userId: String, token: String
+    ) async {
+        let newState = !(item.userData?.isFavorite ?? false)
+        // Optimistic local update — feels instant on the couch
+        patchFavorite(itemId: item.id, isFavorite: newState)
+
+        do {
+            let updatedData = try await EmbyAPI.toggleFavorite(
+                server: server, userId: userId, token: token,
+                itemId: item.id, isFavorite: newState
+            )
+            // Reconcile with what the server actually returned
+            patchUserData(itemId: item.id, newData: updatedData)
+
+            // Refresh the favorites ribbon so the row stays in sync
+            let favRibbon = HomeRibbon(type: .favorites)
+            await reloadRibbon(favRibbon, server: server, userId: userId, token: token)
+        } catch {
+            // Roll back on failure
+            patchFavorite(itemId: item.id, isFavorite: !newState)
+            print("[Store] toggleFavorite failed: \(error)")
+        }
+    }
+
+    private func patchFavorite(itemId: String, isFavorite: Bool) {
+        func patch(_ items: inout [EmbyItem]) {
+            if let idx = items.firstIndex(where: { $0.id == itemId }) {
+                let old = items[idx].userData
+                let patched = UserData(
+                    playbackPositionTicks: old?.playbackPositionTicks,
+                    played: old?.played,
+                    isFavorite: isFavorite
+                )
+                items[idx] = items[idx].withUserData(patched)
+            }
+        }
+        patch(&movieItems)
+        patch(&showItems)
+        for key in ribbonItems.keys {
+            if var arr = ribbonItems[key] { patch(&arr); ribbonItems[key] = arr }
+        }
+    }
+
+    private func patchUserData(itemId: String, newData: UserData) {
+        func patch(_ items: inout [EmbyItem]) {
+            if let idx = items.firstIndex(where: { $0.id == itemId }) {
+                items[idx] = items[idx].withUserData(newData)
+            }
+        }
+        patch(&movieItems)
+        patch(&showItems)
+        for key in ribbonItems.keys {
+            if var arr = ribbonItems[key] { patch(&arr); ribbonItems[key] = arr }
+        }
+    }
+
     // MARK: - Local userData patch
     //
     // After playback stops, immediately update the stored position so that
@@ -149,9 +206,14 @@ final class EmbyLibraryStore: ObservableObject {
     // via EmbyAPI.reportPlaybackStop; this is purely a local UI update.
 
     func updatePlaybackPosition(itemId: String, positionTicks: Int64) {
+        // Preserve isFavorite when patching playback position
+        let existing = ribbonItems.values.flatMap { $0 }.first(where: { $0.id == itemId })
+            ?? movieItems.first(where: { $0.id == itemId })
+            ?? showItems.first(where: { $0.id == itemId })
         let patchedData = UserData(
             playbackPositionTicks: positionTicks > 0 ? positionTicks : nil,
-            played: false
+            played: false,
+            isFavorite: existing?.userData?.isFavorite
         )
 
         func patch(_ items: inout [EmbyItem]) {
