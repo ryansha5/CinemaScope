@@ -2,12 +2,26 @@ import SwiftUI
 
 struct SectionGridView: View {
 
-    let title:    String
-    let items:    [EmbyItem]
-    let session:  EmbySession
-    let onSelect: (EmbyItem) -> Void
+    let title:     String
+    let items:     [EmbyItem]
+    let isLoading: Bool
+    let session:   EmbySession
+    let onSelect:  (EmbyItem) -> Void
 
     @EnvironmentObject var settings: AppSettings
+    @State private var sortOrder: SearchSort = .az
+
+    // Grid sort options — relevance doesn't apply outside search
+    private let sortOptions: [SearchSort] = [.az, .year, .rating, .random]
+
+    private var sortedItems: [EmbyItem] {
+        switch sortOrder {
+        case .relevance, .az: return items.sorted { $0.name.localizedCompare($1.name) == .orderedAscending }
+        case .year:           return items.sorted { ($0.productionYear ?? 0) > ($1.productionYear ?? 0) }
+        case .rating:         return items.sorted { ($0.communityRating ?? 0) > ($1.communityRating ?? 0) }
+        case .random:         return items.shuffled()
+        }
+    }
 
     var columns: [GridItem] {
         let count:   Int     = settings.scopeUIEnabled ? 10 : 5
@@ -16,19 +30,37 @@ struct SectionGridView: View {
     }
 
     var body: some View {
-        // No canvas management here — the parent shell already
-        // constrains this view to the correct region.
-        // Just render content with the right background.
         ZStack {
             if settings.scopeUIEnabled {
-                // Already inside the peacock canvas frame from HomeView.
-                // Use clear so the parent gradient shows through.
                 Color.clear
             } else {
                 CinemaBackground()
             }
 
-            if items.isEmpty {
+            if isLoading {
+                // Show skeleton grid while library loads
+                ScrollView(.vertical, showsIndicators: false) {
+                    VStack(alignment: .leading, spacing: settings.scopeUIEnabled ? 16 : 24) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            SkeletonBox(width: 200, height: settings.scopeUIEnabled ? 24 : 34, cornerRadius: 6, colorMode: settings.colorMode)
+                                .padding(.top, settings.scopeUIEnabled ? 24 : 60)
+                            SkeletonBox(width: 300, height: settings.scopeUIEnabled ? 20 : 26, cornerRadius: 5, colorMode: settings.colorMode)
+                        }
+
+                        LazyVGrid(columns: columns, spacing: settings.scopeUIEnabled ? 10 : 28) {
+                            ForEach(0..<(settings.scopeUIEnabled ? 30 : 15), id: \.self) { _ in
+                                SkeletonGridCard(scopeMode: settings.scopeUIEnabled,
+                                                colorMode: settings.colorMode)
+                            }
+                        }
+                        .padding(.bottom, 40)
+                    }
+                    .padding(.horizontal, settings.scopeUIEnabled ? 20 : CinemaTheme.pagePadding)
+                    .padding(.vertical, 12)
+                }
+                .clipped(antialiased: false)
+                .allowsHitTesting(false)
+            } else if items.isEmpty {
                 VStack(spacing: 20) {
                     Image(systemName: "rectangle.stack")
                         .font(.system(size: 64))
@@ -39,17 +71,56 @@ struct SectionGridView: View {
                 }
             } else {
                 ScrollView(.vertical, showsIndicators: false) {
-                    VStack(alignment: .leading, spacing: settings.scopeUIEnabled ? 20 : 32) {
-                        Text(title)
-                            .font(settings.scopeUIEnabled
-                                  ? .system(size: 28, weight: .bold)
-                                  : CinemaTheme.titleFont)
-                            .foregroundStyle(CinemaTheme.primary(settings.colorMode))
-                            .padding(.top, settings.scopeUIEnabled ? 24 : 60)
+                    VStack(alignment: .leading, spacing: settings.scopeUIEnabled ? 16 : 24) {
+
+                        // Title + sort bar
+                        VStack(alignment: .leading, spacing: settings.scopeUIEnabled ? 10 : 16) {
+                            Text(title)
+                                .font(settings.scopeUIEnabled
+                                      ? .system(size: 28, weight: .bold)
+                                      : CinemaTheme.titleFont)
+                                .foregroundStyle(CinemaTheme.primary(settings.colorMode))
+                                .padding(.top, settings.scopeUIEnabled ? 24 : 60)
+
+                            // Sort bar
+                            HStack(spacing: 0) {
+                                ScrollView(.horizontal, showsIndicators: false) {
+                                    HStack(spacing: 6) {
+                                        ForEach(sortOptions, id: \.rawValue) { s in
+                                            SearchPill(
+                                                label:     s.displayName,
+                                                icon:      s.icon,
+                                                isActive:  sortOrder == s,
+                                                colorMode: settings.colorMode,
+                                                scopeMode: settings.scopeUIEnabled,
+                                                small:     true
+                                            ) {
+                                                if sortOrder == s && s == .random {
+                                                    // Re-shuffle on repeat tap
+                                                    sortOrder = .relevance // force re-evaluation
+                                                    sortOrder = .random
+                                                } else {
+                                                    sortOrder = s
+                                                }
+                                            }
+                                        }
+                                    }
+                                    .padding(.vertical, 2)
+                                }
+                                .scrollClipDisabled()
+
+                                Spacer()
+
+                                Text("\(items.count) title\(items.count == 1 ? "" : "s")")
+                                    .font(.system(size: settings.scopeUIEnabled ? 11 : 13))
+                                    .foregroundStyle(CinemaTheme.tertiary(settings.colorMode))
+                                    .padding(.leading, 12)
+                            }
+                        }
 
                         LazyVGrid(columns: columns,
                                   spacing: settings.scopeUIEnabled ? 10 : 28) {
-                            ForEach(items) { item in
+                            ForEach(sortedItems) { item in
                                 GridCard(
                                     item:      item,
                                     session:   session,
@@ -95,7 +166,7 @@ struct GridCard: View {
             VStack(alignment: .leading, spacing: scopeMode ? 6 : 10) {
                 ZStack {
                     if let url = posterURL {
-                        AsyncImage(url: url) { image in
+                        CachedAsyncImage(url: url) { image in
                             image.resizable().scaledToFill()
                         } placeholder: {
                             placeholderIcon
@@ -143,6 +214,12 @@ struct GridCard: View {
         }
         .focusRingFree()
         .focused($isFocused)
+        .accessibilityLabel({
+            var parts = [item.name]
+            if let year = item.productionYear { parts.append(String(year)) }
+            return parts.joined(separator: ", ")
+        }())
+        .accessibilityHint("Activate to view details")
     }
 
     private var placeholderIcon: some View {

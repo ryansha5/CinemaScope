@@ -138,15 +138,10 @@ private struct RecommendationCard: View {
         let w = Int(cardWidth * 2)   // 2× for sharp rendering on 4K TVs
 
         if let url = backdropURL(width: w) {
-            AsyncImage(url: url) { phase in
-                switch phase {
-                case .success(let img):
-                    img.resizable().aspectRatio(contentMode: .fill)
-                case .failure:
-                    placeholderView
-                default:
-                    placeholderView
-                }
+            CachedAsyncImage(url: url) { img in
+                img.resizable().aspectRatio(contentMode: .fill)
+            } placeholder: {
+                placeholderView
             }
         } else {
             placeholderView
@@ -173,13 +168,14 @@ private struct RecommendationCard: View {
     }
 
     private var placeholderView: some View {
-        ZStack {
+        let rec = item.recommendation
+        return ZStack {
             Color(red: 0.08, green: 0.12, blue: 0.20)
             VStack(spacing: 8) {
-                Image(systemName: "film")
+                Image(systemName: rec.type == "Series" ? "tv" : "film")
                     .font(.system(size: 36))
                     .foregroundStyle(CinemaTheme.accentGold.opacity(0.4))
-                Text(item.recommendation.name)
+                Text(rec.name)
                     .font(.system(size: 14, weight: .medium))
                     .foregroundStyle(.white.opacity(0.5))
                     .multilineTextAlignment(.center)
