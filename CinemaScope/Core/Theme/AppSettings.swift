@@ -60,6 +60,20 @@ final class AppSettings: ObservableObject {
         didSet { UserDefaults.standard.set(hasCompletedOnboarding, forKey: "hasCompletedOnboarding") }
     }
 
+    // MARK: - PlayerLab  (Sprint 15)
+
+    /// When true the PlayerLab custom playback engine is enabled.
+    /// Compatible local MP4 files (H.264/HEVC + AAC) can be played through
+    /// PlayerLab instead of AVPlayer.  Default: false.
+    @Published var playerLabEnabled: Bool {
+        didSet { UserDefaults.standard.set(playerLabEnabled, forKey: "playerLabEnabled") }
+    }
+
+    /// Last file path the user tested in PlayerLab — persisted across sessions.
+    @Published var playerLabLastPath: String {
+        didSet { UserDefaults.standard.set(playerLabLastPath, forKey: "playerLabLastPath") }
+    }
+
     // MARK: - Init
 
     private init() {
@@ -75,6 +89,8 @@ final class AppSettings: ObservableObject {
         let tabRaw  = UserDefaults.standard.string(forKey: "startupTab") ?? NavTab.home.rawValue
         self.startupTab = NavTab(rawValue: tabRaw) ?? .home
         self.hasCompletedOnboarding = UserDefaults.standard.bool(forKey: "hasCompletedOnboarding")
+        self.playerLabEnabled       = UserDefaults.standard.bool(forKey: "playerLabEnabled")
+        self.playerLabLastPath      = UserDefaults.standard.string(forKey: "playerLabLastPath") ?? ""
     }
 
     // MARK: - Ribbon helpers

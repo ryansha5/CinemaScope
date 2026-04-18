@@ -52,6 +52,19 @@ struct TrackInfo {
     /// nil for non-HEVC tracks.
     let hvcCData:       Data?
 
+    // MARK: - Audio-specific (nil for video tracks)  — Sprint 13
+
+    /// Raw payload of the esds box inside the mp4a sample entry.
+    /// Contains the ES_Descriptor, whose DecoderSpecificInfo payload is the
+    /// AudioSpecificConfig (the "magic cookie" for CMAudioFormatDescriptionCreate).
+    let esdsData:        Data?
+
+    /// Channel count from the mp4a AudioSampleEntry.
+    let channelCount:    UInt16?
+
+    /// Sample rate (Hz) from the mp4a AudioSampleEntry (fixed-point 16.16 → Double).
+    let audioSampleRate: Double?
+
     // MARK: - Derived
 
     var durationSeconds: Double {
@@ -67,4 +80,7 @@ struct TrackInfo {
     var isHEVC: Bool {
         codecFourCC == "hvc1" || codecFourCC == "hev1"
     }
+
+    /// Sprint 13: AAC audio.
+    var isAAC: Bool { codecFourCC == "mp4a" }
 }

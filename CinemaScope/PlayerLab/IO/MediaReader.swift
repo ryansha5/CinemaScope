@@ -73,6 +73,10 @@ final class MediaReader {
         return URLSession(configuration: config)
     }()
 
+    /// Persistent file handle for local files.
+    /// Kept open for the lifetime of the reader to avoid per-read open/close overhead.
+    private var localFileHandle: FileHandle? = nil
+
     // MARK: - Simple read-ahead buffer
     //
     // Caches the last read result.  When the next request falls within the
@@ -120,13 +124,17 @@ final class MediaReader {
 
     private func openLocalFile() throws {
         do {
+            // Open a persistent FileHandle so every read() call reuses it
+            // rather than paying the open/close cost on every byte-range request.
+            let fh = try FileHandle(forReadingFrom: url)
+            localFileHandle = fh
+
             let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
             if let size = attrs[.size] as? Int64 {
                 contentLength      = size
                 supportsByteRanges = true
                 log(.info, "Local file size: \(formatBytes(size))")
             } else if let size = attrs[.size] as? Int {
-                // FileManager returns Int on some platforms
                 contentLength      = Int64(size)
                 supportsByteRanges = true
                 log(.info, "Local file size: \(formatBytes(contentLength))")
@@ -188,6 +196,9 @@ final class MediaReader {
     // Returns up to `length` bytes starting at `offset` (may be fewer at EOF).
     // Validates range against contentLength when known.
     // Checks the single-slot read cache before hitting disk/network.
+    //
+    // Per-read logging is intentionally suppressed to avoid flooding stderr when
+    // thousands of small sample reads are issued during packet extraction.
 
     func read(offset: Int64, length: Int) async throws -> Data {
         guard isOpen else { throw MediaReaderError.notOpened }
@@ -206,11 +217,8 @@ final class MediaReader {
 
         // Cache hit?
         if let cached = readCache?.slice(offset: offset, length: clampedLength) {
-            log(.data, "read(offset: \(offset), length: \(clampedLength)) → cache hit, \(cached.count) bytes")
             return cached
         }
-
-        log(.info, "read(offset: \(offset), length: \(clampedLength)) — fetching")
 
         let data: Data
         if url.isFileURL {
@@ -219,10 +227,8 @@ final class MediaReader {
             data = try await readRemoteRange(offset: offset, length: clampedLength)
         }
 
-        log(.data, "read() → \(data.count) bytes received (requested \(clampedLength))")
-
         if data.count != clampedLength {
-            log(.warning, "Short read: expected \(clampedLength), got \(data.count) — likely at EOF")
+            log(.warning, "Short read at offset \(offset): expected \(clampedLength), got \(data.count) — likely at EOF")
         }
 
         // Populate cache
@@ -231,16 +237,24 @@ final class MediaReader {
         return data
     }
 
-    // MARK: - Local byte-range read (FileHandle)
+    // MARK: - Local byte-range read (persistent FileHandle)
     //
-    // Opens a new FileHandle per call — simple and safe for random access.
-    // Avoids loading the full file into memory.
+    // Uses the FileHandle opened in openLocalFile() — avoids the
+    // open/seek/close overhead on every individual sample read.
 
     private func readLocalRange(offset: Int64, length: Int) throws -> Data {
+        guard let fh = localFileHandle else {
+            // Shouldn't happen after open(), but fall back gracefully.
+            let fh2 = try FileHandle(forReadingFrom: url)
+            defer { try? fh2.close() }
+            if #available(tvOS 13.4, iOS 13.4, macOS 10.15.4, *) {
+                try fh2.seek(toOffset: UInt64(offset))
+            } else {
+                fh2.seek(toFileOffset: UInt64(offset))
+            }
+            return fh2.readData(ofLength: length)
+        }
         do {
-            let fh = try FileHandle(forReadingFrom: url)
-            defer { try? fh.close() }
-
             if #available(tvOS 13.4, iOS 13.4, macOS 10.15.4, *) {
                 try fh.seek(toOffset: UInt64(offset))
                 return fh.readData(ofLength: length)
@@ -249,7 +263,7 @@ final class MediaReader {
                 return fh.readData(ofLength: length)
             }
         } catch {
-            log(.error, "FileHandle read failed: \(error)")
+            log(.error, "FileHandle read failed at offset \(offset): \(error)")
             throw MediaReaderError.readFailed(underlying: error)
         }
     }

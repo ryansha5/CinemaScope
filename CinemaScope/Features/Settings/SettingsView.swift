@@ -289,7 +289,11 @@ struct SettingsView: View {
     // MARK: - PlayerLab panel
 
     private var playerLabPanel: some View {
-        PlayerLabPanel(colorMode: settings.colorMode)
+        PlayerLabPanel(
+            colorMode:        settings.colorMode,
+            isEnabled:        $settings.playerLabEnabled,
+            persistedPath:    $settings.playerLabLastPath
+        )
     }
 
     // MARK: - Shared panel helpers
@@ -719,13 +723,15 @@ private struct DiagnosticsPanel: View {
 // MARK: - PlayerLabPanel
 
 private struct PlayerLabPanel: View {
-    let colorMode: ColorMode
+    let colorMode:     ColorMode
+    @Binding var isEnabled:     Bool     // Sprint 15: AppSettings.playerLabEnabled
+    @Binding var persistedPath: String   // Sprint 15: AppSettings.playerLabLastPath
 
-    @State private var labFilePath:  String = ""
-    @State private var labIsRunning: Bool   = false
-    @State private var labLog:       String = ""
-    @State private var labSuccess:   Bool?  = nil
-    @State private var labShowPlayer: Bool  = false
+    @State private var labFilePath:   String = ""
+    @State private var labIsRunning:  Bool   = false
+    @State private var labLog:        String = ""
+    @State private var labSuccess:    Bool?  = nil
+    @State private var labShowPlayer: Bool   = false
 
     var body: some View {
         ScrollView(.vertical, showsIndicators: false) {
@@ -736,12 +742,25 @@ private struct PlayerLabPanel: View {
                     Text("PlayerLab")
                         .font(.system(size: 36, weight: .bold))
                         .foregroundStyle(CinemaTheme.primary(colorMode))
-                    Text("Test the custom MP4 / H.264 / VideoToolbox pipeline.")
+                    Text("Custom MP4 playback engine — H.264/HEVC + AAC, timed presentation, seek.")
                         .font(.system(size: 18))
                         .foregroundStyle(CinemaTheme.secondary(colorMode))
                 }
 
                 Divider().background(CinemaTheme.peacockLight.opacity(0.2)).padding(.vertical, 4)
+
+                // Sprint 15: Enable toggle
+                settingsRow(
+                    icon: "flask.fill",
+                    title: "Enable PlayerLab",
+                    subtitle: isEnabled
+                        ? "PlayerLab is active — local MP4 files play through the custom engine"
+                        : "Disabled — all playback uses the standard AVPlayer path"
+                ) {
+                    Toggle("", isOn: $isEnabled)
+                        .labelsHidden()
+                        .tint(CinemaTheme.accentGold)
+                }
 
                 // Path input card
                 VStack(alignment: .leading, spacing: 0) {
@@ -754,7 +773,7 @@ private struct PlayerLabPanel: View {
                             Text("MP4 File Path")
                                 .font(.system(size: 18, weight: .semibold))
                                 .foregroundStyle(CinemaTheme.primary(colorMode))
-                            Text("Local H.264 MP4 file. On the simulator, any path on your Mac works.")
+                            Text("Local H.264 or HEVC MP4. Path persists across sessions.")
                                 .font(.system(size: 14))
                                 .foregroundStyle(CinemaTheme.tertiary(colorMode))
                         }
@@ -766,6 +785,9 @@ private struct PlayerLabPanel: View {
                             .autocorrectionDisabled()
                             .textInputAutocapitalization(.never)
                             .frame(width: 380)
+                            .onChange(of: labFilePath) { newPath in
+                                persistedPath = newPath   // persist to AppSettings
+                            }
                     }
                     .padding(.horizontal, 24).padding(.vertical, 20)
                 }
@@ -787,11 +809,11 @@ private struct PlayerLabPanel: View {
                     }
                     .disabled(labIsRunning || labFilePath.trimmingCharacters(in: .whitespaces).isEmpty)
 
-                    // Sprint 10: open the debug video player
+                    // Watch Video — opens PlayerLabPlayerView (Sprints 10–14)
                     SettingsButton(
                         icon:      "tv.fill",
                         label:     "Watch Video",
-                        style:     .ghost,
+                        style:     isEnabled ? .accent : .ghost,
                         colorMode: colorMode
                     ) {
                         labShowPlayer = true
@@ -807,9 +829,14 @@ private struct PlayerLabPanel: View {
                 }
                 .fullScreenCover(isPresented: $labShowPlayer) {
                     PlayerLabPlayerView(
-                        url:         URL(fileURLWithPath: labFilePath.trimmingCharacters(in: .whitespaces)),
-                        packetCount: 300
+                        url: URL(fileURLWithPath: labFilePath.trimmingCharacters(in: .whitespaces))
                     )
+                }
+                .onAppear {
+                    // Restore last used path from AppSettings
+                    if labFilePath.isEmpty && !persistedPath.isEmpty {
+                        labFilePath = persistedPath
+                    }
                 }
 
                 // Result status
@@ -880,6 +907,43 @@ private struct PlayerLabPanel: View {
         labLog     = harness.formattedLog
         labSuccess = harness.log.contains { $0.message.contains("Sprint 9 milestone") }
         labIsRunning = false
+    }
+
+    // Row helper — icon + title + subtitle + arbitrary trailing control
+    @ViewBuilder
+    private func settingsRow<Trailing: View>(
+        icon:     String,
+        title:    String,
+        subtitle: String,
+        @ViewBuilder trailing: () -> Trailing
+    ) -> some View {
+        HStack(spacing: 20) {
+            Image(systemName: icon)
+                .font(.system(size: 22))
+                .foregroundStyle(CinemaTheme.accentGold)
+                .frame(width: 32)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title)
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(CinemaTheme.primary(colorMode))
+                Text(subtitle)
+                    .font(.system(size: 14))
+                    .foregroundStyle(CinemaTheme.tertiary(colorMode))
+                    .lineLimit(2)
+                    .frame(maxWidth: 560, alignment: .leading)
+            }
+
+            Spacer()
+
+            trailing()
+        }
+        .padding(.horizontal, 20).padding(.vertical, 16)
+        .background(CinemaTheme.peacockDeep.opacity(0.4), in: RoundedRectangle(cornerRadius: 12))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(CinemaTheme.peacockLight.opacity(0.15), lineWidth: 1)
+        }
     }
 }
 

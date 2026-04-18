@@ -42,4 +42,8 @@ struct DemuxPacket {
 
     /// File byte offset of this sample's first byte.
     let byteOffset:  Int64
+
+    /// Per-sample duration (used for audio CMSampleBuffers).
+    /// .invalid for video (AVSBDL infers duration from consecutive PTS values).
+    let duration:    CMTime
 }

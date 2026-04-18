@@ -58,6 +58,8 @@ final class MP4Demuxer {
 
     private(set) var tracks:     [TrackInfo] = []
     private(set) var videoTrack: TrackInfo?  = nil
+    /// Sprint 13: first audio track (soun handler, mp4a codec).
+    private(set) var audioTrack: TrackInfo?  = nil
 
     // MARK: - IO
 
@@ -75,6 +77,11 @@ final class MP4Demuxer {
     private var accDisplayHeight:  UInt16? = nil
     private var accAvcCData:       Data?   = nil
     private var accHvcCData:       Data?   = nil    // Sprint 12: HEVC parameter sets
+
+    // Sprint 13: audio-specific accumulator fields
+    private var accEsdsData:        Data?   = nil   // esds box payload (ES_Descriptor)
+    private var accChannelCount:    UInt16? = nil   // mp4a channelcount
+    private var accAudioSampleRate: Double? = nil   // mp4a samplerate (Hz)
 
     // Sample table accumulator
     private var accSttsEntries:     [(count: Int, delta: Int)] = []
@@ -102,6 +109,16 @@ final class MP4Demuxer {
     private var vtHasStss:         Bool      = false
     private var vtTimescale:       UInt32    = 0
 
+    // MARK: - Audio-track sample tables (snapshotted after finalizeTrack)  — Sprint 13
+
+    private var atSttsEntries:     [(count: Int, delta: Int)] = []
+    private var atStscEntries:     [(firstChunk: Int, samplesPerChunk: Int)] = []
+    private var atSampleSizes:     [Int]     = []
+    private var atFixedSampleSize: Int       = 0
+    private var atChunkOffsets:    [Int64]   = []
+    private var atTimescale:       UInt32    = 0
+    private var atSampleCount:     Int       = 0
+
     // MARK: - Parser state flags
 
     private var insideTrak: Bool = false
@@ -120,8 +137,10 @@ final class MP4Demuxer {
         guard reader.contentLength > 0 else { throw MP4DemuxError.readerNotOpened }
         tracks     = []
         videoTrack = nil
+        audioTrack = nil
         try await parseBoxes(at: 0, length: reader.contentLength, depth: 0)
         videoTrack = tracks.first { if case .video = $0.trackType { return true }; return false }
+        audioTrack = tracks.first { if case .audio = $0.trackType { return true }; return false }
     }
 
     // MARK: - Box Tree Walker
@@ -316,6 +335,26 @@ final class MP4Demuxer {
             // Both codecs share the same VisualSampleEntry base layout (86-byte
             // fixed header visible from the stsd entry, child boxes at offset 94).
             accHvcCData = findChildBox(type: "hvcC", in: data, from: 94)
+        } else if entryType == "mp4a" {
+            // Sprint 13: AAC audio.
+            // AudioSampleEntry layout (from stsd payload start):
+            //   [0-7]   stsd header (version+flags + entry_count)
+            //   [8-15]  entry size + type "mp4a"
+            //   [16-21] reserved (6 bytes)
+            //   [22-23] data_reference_index
+            //   [24-31] reserved (8 bytes)   AudioSampleEntry base
+            //   [32-33] channelcount
+            //   [34-35] samplesize (usually 16)
+            //   [36-37] pre_defined
+            //   [38-39] reserved
+            //   [40-43] samplerate (fixed-point 16.16; upper 16 bits = Hz)
+            //   [44+]   child boxes (esds)
+            if data.count >= 44 {
+                accChannelCount    = data.mp4UInt16BE(at: 32)
+                let rateFixed      = data.mp4UInt32BE(at: 40)
+                accAudioSampleRate = Double(rateFixed >> 16)
+                accEsdsData        = findChildBox(type: "esds", in: data, from: 44)
+            }
         }
     }
 
@@ -494,6 +533,7 @@ final class MP4Demuxer {
         accCodecFourCC = nil;  accDisplayWidth = nil;  accDisplayHeight = nil
         accAvcCData = nil
         accHvcCData = nil
+        accEsdsData = nil;  accChannelCount = nil;  accAudioSampleRate = nil
         accSttsEntries = [];  accCttsEntries = [];  accStssSet = []
         accStscEntries = [];  accSampleSizes = [];  accFixedSampleSize = 0
         accChunkOffsets = [];  accHasCtts = false;  accHasStss = false
@@ -528,7 +568,10 @@ final class MP4Demuxer {
             displayWidth:   accDisplayWidth,
             displayHeight:  accDisplayHeight,
             avcCData:       accAvcCData,
-            hvcCData:       accHvcCData       // Sprint 12
+            hvcCData:       accHvcCData,      // Sprint 12
+            esdsData:       accEsdsData,      // Sprint 13
+            channelCount:   accChannelCount,
+            audioSampleRate: accAudioSampleRate
         )
         tracks.append(info)
 
@@ -545,12 +588,30 @@ final class MP4Demuxer {
             vtHasStss         = accHasStss
             vtTimescale       = accTimescale
         }
+
+        // Sprint 13: snapshot sample tables for the audio track
+        if case .audio = trackType {
+            atSttsEntries     = accSttsEntries
+            atStscEntries     = accStscEntries
+            atSampleSizes     = accSampleSizes
+            atFixedSampleSize = accFixedSampleSize
+            atChunkOffsets    = accChunkOffsets
+            atTimescale       = accTimescale
+            atSampleCount     = resolvedCount
+        }
     }
 
-    // MARK: - Packet Extraction (Sprint 8)
+    // MARK: - Packet Extraction (Sprint 8 + Sprint 15 perf)
+    //
+    // Samples are extracted in contiguous batches to minimise reader.read() calls.
+    // For interleaved MP4 (1 video sample / chunk) consecutive video samples are
+    // separated by audio chunks, so they are not contiguous — each is a separate
+    // read.  For non-interleaved / streaming MP4 they often ARE contiguous and
+    // collapse into a single read per run.  Audio chunks typically contain many
+    // samples that are always contiguous within the chunk — big win there.
 
     /// Read the first `count` video packets from the parsed MP4.
-    /// Each packet contains the raw AVCC-format H.264 sample bytes.
+    /// Each packet contains the raw AVCC-format H.264/HEVC sample bytes.
     func extractPackets(count: Int) async throws -> [DemuxPacket] {
         guard let vt = videoTrack else {
             throw MP4DemuxError.videoTrackNotFound
@@ -566,27 +627,52 @@ final class MP4Demuxer {
         }
 
         let total = min(count, vt.sampleCount)
-        var packets: [DemuxPacket] = []
-        packets.reserveCapacity(total)
+        let ts    = Int32(vtTimescale > 0 ? vtTimescale : 1)
 
+        // 1. Pre-compute all (offset, size) without IO — pure table math.
+        struct SampleLoc { let idx: Int; let fileOff: Int64; let size: Int }
+        var locs = [SampleLoc]()
+        locs.reserveCapacity(total)
         for i in 0..<total {
-            let (fileOff, size) = try sampleLocation(index: i)
-            let data = try await reader.read(offset: fileOff, length: size)
+            let (off, sz) = try sampleLocation(index: i)
+            locs.append(SampleLoc(idx: i, fileOff: off, size: sz))
+        }
 
-            let ts       = Int32(vtTimescale > 0 ? vtTimescale : 1)
-            let dtsTicks = self.dtsTicks(forSample: i)
-            let ptsTicks = dtsTicks + Int64(cttsOffset(forSample: i))
-            let isKey    = vtHasStss ? vtStssSet.contains(i + 1) : true
+        // 2. Group into contiguous runs → one read() per run.
+        var packets = [DemuxPacket]()
+        packets.reserveCapacity(total)
+        var runStart = 0
+        while runStart < locs.count {
+            var runEnd = runStart + 1
+            while runEnd < locs.count {
+                let prev = locs[runEnd - 1], curr = locs[runEnd]
+                if curr.fileOff == prev.fileOff + Int64(prev.size) { runEnd += 1 }
+                else { break }
+            }
+            // Read the whole contiguous run at once.
+            let runFileOff  = locs[runStart].fileOff
+            let runByteLen  = locs[runEnd - 1].fileOff + Int64(locs[runEnd - 1].size) - runFileOff
+            let chunkData   = try await reader.read(offset: runFileOff, length: Int(runByteLen))
 
-            packets.append(DemuxPacket(
-                streamType: .video,
-                index:      i,
-                pts:        CMTime(value: ptsTicks, timescale: ts),
-                dts:        CMTime(value: dtsTicks, timescale: ts),
-                data:       data,
-                isKeyframe: isKey,
-                byteOffset: fileOff
-            ))
+            for j in runStart..<runEnd {
+                let loc       = locs[j]
+                let sliceOff  = Int(loc.fileOff - runFileOff)
+                let data      = chunkData.subdata(in: sliceOff ..< sliceOff + loc.size)
+                let dtsTicks  = self.dtsTicks(forSample: loc.idx)
+                let ptsTicks  = dtsTicks + Int64(cttsOffset(forSample: loc.idx))
+                let isKey     = vtHasStss ? vtStssSet.contains(loc.idx + 1) : true
+                packets.append(DemuxPacket(
+                    streamType: .video,
+                    index:      loc.idx,
+                    pts:        CMTime(value: ptsTicks, timescale: ts),
+                    dts:        CMTime(value: dtsTicks, timescale: ts),
+                    data:       data,
+                    isKeyframe: isKey,
+                    byteOffset: loc.fileOff,
+                    duration:   .invalid
+                ))
+            }
+            runStart = runEnd
         }
         return packets
     }
@@ -669,5 +755,251 @@ final class MP4Demuxer {
             remaining -= entry.count
         }
         return 0
+    }
+
+    // MARK: - Audio Packet Extraction (Sprint 13 + Sprint 15 perf)
+    //
+    // Uses contiguous-batch reading just like extractPackets().
+    // For a typical MP4, all audio samples in a chunk are physically adjacent,
+    // so the whole audio track often collapses into a handful of reads.
+
+    /// Extract up to `count` audio packets starting from sample index `startIndex`.
+    func extractAudioPackets(count: Int, from startIndex: Int = 0) async throws -> [DemuxPacket] {
+        guard audioTrack != nil else { throw MP4DemuxError.videoTrackNotFound }
+        guard !atChunkOffsets.isEmpty else { throw MP4DemuxError.incompleteStbl("audio stco/co64 missing") }
+        guard !atStscEntries.isEmpty  else { throw MP4DemuxError.incompleteStbl("audio stsc missing") }
+        guard !atSttsEntries.isEmpty  else { throw MP4DemuxError.incompleteStbl("audio stts missing") }
+
+        let total = min(startIndex + count, atSampleCount)
+        let ts    = Int32(atTimescale > 0 ? atTimescale : 1)
+
+        // 1. Pre-compute all (offset, size) without IO.
+        struct SampleLoc { let idx: Int; let fileOff: Int64; let size: Int }
+        var locs = [SampleLoc]()
+        locs.reserveCapacity(max(0, total - startIndex))
+        for i in startIndex..<total {
+            let (off, sz) = try audioSampleLocation(index: i)
+            locs.append(SampleLoc(idx: i, fileOff: off, size: sz))
+        }
+
+        // 2. Group into contiguous runs → one read() per run.
+        var packets = [DemuxPacket]()
+        packets.reserveCapacity(locs.count)
+        var runStart = 0
+        while runStart < locs.count {
+            var runEnd = runStart + 1
+            while runEnd < locs.count {
+                let prev = locs[runEnd - 1], curr = locs[runEnd]
+                if curr.fileOff == prev.fileOff + Int64(prev.size) { runEnd += 1 }
+                else { break }
+            }
+            let runFileOff  = locs[runStart].fileOff
+            let runByteLen  = locs[runEnd - 1].fileOff + Int64(locs[runEnd - 1].size) - runFileOff
+            let chunkData   = try await reader.read(offset: runFileOff, length: Int(runByteLen))
+
+            for j in runStart..<runEnd {
+                let loc          = locs[j]
+                let sliceOff     = Int(loc.fileOff - runFileOff)
+                let data         = chunkData.subdata(in: sliceOff ..< sliceOff + loc.size)
+                let dtsTicks     = self.audioDtsTicks(forSample: loc.idx)
+                let frameDuration = audioFrameDuration(forSample: loc.idx)
+                packets.append(DemuxPacket(
+                    streamType: .audio,
+                    index:      loc.idx,
+                    pts:        CMTime(value: dtsTicks,     timescale: ts),
+                    dts:        CMTime(value: dtsTicks,     timescale: ts),
+                    data:       data,
+                    isKeyframe: true,
+                    byteOffset: loc.fileOff,
+                    duration:   CMTime(value: frameDuration, timescale: ts)
+                ))
+            }
+            runStart = runEnd
+        }
+        return packets
+    }
+
+    // MARK: - Seek Support (Sprint 14)
+
+    /// Extract video packets starting from `startIndex` using contiguous-batch reads.
+    func extractVideoPackets(from startIndex: Int, count: Int) async throws -> [DemuxPacket] {
+        guard let vt = videoTrack else { throw MP4DemuxError.videoTrackNotFound }
+        guard !vtChunkOffsets.isEmpty else { throw MP4DemuxError.incompleteStbl("stco/co64 missing") }
+        guard !vtStscEntries.isEmpty  else { throw MP4DemuxError.incompleteStbl("stsc missing") }
+        guard !vtSttsEntries.isEmpty  else { throw MP4DemuxError.incompleteStbl("stts missing") }
+
+        let total = min(startIndex + count, vt.sampleCount)
+        let ts    = Int32(vtTimescale > 0 ? vtTimescale : 1)
+
+        struct SampleLoc { let idx: Int; let fileOff: Int64; let size: Int }
+        var locs = [SampleLoc]()
+        locs.reserveCapacity(max(0, total - startIndex))
+        for i in startIndex..<total {
+            let (off, sz) = try sampleLocation(index: i)
+            locs.append(SampleLoc(idx: i, fileOff: off, size: sz))
+        }
+
+        var packets = [DemuxPacket]()
+        packets.reserveCapacity(locs.count)
+        var runStart = 0
+        while runStart < locs.count {
+            var runEnd = runStart + 1
+            while runEnd < locs.count {
+                let prev = locs[runEnd - 1], curr = locs[runEnd]
+                if curr.fileOff == prev.fileOff + Int64(prev.size) { runEnd += 1 }
+                else { break }
+            }
+            let runFileOff = locs[runStart].fileOff
+            let runByteLen = locs[runEnd - 1].fileOff + Int64(locs[runEnd - 1].size) - runFileOff
+            let chunkData  = try await reader.read(offset: runFileOff, length: Int(runByteLen))
+
+            for j in runStart..<runEnd {
+                let loc      = locs[j]
+                let sliceOff = Int(loc.fileOff - runFileOff)
+                let data     = chunkData.subdata(in: sliceOff ..< sliceOff + loc.size)
+                let dtsTicks = self.dtsTicks(forSample: loc.idx)
+                let ptsTicks = dtsTicks + Int64(cttsOffset(forSample: loc.idx))
+                let isKey    = vtHasStss ? vtStssSet.contains(loc.idx + 1) : true
+                packets.append(DemuxPacket(
+                    streamType: .video,
+                    index:      loc.idx,
+                    pts:        CMTime(value: ptsTicks, timescale: ts),
+                    dts:        CMTime(value: dtsTicks, timescale: ts),
+                    data:       data,
+                    isKeyframe: isKey,
+                    byteOffset: loc.fileOff,
+                    duration:   .invalid
+                ))
+            }
+            runStart = runEnd
+        }
+        return packets
+    }
+
+    /// Return the 0-based index of the video keyframe whose PTS is closest to
+    /// (but not after) `target`.  Returns 0 when the target is before all keyframes
+    /// or when there is no stss (all frames are keyframes).
+    func findVideoKeyframeSampleIndex(nearestBeforePTS target: CMTime) -> Int {
+        guard vtTimescale > 0 else { return 0 }
+
+        // Convert target to ticks in the video timescale
+        let targetTicks = Int64(target.seconds * Double(vtTimescale))
+
+        // Walk stts to find the last sample whose PTS ≤ targetTicks
+        var sampleIdx = 0
+        var accTicks  = Int64(0)
+        outer: for entry in vtSttsEntries {
+            for _ in 0..<entry.count {
+                let ptsTicks = accTicks + Int64(cttsOffset(forSample: sampleIdx))
+                if ptsTicks > targetTicks { break outer }
+                sampleIdx += 1
+                accTicks  += Int64(entry.delta)
+            }
+        }
+        // sampleIdx is now just past the target — step back one
+        if sampleIdx > 0 { sampleIdx -= 1 }
+
+        // If no stss, every frame is a keyframe
+        guard vtHasStss else { return sampleIdx }
+
+        // Scan sorted keyframe list for the last one at or before sampleIdx
+        var keyframeIdx = 0
+        for kf1 in vtStssSet.sorted() {
+            let kfIdx = kf1 - 1   // 0-based
+            if kfIdx <= sampleIdx { keyframeIdx = kfIdx } else { break }
+        }
+        return keyframeIdx
+    }
+
+    /// Presentation timestamp of video sample at `index`.
+    /// Used by the streaming controller to re-anchor the synchronizer after a seek.
+    func videoPTS(forSample index: Int) -> CMTime {
+        guard vtTimescale > 0 else { return .zero }
+        let ts     = Int32(vtTimescale)
+        let dtsTk  = dtsTicks(forSample: index)
+        let ptsTk  = dtsTk + Int64(cttsOffset(forSample: index))
+        return CMTime(value: ptsTk, timescale: ts)
+    }
+
+    /// Return the 0-based audio sample index whose DTS is closest to (but not after)
+    /// `target`.  Safe to call with .zero (returns 0).
+    func findAudioSampleIndex(nearestBeforePTS target: CMTime) -> Int {
+        guard atTimescale > 0 else { return 0 }
+        let targetTicks = Int64(target.seconds * Double(atTimescale))
+        var sampleIdx = 0
+        var accTicks  = Int64(0)
+        for entry in atSttsEntries {
+            for _ in 0..<entry.count {
+                if accTicks > targetTicks { return max(0, sampleIdx - 1) }
+                sampleIdx += 1
+                accTicks  += Int64(entry.delta)
+            }
+        }
+        return max(0, sampleIdx - 1)
+    }
+
+    // MARK: - Audio Location Helpers
+
+    private func audioSampleLocation(index: Int) throws -> (offset: Int64, size: Int) {
+        var globalSample = 0
+        for i in 0..<atStscEntries.count {
+            let entry          = atStscEntries[i]
+            let firstChunk1    = entry.firstChunk
+            let spc            = entry.samplesPerChunk
+            let nextFirstChunk = (i + 1 < atStscEntries.count)
+                ? atStscEntries[i + 1].firstChunk
+                : atChunkOffsets.count + 1
+
+            let numChunks    = nextFirstChunk - firstChunk1
+            let samplesInRun = numChunks * spc
+
+            if globalSample + samplesInRun > index {
+                let offsetInRun      = index - globalSample
+                let chunkOffsetInRun = offsetInRun / spc
+                let sampleInChunk    = offsetInRun % spc
+
+                let chunkIdx0 = (firstChunk1 - 1) + chunkOffsetInRun
+                guard chunkIdx0 < atChunkOffsets.count else {
+                    throw MP4DemuxError.chunkIndexOutOfBounds(chunkIdx0)
+                }
+                var fileOff = atChunkOffsets[chunkIdx0]
+                let firstSampleInChunk = globalSample + chunkOffsetInRun * spc
+                for s in firstSampleInChunk..<(firstSampleInChunk + sampleInChunk) {
+                    fileOff += Int64(audioSampleSizeAt(s))
+                }
+                return (fileOff, audioSampleSizeAt(index))
+            }
+            globalSample += samplesInRun
+        }
+        throw MP4DemuxError.sampleNotFound(index)
+    }
+
+    private func audioSampleSizeAt(_ index: Int) -> Int {
+        if atFixedSampleSize > 0 { return atFixedSampleSize }
+        return index < atSampleSizes.count ? atSampleSizes[index] : 0
+    }
+
+    private func audioDtsTicks(forSample index: Int) -> Int64 {
+        var ticks     = Int64(0)
+        var remaining = index
+        for entry in atSttsEntries {
+            if remaining < entry.count {
+                ticks += Int64(remaining) * Int64(entry.delta)
+                return ticks
+            }
+            ticks     += Int64(entry.count) * Int64(entry.delta)
+            remaining -= entry.count
+        }
+        return ticks
+    }
+
+    /// Duration (in ticks) of the audio frame at `index`, from the stts table.
+    private func audioFrameDuration(forSample index: Int) -> Int64 {
+        var remaining = index
+        for entry in atSttsEntries {
+            if remaining < entry.count { return Int64(entry.delta) }
+            remaining -= entry.count
+        }
+        return atSttsEntries.last.map { Int64($0.delta) } ?? 1024
     }
 }
