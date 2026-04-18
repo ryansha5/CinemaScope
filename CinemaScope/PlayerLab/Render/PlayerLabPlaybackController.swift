@@ -129,6 +129,14 @@ final class PlayerLabPlaybackController: ObservableObject {
     /// Published so the HUD can show "MKV" vs "MP4".
     @Published private(set) var detectedContainer: String = "—"
 
+    // MARK: - Sprint 42: Fallback callback
+
+    /// Set by the host before calling prepare(url:).
+    /// Called when PlayerLab cannot play the content and AVPlayer must take over
+    /// (e.g. audio codec has no compatible decode path). The String argument is a
+    /// short reason label suitable for logging and routing decisions.
+    var onFallbackRequired: ((String) -> Void)?
+
     // MARK: - Sprint 25: Audio preference state
 
     private var currentURL: URL? = nil
@@ -276,6 +284,9 @@ final class PlayerLabPlaybackController: ObservableObject {
             case .fallbackToAVPlayer(let reason):
                 record("[Audio] No compatible PlayerLab audio path — \(reason)")
                 fail("No compatible audio — route to AVPlayer: \(reason)")
+                // Sprint 42: notify host so it can hand off to AVPlayer cleanly.
+                // Capture before returning so the callback fires after fail().
+                onFallbackRequired?("audio: \(reason)")
                 return
             case .videoOnly:
                 record("[Audio] No audio tracks — video-only playback")
@@ -480,6 +491,10 @@ final class PlayerLabPlaybackController: ObservableObject {
 
         // ── Phase 2: FLUSH (display gap starts here) ──────────────────────────
         renderer.flushForSeek()
+        // Sprint 39: clear stale PGS cue immediately on flush so no subtitle
+        // image from the pre-seek position persists until update(forTime:) fires
+        // (which otherwise arrives up to 250 ms later from the time-tracking loop).
+        pgsController.clearCurrentCue(reason: "seek")
 
         // ── Phase 3: RESET CURSORS + ENQUEUE (gap ends here) ─────────────────
         feeder.setCursors(videoIdx: keyframeIdx, audioIdx: audioIdx,

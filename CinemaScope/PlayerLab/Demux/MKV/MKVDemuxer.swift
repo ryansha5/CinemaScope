@@ -1138,42 +1138,143 @@ final class MKVDemuxer {
         pgsRawPackets.append(PGSRawPacket(pts: pts, endPTS: endPTS, data: data))
     }
 
-    // MARK: - PGS Post-processing  (Sprint 28)
+    // MARK: - PGS Post-processing  (Sprint 28 / Sprint 38 / Sprint 39)
     //
     // Converts raw PGS byte payloads into fully-decoded PGSCue objects.
-    // End time: use BlockDuration when present; otherwise derive from next packet's PTS;
-    // fallback to +5 s.
+    //
+    // Sprint 38: passes isForced and windowRect through to each PGSCue.
+    //
+    // Sprint 39: pending-cue timing pattern.
+    //   Content display sets (ds.hasBitmap) are held as "pending" until their
+    //   end time is known.  End time is resolved from the first of:
+    //     1. An explicit BlockDuration on the content packet itself (endPTS).
+    //     2. The PTS of the following clear display set (ds.isClearSet).
+    //     3. The PTS of the next content display set (no clear in between).
+    //     4. +5 s fallback at end of input.
+    //
+    // This is more accurate than the Sprint 28 approach of using packets[i+1].pts
+    // uniformly, which silently relied on clear sets coincidentally being the next
+    // packet — correct for normal MKV PGS, but fragile for unusual encodings.
 
     private func processPGSPackets(_ packets: [PGSRawPacket]) async -> [PGSCue] {
         guard !packets.isEmpty else { return [] }
         var cues = [PGSCue]()
         cues.reserveCapacity(packets.count / 2)
 
-        for i in 0..<packets.count {
-            let pkt = packets[i]
-            let ds  = PGSParser.parseDisplaySet(data: pkt.data)
-            guard ds.hasBitmap,
-                  let (img, rect) = PGSParser.makeImage(from: ds)
-            else { continue }
-
-            let endTime: CMTime
-            if let explicit = pkt.endPTS {
-                endTime = explicit
-            } else if i + 1 < packets.count {
-                endTime = packets[i + 1].pts
-            } else {
-                endTime = CMTimeAdd(pkt.pts, CMTime(seconds: 5, preferredTimescale: outputTimescale))
-            }
-            cues.append(PGSCue(id:         UUID(),
-                                startTime:  pkt.pts,
-                                endTime:    endTime,
-                                image:      img,
-                                videoSize:  CGSize(width:  ds.videoWidth, height: ds.videoHeight),
-                                objectRect: rect))
-            fputs("[MKVDemuxer][PGS] Cue at \(String(format: "%.3f", pkt.pts.seconds))s "
-                + "size=\(cgImageDims(img))  rect=\(Int(rect.origin.x)),\(Int(rect.origin.y))"
-                + "+\(Int(rect.width))×\(Int(rect.height))\n", stderr)
+        // Lightweight store for the pending content display set.
+        struct Pending {
+            let pts:       CMTime
+            let img:       CGImage
+            let rect:      CGRect
+            let videoSize: CGSize
+            let isForced:  Bool
+            let windowRect: CGRect?
         }
+        var pending: Pending? = nil
+
+        for pkt in packets {
+            let ds = PGSParser.parseDisplaySet(data: pkt.data)
+
+            if ds.isClearSet {
+                // Clear display set — emit any pending cue using this packet's PTS
+                // as the end time.  Use endPTS if BlockDuration was supplied; otherwise
+                // the clear PTS is the exact moment the image is erased.
+                if let p = pending {
+                    let endTime = pkt.endPTS ?? pkt.pts
+                    cues.append(PGSCue(id:         UUID(),
+                                       startTime:  p.pts,
+                                       endTime:    endTime,
+                                       image:      p.img,
+                                       videoSize:  p.videoSize,
+                                       objectRect: p.rect,
+                                       isForced:   p.isForced,
+                                       windowRect: p.windowRect))
+                    fputs("[MKVDemuxer][PGS] Cue "
+                        + "\(String(format: "%.3f", p.pts.seconds))→"
+                        + "\(String(format: "%.3f", endTime.seconds))s "
+                        + "(clear-set end)  forced=\(p.isForced)  "
+                        + "\(cgImageDims(p.img))  "
+                        + "rect=\(Int(p.rect.origin.x)),\(Int(p.rect.origin.y))"
+                        + "+\(Int(p.rect.width))×\(Int(p.rect.height))\n", stderr)
+                    pending = nil
+                }
+
+            } else if ds.hasBitmap, let (img, rect) = PGSParser.makeImage(from: ds) {
+                // Content display set — emit any pending cue first (no clear in between).
+                if let p = pending {
+                    cues.append(PGSCue(id:         UUID(),
+                                       startTime:  p.pts,
+                                       endTime:    pkt.pts,
+                                       image:      p.img,
+                                       videoSize:  p.videoSize,
+                                       objectRect: p.rect,
+                                       isForced:   p.isForced,
+                                       windowRect: p.windowRect))
+                    fputs("[MKVDemuxer][PGS] Cue "
+                        + "\(String(format: "%.3f", p.pts.seconds))→"
+                        + "\(String(format: "%.3f", pkt.pts.seconds))s "
+                        + "(next-content end)  forced=\(p.isForced)  "
+                        + "\(cgImageDims(p.img))  "
+                        + "rect=\(Int(p.rect.origin.x)),\(Int(p.rect.origin.y))"
+                        + "+\(Int(p.rect.width))×\(Int(p.rect.height))\n", stderr)
+                    pending = nil
+                }
+
+                // Build the Sprint 38 fields.
+                let isForced   = !ds.forcedObjectIDs.isEmpty
+                let windowID   = ds.compositionObjects.first?.windowID
+                let windowRect = windowID.flatMap { ds.windowRects[$0] }
+
+                if let explicitEnd = pkt.endPTS {
+                    // BlockDuration present — emit immediately; no need to hold pending.
+                    cues.append(PGSCue(id:         UUID(),
+                                       startTime:  pkt.pts,
+                                       endTime:    explicitEnd,
+                                       image:      img,
+                                       videoSize:  CGSize(width: ds.videoWidth, height: ds.videoHeight),
+                                       objectRect: rect,
+                                       isForced:   isForced,
+                                       windowRect: windowRect))
+                    fputs("[MKVDemuxer][PGS] Cue "
+                        + "\(String(format: "%.3f", pkt.pts.seconds))→"
+                        + "\(String(format: "%.3f", explicitEnd.seconds))s "
+                        + "(explicit dur)  forced=\(isForced)  "
+                        + "\(cgImageDims(img))  "
+                        + "rect=\(Int(rect.origin.x)),\(Int(rect.origin.y))"
+                        + "+\(Int(rect.width))×\(Int(rect.height))\n", stderr)
+                } else {
+                    // No explicit duration — hold as pending until clear or next content.
+                    pending = Pending(pts:       pkt.pts,
+                                     img:       img,
+                                     rect:      rect,
+                                     videoSize: CGSize(width: ds.videoWidth, height: ds.videoHeight),
+                                     isForced:  isForced,
+                                     windowRect: windowRect)
+                }
+            }
+            // Non-clear, non-bitmap sets (e.g. palette-only partial updates) are skipped.
+        }
+
+        // End of input: emit any remaining pending cue with a +5 s fallback.
+        if let p = pending {
+            let endTime = CMTimeAdd(p.pts, CMTime(seconds: 5, preferredTimescale: outputTimescale))
+            cues.append(PGSCue(id:         UUID(),
+                               startTime:  p.pts,
+                               endTime:    endTime,
+                               image:      p.img,
+                               videoSize:  p.videoSize,
+                               objectRect: p.rect,
+                               isForced:   p.isForced,
+                               windowRect: p.windowRect))
+            fputs("[MKVDemuxer][PGS] Cue "
+                + "\(String(format: "%.3f", p.pts.seconds))→"
+                + "\(String(format: "%.3f", endTime.seconds))s "
+                + "(fallback +5s)  forced=\(p.isForced)  "
+                + "\(cgImageDims(p.img))  "
+                + "rect=\(Int(p.rect.origin.x)),\(Int(p.rect.origin.y))"
+                + "+\(Int(p.rect.width))×\(Int(p.rect.height))\n", stderr)
+        }
+
         return cues
     }
 

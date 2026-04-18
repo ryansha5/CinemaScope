@@ -11,6 +11,25 @@ enum AppDestination: Equatable {
     case settings
 }
 
+// MARK: - PendingLabPlay
+
+/// Sprint 43: Carries everything needed to present PlayerLabHostView AND to fall
+/// back to AVPlayer cleanly if PlayerLab cannot play the content.
+private struct PendingLabPlay: Identifiable {
+    let id      = UUID()
+    // Presentation
+    let item:    EmbyItem
+    let url:     URL
+    let ticks:   Int64
+    let backdrop: URL?
+    // Fallback — the already-resolved PlaybackResult and credentials let
+    // launchAVPlayer() skip another round-trip to Emby.
+    let result:  PlaybackResult
+    let server:  EmbyServer
+    let user:    EmbyUser
+    let token:   String
+}
+
 // MARK: - HomeView
 
 struct HomeView: View {
@@ -25,7 +44,9 @@ struct HomeView: View {
         let raw = UserDefaults.standard.string(forKey: "startupTab") ?? NavTab.home.rawValue
         return NavTab(rawValue: raw) ?? .home
     }()
-    @State private var destination: AppDestination? = nil
+    @State private var destination:    AppDestination? = nil
+    /// Sprint 43: non-nil when a PlayerLab session is being presented.
+    @State private var pendingLabPlay: PendingLabPlay? = nil
 
     var body: some View {
         ZStack {
@@ -142,6 +163,37 @@ struct HomeView: View {
         }
         .animation(.easeInOut(duration: 0.25), value: destination)
         .animation(.easeInOut(duration: 0.4),  value: settings.scopeUIEnabled)
+        // Sprint 43: PlayerLab full-screen cover.  onFallback hands off to AVPlayer
+        // using the already-resolved PlaybackResult so no second Emby round-trip.
+        .fullScreenCover(item: $pendingLabPlay) { pending in
+            PlayerLabHostView(
+                url:         pending.url,
+                startTicks:  pending.ticks,
+                itemName:    pending.item.name,
+                backdropURL: pending.backdrop,
+                onExit: {
+                    pendingLabPlay = nil
+                },
+                onFallback: { reason in
+                    print("[HomeView] PlayerLab fallback — \(reason) — switching to AVPlayer")
+                    let cap = pending
+                    pendingLabPlay = nil
+                    // Brief async hop lets the fullScreenCover begin dismissal before
+                    // AVPlayer's destination change is applied.
+                    Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 150_000_000)
+                        launchAVPlayer(
+                            item:   cap.item,
+                            result: cap.result,
+                            ticks:  cap.ticks,
+                            server: cap.server,
+                            user:   cap.user,
+                            token:  cap.token
+                        )
+                    }
+                }
+            )
+        }
         .task {
             guard let server = session.server,
                   let user   = session.user,
@@ -427,38 +479,90 @@ struct HomeView: View {
                 // explicitly supplied (e.g. restart) that takes precedence;
                 // otherwise use the shared CTA logic so threshold rules apply.
                 let ticks = startTicks ?? PlaybackCTA.state(for: item).primaryStartTicks
+
+                // ── Sprint 43: Routing decision ───────────────────────────────
+                let route = PlaybackRouter.decide(
+                    source:           result.selectedSource,
+                    playMethod:       result.playMethod,
+                    url:              result.url,
+                    playerLabEnabled: settings.playerLabEnabled
+                )
+                print("[HomeView] \(route.logLine)")
+
                 await MainActor.run {
-                    // Tell the engine about the UI mode and item identity BEFORE load.
-                    // This sets the correct default viewport and restores any stored AR override.
-                    engine.setPlaybackContext(
-                        scopeUIEnabled: settings.scopeUIEnabled,
-                        serverURL:      server.url,
-                        itemId:         item.id
-                    )
-                    engine.setReportingContext(
-                        server: server, userId: user.id, token: token, itemId: item.id,
-                        mediaSourceId: result.mediaSourceId,
-                        playSessionId: result.playSessionId,
-                        playMethod:    result.playMethod)
-                    // Retry handler: if primary URL fails, force HLS transcode
-                    engine.setRetryHandler {
-                        print("[HomeView] 🔄 Primary failed — forcing transcode for \(item.name)")
-                        guard let fallback = try? await EmbyAPI.forcedTranscodeURL(
-                            server: server, userId: user.id, token: token, itemId: item.id) else { return }
-                        await MainActor.run {
-                            engine.setReportingContext(
-                                server: server, userId: user.id, token: token, itemId: item.id,
-                                mediaSourceId: fallback.mediaSourceId,
-                                playSessionId: fallback.playSessionId,
-                                playMethod:    fallback.playMethod)
-                            engine.load(url: fallback.url, startTicks: ticks)
+                    if route.meetsThreshold(settings.playerLabMinConfidence) {
+                        // ── PlayerLab path ───────────────────────────────────
+                        // Compute backdrop URL for the loading screen.
+                        let backdropTag = item.backdropImageTags?.first
+                        let backdropURL: URL? = backdropTag.flatMap {
+                            URL(string: "\(server.url)/Items/\(item.id)/Images/Backdrop/0"
+                              + "?api_key=\(token)&tag=\($0)")
                         }
+                        pendingLabPlay = PendingLabPlay(
+                            item:     item,
+                            url:      result.url,
+                            ticks:    ticks,
+                            backdrop: backdropURL,
+                            result:   result,
+                            server:   server,
+                            user:     user,
+                            token:    token
+                        )
+                    } else {
+                        // ── AVPlayer path (existing behaviour) ───────────────
+                        launchAVPlayer(
+                            item:   item,
+                            result: result,
+                            ticks:  ticks,
+                            server: server,
+                            user:   user,
+                            token:  token
+                        )
                     }
-                    engine.load(url: result.url, startTicks: ticks)
-                    withAnimation { destination = .player(item) }
                 }
             } catch { print("[HomeView] Playback error: \(error)") }
         }
+    }
+
+    /// Configures and starts AVPlayer for the given item + already-resolved result.
+    /// Called both from play() when the router selects AVPlayer, and from the
+    /// PlayerLabHostView onFallback callback when PlayerLab cannot play the content.
+    private func launchAVPlayer(
+        item:   EmbyItem,
+        result: PlaybackResult,
+        ticks:  Int64,
+        server: EmbyServer,
+        user:   EmbyUser,
+        token:  String
+    ) {
+        // Tell the engine about the UI mode and item identity BEFORE load.
+        // This sets the correct default viewport and restores any stored AR override.
+        engine.setPlaybackContext(
+            scopeUIEnabled: settings.scopeUIEnabled,
+            serverURL:      server.url,
+            itemId:         item.id
+        )
+        engine.setReportingContext(
+            server: server, userId: user.id, token: token, itemId: item.id,
+            mediaSourceId: result.mediaSourceId,
+            playSessionId: result.playSessionId,
+            playMethod:    result.playMethod)
+        // Retry handler: if primary URL fails, force HLS transcode
+        engine.setRetryHandler {
+            print("[HomeView] 🔄 Primary failed — forcing transcode for \(item.name)")
+            guard let fallback = try? await EmbyAPI.forcedTranscodeURL(
+                server: server, userId: user.id, token: token, itemId: item.id) else { return }
+            await MainActor.run {
+                engine.setReportingContext(
+                    server: server, userId: user.id, token: token, itemId: item.id,
+                    mediaSourceId: fallback.mediaSourceId,
+                    playSessionId: fallback.playSessionId,
+                    playMethod:    fallback.playMethod)
+                engine.load(url: fallback.url, startTicks: ticks)
+            }
+        }
+        engine.load(url: result.url, startTicks: ticks)
+        withAnimation { destination = .player(item) }
     }
 
     private func restart(_ item: EmbyItem) {

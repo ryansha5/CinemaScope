@@ -282,6 +282,10 @@ struct PlaybackResult {
     let mediaSourceId: String
     /// "DirectPlay" | "DirectStream" | "Transcode" — reported to Emby verbatim.
     let playMethod:    String
+    /// Sprint 43: The Emby media source selected for this session. Carries
+    /// codec/container facts that PlaybackRouter needs to decide between
+    /// PlayerLab and AVPlayer. Nil on forced-transcode fallback paths.
+    let selectedSource: EmbyMediaSource?
 }
 
 // MARK: - Playback Info

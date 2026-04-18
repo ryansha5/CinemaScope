@@ -74,6 +74,15 @@ final class AppSettings: ObservableObject {
         didSet { UserDefaults.standard.set(playerLabLastPath, forKey: "playerLabLastPath") }
     }
 
+    /// Sprint 43: Minimum routing confidence required for PlayerLab to take over.
+    /// If PlaybackRouter returns confidence below this threshold, AVPlayer is used.
+    /// Stored as Int rawValue (0 = low, 1 = medium, 2 = high). Default: high for
+    /// conservative rollout — only fully-deterministic codec combinations route to
+    /// PlayerLab until confidence in the codec matrix improves over sprints.
+    @Published var playerLabMinConfidence: PlaybackConfidence {
+        didSet { UserDefaults.standard.set(playerLabMinConfidence.rawValue, forKey: "playerLabMinConfidence") }
+    }
+
     // MARK: - Init
 
     private init() {
@@ -91,6 +100,11 @@ final class AppSettings: ObservableObject {
         self.hasCompletedOnboarding = UserDefaults.standard.bool(forKey: "hasCompletedOnboarding")
         self.playerLabEnabled       = UserDefaults.standard.bool(forKey: "playerLabEnabled")
         self.playerLabLastPath      = UserDefaults.standard.string(forKey: "playerLabLastPath") ?? ""
+        // Sprint 43: default to .high — only route to PlayerLab when all codecs are
+        // deterministically supported. Operators can lower to .medium to expand coverage.
+        let confRaw = UserDefaults.standard.object(forKey: "playerLabMinConfidence") as? Int
+            ?? PlaybackConfidence.high.rawValue
+        self.playerLabMinConfidence = PlaybackConfidence(rawValue: confRaw) ?? .high
     }
 
     // MARK: - Ribbon helpers

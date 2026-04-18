@@ -418,10 +418,11 @@ extension EmbyAPI {
         _ = subCodecs
 
         return PlaybackResult(
-            url:           url,
-            playSessionId: activeSessionId,
-            mediaSourceId: activeSource.id,
-            playMethod:    playMethod
+            url:            url,
+            playSessionId:  activeSessionId,
+            mediaSourceId:  activeSource.id,
+            playMethod:     playMethod,
+            selectedSource: activeSource
         )
     }
 
@@ -508,7 +509,7 @@ extension EmbyAPI {
                 comps.queryItems = items
                 if let url = comps.url {
                     print("[Playback] 🆘 forcedTranscode: source=PlaybackInfo, playSessionId=\(playSessionId), wasRelative=\(wasRelative), length=\(url.absoluteString.count)")
-                    return PlaybackResult(url: url, playSessionId: playSessionId, mediaSourceId: source.id, playMethod: "Transcode")
+                    return PlaybackResult(url: url, playSessionId: playSessionId, mediaSourceId: source.id, playMethod: "Transcode", selectedSource: nil)
                 }
             }
         }
@@ -531,6 +532,6 @@ extension EmbyAPI {
         ]
         guard let url = comps.url else { throw EmbyError.invalidURL }
         print("[Playback] 🚨 forcedTranscode manual HLS fallback: length=\(url.absoluteString.count)")
-        return PlaybackResult(url: url, playSessionId: playSessionId, mediaSourceId: source.id, playMethod: "Transcode")
+        return PlaybackResult(url: url, playSessionId: playSessionId, mediaSourceId: source.id, playMethod: "Transcode", selectedSource: nil)
     }
 }

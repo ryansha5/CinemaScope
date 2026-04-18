@@ -1,5 +1,15 @@
 // MARK: - PlayerLab / Subtitle / PGSParser
 // Sprint 28 — PGS segment parser and CGImage renderer.
+// Sprint 38 — Composition correctness:
+//   • Fix PCS bytes[7] off-by-one: composition_state is at bytes[7],
+//     NOT bytes[8] (which is palette_update_flag).  Old code read the
+//     wrong byte for isEpochStart; new CompositionState enum uses bytes[7].
+//   • CompositionState enum (NORMAL / ACQUISITION_POINT / EPOCH_START / EPOCH_CONTINUE).
+//   • WDS (Window Definition Segment) fully parsed into DisplaySet.windowRects.
+//   • forced_on_flag (bit 6 of each composition object's flags byte) extracted
+//     into DisplaySet.forcedObjectIDs.
+//   • compositionObjects tuple extended with windowID for WDS cross-reference.
+//   • isClearSet computed property added for pending-cue timing logic.
 //
 // Parses raw PGS (Presentation Graphic Stream) block payloads
 // (no outer PG magic / PTS header — those come from the MKV block).
@@ -11,6 +21,26 @@
 
 import Foundation
 import CoreGraphics
+
+// MARK: - CompositionState  (Sprint 38)
+
+/// PCS composition_state field (bytes[7]).
+/// Describes the relationship between consecutive display sets in an epoch.
+enum CompositionState {
+    case normal            // 0x00 — partial update within the current epoch
+    case acquisitionPoint  // 0x40 — full redefinition; can be decoded independently
+    case epochStart        // 0x80 — new epoch; all state is reset
+    case epochContinue     // 0xC0 — continuation of a split epoch (rare)
+
+    init(rawByte: UInt8) {
+        switch rawByte & 0xC0 {
+        case 0x40: self = .acquisitionPoint
+        case 0x80: self = .epochStart
+        case 0xC0: self = .epochContinue
+        default:   self = .normal
+        }
+    }
+}
 
 struct PGSParser {
 
@@ -27,10 +57,29 @@ struct PGSParser {
     struct DisplaySet {
         var videoWidth:  Int = 0
         var videoHeight: Int = 0
-        var isEpochStart: Bool = false
-        var compositionObjects: [(objectID: Int, x: Int, y: Int)] = []
+
+        // Sprint 38: replaces isEpochStart: Bool
+        var compositionState: CompositionState = .normal
+
+        // Sprint 38: windowID included for WDS cross-reference.
+        // Each entry: (objectID, windowID, x, y) in video-space coordinates.
+        var compositionObjects: [(objectID: Int, windowID: Int, x: Int, y: Int)] = []
+
+        // Sprint 38: window bounds from WDS, keyed by window_id.
+        var windowRects: [Int: CGRect] = [:]
+
+        // Sprint 38: objectIDs with forced_on_flag (bit 6) set in PCS.
+        var forcedObjectIDs: Set<Int> = []
+
         var palette: [Int: (r: UInt8, g: UInt8, b: UInt8, a: UInt8)] = [:]
         var objects: [Int: (width: Int, height: Int, pixels: [UInt8])] = [:]
+
+        // Sprint 38: backward-compat accessor.
+        var isEpochStart: Bool { compositionState == .epochStart }
+
+        // Sprint 38: true when the PCS carries no composition objects — i.e.
+        // this is a "clear" display set that erases the current subtitle image.
+        var isClearSet: Bool { compositionObjects.isEmpty }
 
         var hasBitmap: Bool {
             !compositionObjects.isEmpty && !objects.isEmpty
@@ -68,9 +117,8 @@ struct PGSParser {
             case segPCS:
                 parsePCS(data: segmentData, offset: &segOffset, into: &ds)
             case segWDS:
-                // Window Definition Segment — describes display window bounds.
-                // Sprint 28: basic scope; data noted but not used for rendering.
-                break
+                // Sprint 38: fully parse Window Definition Segment.
+                parseWDS(data: segmentData, into: &ds)
             case segEND:
                 // End of Display Set
                 break
@@ -111,40 +159,79 @@ struct PGSParser {
         return (cgImage, rect)
     }
 
-    // MARK: - Private Helpers
+    // MARK: - Private: PCS
 
     private static func parsePCS(data: Data, offset: inout Int, into ds: inout DisplaySet) {
         // PCS layout:
-        //   [0..1]  video_width   — big-endian UInt16
-        //   [2..3]  video_height  — big-endian UInt16
-        //   [4]     frame_rate    — skip
-        //   [5..6]  comp_number   — skip
-        //   [7]     (skip)
-        //   [8]     comp_state    — 0x80 = epoch start
-        //   [9]     palette_update_flag — skip
-        //   [10]    num_objects
-        //   [11+]   composition objects (8 bytes each, +8 if cropped)
+        //   [0..1]  video_width          — big-endian UInt16
+        //   [2..3]  video_height         — big-endian UInt16
+        //   [4]     frame_rate_id        — skip
+        //   [5..6]  composition_number   — skip
+        //   [7]     composition_state    — 0x80=EPOCH_START, 0x40=ACQUISITION_POINT, 0x00=NORMAL
+        //                                  Sprint 38 fix: was incorrectly read from bytes[8].
+        //   [8]     palette_update_flag  — bit 7; skip
+        //   [9]     palette_id           — skip
+        //   [10]    number_of_composition_objects
+        //   [11+]   composition objects (8 bytes each, +8 if crop enabled)
+        //           per object:
+        //             [0..1] object_id
+        //             [2]    window_id
+        //             [3]    object_cropped_flag  (bit7=crop_enabled, bit6=forced_on_flag)
+        //             [4..5] object_horizontal_position  (x)
+        //             [6..7] object_vertical_position    (y)
         guard data.count >= 11 else { return }
 
         let bytes = [UInt8](data)
-        ds.videoWidth   = Int(UInt32(bytes[0]) << 8 | UInt32(bytes[1]))
-        ds.videoHeight  = Int(UInt32(bytes[2]) << 8 | UInt32(bytes[3]))
-        ds.isEpochStart = (bytes[8] & 0x80) != 0
-        let numObjects  = Int(bytes[10])
+        ds.videoWidth       = Int(UInt32(bytes[0]) << 8 | UInt32(bytes[1]))
+        ds.videoHeight      = Int(UInt32(bytes[2]) << 8 | UInt32(bytes[3]))
+        ds.compositionState = CompositionState(rawByte: bytes[7])   // Sprint 38: was bytes[8]
+        let numObjects      = Int(bytes[10])
 
         var objOffset = 11
         for _ in 0..<numObjects {
             guard objOffset + 8 <= bytes.count else { break }
-            let objectID = Int(UInt32(bytes[objOffset])     << 8 | UInt32(bytes[objOffset + 1]))
-            // bytes[objOffset + 2] = window_id (skip)
-            let cropFlag = bytes[objOffset + 3]
-            let x        = Int(UInt32(bytes[objOffset + 4]) << 8 | UInt32(bytes[objOffset + 5]))
-            let y        = Int(UInt32(bytes[objOffset + 6]) << 8 | UInt32(bytes[objOffset + 7]))
+            let objectID  = Int(UInt32(bytes[objOffset])     << 8 | UInt32(bytes[objOffset + 1]))
+            let windowID  = Int(bytes[objOffset + 2])
+            let cropFlags = bytes[objOffset + 3]
+            let x         = Int(UInt32(bytes[objOffset + 4]) << 8 | UInt32(bytes[objOffset + 5]))
+            let y         = Int(UInt32(bytes[objOffset + 6]) << 8 | UInt32(bytes[objOffset + 7]))
             objOffset += 8
-            if (cropFlag & 0x80) != 0 { objOffset += 8 }  // skip crop rectangle
-            ds.compositionObjects.append((objectID: objectID, x: x, y: y))
+            if (cropFlags & 0x80) != 0 { objOffset += 8 }  // skip 8-byte crop rectangle
+            if (cropFlags & 0x40) != 0 { ds.forcedObjectIDs.insert(objectID) }  // Sprint 38: forced_on_flag
+            ds.compositionObjects.append((objectID: objectID, windowID: windowID, x: x, y: y))
         }
     }
+
+    // MARK: - Private: WDS  (Sprint 38)
+
+    private static func parseWDS(data: Data, into ds: inout DisplaySet) {
+        // WDS layout:
+        //   [0]     number_of_windows
+        //   Per window (9 bytes):
+        //     [0]     window_id
+        //     [1..2]  window_horizontal_position  (x)
+        //     [3..4]  window_vertical_position    (y)
+        //     [5..6]  window_width
+        //     [7..8]  window_height
+        guard data.count >= 1 else { return }
+        let bytes = [UInt8](data)
+        let numWindows = Int(bytes[0])
+        var idx = 1
+        for _ in 0..<numWindows {
+            guard idx + 9 <= bytes.count else { break }
+            let windowID = Int(bytes[idx])
+            let x        = Int(UInt16(bytes[idx + 1]) << 8 | UInt16(bytes[idx + 2]))
+            let y        = Int(UInt16(bytes[idx + 3]) << 8 | UInt16(bytes[idx + 4]))
+            let w        = Int(UInt16(bytes[idx + 5]) << 8 | UInt16(bytes[idx + 6]))
+            let h        = Int(UInt16(bytes[idx + 7]) << 8 | UInt16(bytes[idx + 8]))
+            if w > 0, h > 0 {
+                ds.windowRects[windowID] = CGRect(x: x, y: y, width: w, height: h)
+            }
+            idx += 9
+        }
+    }
+
+    // MARK: - Private: PDS
 
     private static func parsePDS(data: Data, offset: inout Int, size: Int, into ds: inout DisplaySet) {
         // PDS layout:
@@ -172,6 +259,8 @@ struct PGSParser {
             idx += 5
         }
     }
+
+    // MARK: - Private: ODS
 
     private static func parseODS(data: Data, offset: inout Int, size: Int,
                                  into ds: inout DisplaySet,
@@ -225,6 +314,8 @@ struct PGSParser {
             fragments[objectID] = existing
         }
     }
+
+    // MARK: - Private: RLE decoder
 
     private static func decodeRLE(data: Data, width: Int, height: Int) -> [UInt8]? {
         guard width > 0, height > 0 else { return nil }

@@ -1,5 +1,9 @@
 // MARK: - PlayerLab / Subtitle / PGSSubtitleController
 // Sprint 28 — Cue-timing manager for PGS bitmap subtitle overlay.
+// Sprint 39 — clearCurrentCue(reason:) added for immediate seek clearing.
+// Sprint 40 — Forced-cue auto-display: when all loaded cues carry isForced,
+//             the controller shows them even if no track has been explicitly
+//             selected (e.g. foreign-language insets in an English film).
 //
 // Mirrors PlayerLabSubtitleController structure: search-hint optimization,
 // backwards-seek detection, same update semantics.
@@ -19,6 +23,11 @@ final class PGSSubtitleController: ObservableObject {
     private var cues: [PGSCue] = []
     private var searchHint: Int = 0
 
+    // Sprint 40: set in loadCues() when every loaded cue has isForced == true.
+    // When true, update(forTime:) bypasses the selectedTrack guard so forced
+    // subtitles always appear regardless of user subtitle preferences.
+    private var allCuesAreForced: Bool = false
+
     // MARK: - Track Management
 
     func setAvailableTracks(_ tracks: [SubtitleTrackDescriptor]) {
@@ -26,10 +35,21 @@ final class PGSSubtitleController: ObservableObject {
     }
 
     func loadCues(_ newCues: [PGSCue], for track: SubtitleTrackDescriptor?) {
-        self.cues = newCues
+        self.cues       = newCues
         self.selectedTrack = track
         self.searchHint = 0
         self.currentCue = nil
+
+        // Sprint 40: detect all-forced cue set (e.g. Japanese insets on a
+        // Japanese-language Blu-ray).  Log once at load time so the decision
+        // is visible in the debug log; no repeated noise during playback.
+        let forced = !newCues.isEmpty && newCues.allSatisfy { $0.isForced }
+        self.allCuesAreForced = forced
+        if forced {
+            fputs("[PGSSubtitleController] [Sprint40] "
+                + "All \(newCues.count) cue(s) are forced — "
+                + "enabling forced display regardless of track selection\n", stderr)
+        }
     }
 
     func selectOff() {
@@ -40,7 +60,14 @@ final class PGSSubtitleController: ObservableObject {
     // MARK: - Time Update
 
     func update(forTime time: TimeInterval) {
-        guard !cues.isEmpty, selectedTrack != nil else {
+        guard !cues.isEmpty else {
+            currentCue = nil
+            return
+        }
+
+        // Sprint 40: show cues when a track is explicitly selected, OR when
+        // every cue in the loaded set is forced (mandatory display).
+        guard selectedTrack != nil || allCuesAreForced else {
             currentCue = nil
             return
         }
@@ -87,12 +114,26 @@ final class PGSSubtitleController: ObservableObject {
         }
     }
 
+    // MARK: - Sprint 39: Seek clearing
+
+    /// Immediately clears the currently displayed cue.
+    ///
+    /// Called during seek Phase 2 (flush) so no stale PGS frame lingers on
+    /// screen between the flush and the first post-seek `update(forTime:)` call
+    /// (which otherwise arrives up to 250 ms later).
+    func clearCurrentCue(reason: String) {
+        guard currentCue != nil else { return }
+        fputs("[PGSSubtitleController] Clearing current cue — \(reason)\n", stderr)
+        currentCue = nil
+    }
+
     // MARK: - Reset
 
     func reset() {
         cues.removeAll()
-        selectedTrack = nil
-        currentCue = nil
-        searchHint = 0
+        selectedTrack    = nil
+        currentCue       = nil
+        searchHint       = 0
+        allCuesAreForced = false
     }
 }
