@@ -1,6 +1,7 @@
 // MARK: - PlayerLab / Subtitle / SubtitleTrackDescriptor
 //
 // Sprint 26 — Subtitle track metadata model.
+// Sprint 28 — isPGS for bitmap subtitle support.
 // Container-agnostic descriptor for one subtitle track.
 //
 // Sources:
@@ -38,6 +39,9 @@ struct SubtitleTrackDescriptor: Identifiable {
     var isSRTCompatible: Bool {
         codecID == "S_TEXT/UTF8" || codecID == "external/srt"
     }
+
+    /// True if this track contains PGS bitmap subtitles.
+    var isPGS: Bool { codecID == "S_HDMV/PGS" }
 
     /// True if this is an externally-loaded file (not embedded in the container).
     var isExternal: Bool { codecID.hasPrefix("external/") }

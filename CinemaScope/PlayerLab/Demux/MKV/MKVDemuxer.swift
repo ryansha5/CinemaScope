@@ -7,6 +7,9 @@
 // Sprint 25 — Audio preference policy + pre-selection API for restart-based track switching
 // Sprint 26 — Subtitle track detection (S_TEXT/UTF8) and cue extraction
 // Sprint 27 — Chapter parsing (MKV Chapters / EditionEntry / ChapterAtom)
+// Sprint 28 — PGS subtitle track detection, packet extraction, and cue decoding
+// Sprint 29 — TrueHD/DTS/DTS-HD audio track detection and classification
+// Sprint 30 — DTS fix for B-frame H.264 (dts:.invalid for video packets)
 //
 // Architecture (unchanged from Sprint 20):
 //   parse()  → EBML validation → Segment → Info + Tracks + Chapters → scanClusters
@@ -41,7 +44,22 @@ struct MKVAudioTrackDescriptor {
     var isAAC:  Bool { codecID == "A_AAC" || codecID.hasPrefix("A_AAC/") }
     var isAC3:  Bool { codecID == "A_AC3"  }
     var isEAC3: Bool { codecID == "A_EAC3" }
+    var isTrueHD: Bool { codecID == "A_TRUEHD" }
+    var isDTS:    Bool { codecID == "A_DTS" || codecID.hasPrefix("A_DTS") }
+
     var isSupported: Bool { isAAC || isAC3 || isEAC3 }
+
+    /// Sprint 29: three-tier classification for audio selection logging.
+    enum Classification {
+        case supported          // AAC, AC3, EAC3 — can be decoded by PlayerLab
+        case unsupportedKnown   // TrueHD, DTS, DTS-HD — recognized but not yet supported
+        case unknown            // codec ID not recognized
+    }
+    var classification: Classification {
+        if isSupported                         { return .supported }
+        if isTrueHD || isDTS                   { return .unsupportedKnown }
+        return .unknown
+    }
 }
 
 // MARK: - Private frame / block types
@@ -69,6 +87,13 @@ private struct RawBlockInfo {
     let durationTicks: Int64?   // Sprint 26: from BlockDuration; nil for SimpleBlock
 }
 
+/// Sprint 28: raw PGS block collected during cluster scan, before CGImage decode.
+private struct PGSRawPacket {
+    let pts:    CMTime
+    let endPTS: CMTime?   // from BlockDuration when present
+    let data:   Data
+}
+
 // MARK: - Private track model
 
 private struct MKVTrackInfo {
@@ -93,6 +118,7 @@ private struct MKVTrackInfo {
     var isEAC3:  Bool { codecID == "A_EAC3" }
     var isAudioSupported: Bool { isAAC || isAC3 || isEAC3 }
     var isSRTText: Bool { codecID == "S_TEXT/UTF8" }  // Sprint 26
+    var isPGS: Bool { codecID == "S_HDMV/PGS" }    // Sprint 28
 }
 
 // MARK: - MKVDemuxError
@@ -139,6 +165,10 @@ final class MKVDemuxer {
     // Sprint 27
     private(set) var chapters: [ChapterInfo] = []
 
+    // Sprint 28: PGS bitmap subtitle state
+    private(set) var pgsCues:         [PGSCue]                = []
+    private(set) var selectedPGSTrack: SubtitleTrackDescriptor? = nil
+
     // MARK: - Sprint 25: preference pre-selection API
     //
     // Set these before calling parse().  They override the built-in heuristic
@@ -162,6 +192,7 @@ final class MKVDemuxer {
 
     private var frameIndex:      [MKVFrameInfo]      = []
     private var audioFrameIndex: [MKVAudioFrameInfo] = []
+    private var pgsRawPackets: [PGSRawPacket] = []
 
     private var timecodeScaleNS:     UInt64      = 1_000_000
     private let outputTimescale:     CMTimeScale = 1_000
@@ -244,8 +275,22 @@ final class MKVDemuxer {
                 policy: preferencePolicy)
             log("  ✅ Audio: track \(a.trackNumber) \(a.codecID) "
               + "ch=\(a.channelCount) sr=\(Int(a.sampleRate)) lang=\(a.language) — \(reason)")
-        } else {
-            log("  ℹ️ No supported audio track")
+        }
+
+        // Sprint 29: log available tracks with TrueHD/DTS classification
+        for t in availableAudioTracks {
+            switch t.classification {
+            case .supported:
+                log("    [Audio] track \(t.trackNumber): \(t.codecID) ch=\(t.channelCount) sr=\(Int(t.sampleRate)) lang=\(t.language)\(t.isDefault ? " [default]" : "") ✅ supported")
+            case .unsupportedKnown:
+                log("    [Audio] track \(t.trackNumber): \(t.codecID) — ⚠️ recognized but not supported (TrueHD/DTS)")
+            case .unknown:
+                log("    [Audio] track \(t.trackNumber): \(t.codecID) — ❓ unknown codec")
+            }
+        }
+        let allUnsupported = availableAudioTracks.allSatisfy { !$0.isSupported }
+        if allUnsupported && !availableAudioTracks.isEmpty {
+            log("  ⚠️ [Sprint29] All audio tracks are unsupported (TrueHD/DTS/unknown) — video-only playback. Future: implement passthrough or decode path.")
         }
 
         // ── Subtitle track discovery (Sprint 26) ─────────────────────────────
@@ -273,13 +318,35 @@ final class MKVDemuxer {
             log("  ℹ️ \(allSubtitleMKVTracks.count) subtitle track(s) found — none auto-selected")
         }
 
+        // ── PGS subtitle track discovery (Sprint 28) ──────────────────────────────────────
+        // Auto-select: forced PGS > default PGS > first PGS.
+        // PGS and SRT are independent; both can be scanned simultaneously.
+        let selectedPGSMKVTrack: MKVTrackInfo? = {
+            if let t = allSubtitleMKVTracks.first(where: { $0.isPGS && $0.flagForced  }) { return t }
+            if let t = allSubtitleMKVTracks.first(where: { $0.isPGS && $0.flagDefault }) { return t }
+            if let t = allSubtitleMKVTracks.first(where: { $0.isPGS                   }) { return t }
+            return nil
+        }()
+        if let pgs = selectedPGSMKVTrack {
+            selectedPGSTrack = availableSubtitleTracks.first { $0.trackNumber == pgs.trackNumber }
+            log("  ✅ PGS: track \(pgs.trackNumber) lang=\(pgs.language)")
+        }
+
         // ── Scan clusters ─────────────────────────────────────────────────────
         try await scanClusters(inSegment:        segmentOffset,
                                 videoTrackNumber: videoMKVTrack.trackNumber,
                                 audioTrackNumber: selectedAudioMKVTrack?.trackNumber,
-                                subtitleTrackNum: selectedSubMKVTrack?.trackNumber)
+                                subtitleTrackNum: selectedSubMKVTrack?.trackNumber,
+                                pgsTrackNum:      selectedPGSMKVTrack?.trackNumber)
+
+        // Sprint 28: decode collected raw PGS packets into bitmap cues
+        if !pgsRawPackets.isEmpty {
+            pgsCues = await processPGSPackets(pgsRawPackets)
+            log("  ✅ PGS: \(pgsCues.count) cue(s) decoded from \(pgsRawPackets.count) packets")
+        }
+
         log("  ✅ Indexed \(frameIndex.count) video / \(audioFrameIndex.count) audio / "
-          + "\(subtitleCues.count) subtitle frames")
+          + "\(subtitleCues.count) SRT / \(pgsCues.count) PGS subtitle frames")
 
         // ── Build video TrackInfo ─────────────────────────────────────────────
         let codecFourCC = videoMKVTrack.isH264 ? "avc1" : "hev1"
@@ -559,12 +626,14 @@ final class MKVDemuxer {
     private func scanClusters(inSegment segOffset: Int64,
                                videoTrackNumber: UInt64,
                                audioTrackNumber: UInt64?,
-                               subtitleTrackNum: UInt64?) async throws {    // Sprint 26
+                               subtitleTrackNum: UInt64?,
+                               pgsTrackNum: UInt64?) async throws {    // Sprint 26/28
         frameIndex.removeAll()
         frameIndex.reserveCapacity(8_000)
         audioFrameIndex.removeAll()
         audioFrameIndex.reserveCapacity(16_000)
         subtitleCues.removeAll()   // Sprint 26
+        pgsRawPackets.removeAll()   // Sprint 28
 
         var cursor = segOffset
         let limit  = reader.contentLength
@@ -578,7 +647,8 @@ final class MKVDemuxer {
                                        end:           clusterEnd,
                                        videoTrackNum: videoTrackNumber,
                                        audioTrackNum: audioTrackNumber,
-                                       subtitleTrackNum: subtitleTrackNum)
+                                       subtitleTrackNum: subtitleTrackNum,
+                                       pgsTrackNum: pgsTrackNum)
             }
             let total = Int64(hdrBytes) + (elem.payloadSize >= 0 ? elem.payloadSize : 0)
             if total <= 0 { break }
@@ -592,7 +662,8 @@ final class MKVDemuxer {
     private func parseCluster(at start: Int64, end: Int64,
                                videoTrackNum: UInt64,
                                audioTrackNum: UInt64?,
-                               subtitleTrackNum: UInt64?) async throws {
+                               subtitleTrackNum: UInt64?,
+                               pgsTrackNum: UInt64?) async throws {
         var clusterTimecode: Int64 = 0
         var cursor = start
 
@@ -635,6 +706,9 @@ final class MKVDemuxer {
                 } else if let stn = subtitleTrackNum, raw.trackNum == stn {
                     // Sprint 26: read subtitle text payload inline
                     await appendSubtitleCue(from: raw, clusterTC: clusterTimecode)
+                } else if let ptn = pgsTrackNum, raw.trackNum == ptn {
+                    // Sprint 28: collect raw PGS bytes for post-processing
+                    await appendPGSPacket(from: raw, clusterTC: clusterTimecode)
                 }
             }
 
@@ -811,6 +885,69 @@ final class MKVDemuxer {
         subtitleCues.append(SubtitleCue(startTime: pts, endTime: endPTS, rawText: text))
     }
 
+    // MARK: - PGS Packet Collection  (Sprint 28)
+    //
+    // Unlike SRT (plain text, decoded inline), PGS packets require CGImage decode
+    // which is deferred to processPGSPackets() after the full cluster scan.
+
+    private func appendPGSPacket(from raw: RawBlockInfo, clusterTC: Int64) async {
+        guard raw.dataSize > 0 else { return }
+        let pts = makePTS(clusterTC: clusterTC, relTC: raw.relTC)
+        let endPTS: CMTime?
+        if let dticks = raw.durationTicks, dticks > 0 {
+            let durationMS = Int64(Double(dticks) * Double(timecodeScaleNS) / 1_000_000.0)
+            endPTS = CMTimeAdd(pts, CMTime(value: durationMS, timescale: outputTimescale))
+        } else {
+            endPTS = nil
+        }
+        guard let data = try? await reader.read(offset: raw.dataOffset, length: raw.dataSize)
+        else { return }
+        pgsRawPackets.append(PGSRawPacket(pts: pts, endPTS: endPTS, data: data))
+    }
+
+    // MARK: - PGS Post-processing  (Sprint 28)
+    //
+    // Converts raw PGS byte payloads into fully-decoded PGSCue objects.
+    // End time: use BlockDuration when present; otherwise derive from next packet's PTS;
+    // fallback to +5 s.
+
+    private func processPGSPackets(_ packets: [PGSRawPacket]) async -> [PGSCue] {
+        guard !packets.isEmpty else { return [] }
+        var cues = [PGSCue]()
+        cues.reserveCapacity(packets.count / 2)
+
+        for i in 0..<packets.count {
+            let pkt = packets[i]
+            let ds  = PGSParser.parseDisplaySet(data: pkt.data)
+            guard ds.hasBitmap,
+                  let (img, rect) = PGSParser.makeImage(from: ds)
+            else { continue }
+
+            let endTime: CMTime
+            if let explicit = pkt.endPTS {
+                endTime = explicit
+            } else if i + 1 < packets.count {
+                endTime = packets[i + 1].pts
+            } else {
+                endTime = CMTimeAdd(pkt.pts, CMTime(seconds: 5, preferredTimescale: outputTimescale))
+            }
+            cues.append(PGSCue(id:         UUID(),
+                                startTime:  pkt.pts,
+                                endTime:    endTime,
+                                image:      img,
+                                videoSize:  CGSize(width:  ds.videoWidth, height: ds.videoHeight),
+                                objectRect: rect))
+            fputs("[MKVDemuxer][PGS] Cue at \(String(format: "%.3f", pkt.pts.seconds))s "
+                + "size=\(cgImageDims(img))  rect=\(Int(rect.origin.x)),\(Int(rect.origin.y))"
+                + "+\(Int(rect.width))×\(Int(rect.height))\n", stderr)
+        }
+        return cues
+    }
+
+    private func cgImageDims(_ img: CGImage) -> String {
+        "\(img.width)×\(img.height)"
+    }
+
     // MARK: - Timestamp helpers
 
     private func makePTS(clusterTC: Int64, relTC: Int16) -> CMTime {
@@ -882,9 +1019,14 @@ final class MKVDemuxer {
                 let sliceOff = Int(loc.fileOff - runOff)
                 guard sliceOff + loc.size <= chunk.count else { continue }
                 let data = chunk.subdata(in: sliceOff..<(sliceOff + loc.size))
+                // Sprint 30: pass dts:.invalid for video so AVSampleBufferDisplayLayer
+                // handles B-frame reordering from the presentation timestamps, rather
+                // than assuming decode_time == presentation_time.
+                // Audio dts == pts is correct (no reordering needed).
+                let dts: CMTime = streamType == .video ? .invalid : frame.pts
                 packets.append(DemuxPacket(
                     streamType: streamType, index: loc.idx,
-                    pts: frame.pts, dts: frame.pts, data: data,
+                    pts: frame.pts, dts: dts, data: data,
                     isKeyframe: frame.isKeyframe, byteOffset: loc.fileOff,
                     duration: duration
                 ))

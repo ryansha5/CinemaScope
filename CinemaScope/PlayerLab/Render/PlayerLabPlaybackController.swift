@@ -17,6 +17,9 @@
 // Sprint 25  — Audio track switching (restart-based) + AudioPreferencePolicy wiring
 // Sprint 26  — Subtitle integration: PlayerLabSubtitleController, time-tracking cue updates
 // Sprint 27  — Chapter parsing, seekToChapter(), onPlaybackEnded() transport polish
+// Sprint 28  — PGS subtitle support and PGSSubtitleController integration
+// Sprint 29  — TrueHD/DTS audio classification and logging
+// Sprint 30  — State transition logging, restart() from .ended fix, dts:.invalid for B-frame H.264
 //
 // Architecture (Sprints 16–19):
 //   prepare()  → parse metadata + load initial window (3 s) → .ready
@@ -171,6 +174,9 @@ final class PlayerLabPlaybackController: ObservableObject {
     /// Cue-timing controller.  Updated every 250 ms by the time-tracking loop.
     let subtitleController = PlayerLabSubtitleController()
 
+    // Sprint 28: PGS bitmap subtitle controller
+    let pgsController = PGSSubtitleController()
+
     // MARK: - Format descriptions
 
     private var videoFormatDesc: CMVideoFormatDescription?
@@ -270,7 +276,7 @@ final class PlayerLabPlaybackController: ObservableObject {
         videoBuffered        = 0
         audioBuffered        = 0
 
-        // Sprint 25/26/27: reset track / subtitle / chapter state
+        // Sprint 25/26/27/28: reset track / subtitle / chapter state
         // If this is a completely new URL, discard any per-file audio preference.
         if url != currentURL { requestedAudioTrackNumber = nil }
         currentURL          = url
@@ -278,6 +284,7 @@ final class PlayerLabPlaybackController: ObservableObject {
         selectedAudioTrack   = nil
         chapters             = []
         subtitleController.reset()
+        pgsController.reset()
 
         renderer.flushAll()
         stopFeedLoop()
@@ -374,6 +381,15 @@ final class PlayerLabPlaybackController: ObservableObject {
             } else if !mkv.availableSubtitleTracks.isEmpty {
                 record("[Subtitle] \(mkv.availableSubtitleTracks.count) track(s) found "
                      + "but none SRT-compatible — subtitles off")
+            }
+
+            // Sprint 28: PGS subtitle setup
+            if let pgsTrack = mkv.selectedPGSTrack, !mkv.pgsCues.isEmpty {
+                pgsController.setAvailableTracks(mkv.availableSubtitleTracks)
+                pgsController.loadCues(mkv.pgsCues, for: pgsTrack)
+                record("[PGS] \(mkv.pgsCues.count) cue(s) loaded for '\(pgsTrack.displayLabel)'")
+            } else if mkv.availableSubtitleTracks.contains(where: { $0.isPGS }) {
+                record("[PGS] PGS track(s) found but no cues decoded — unsupported or empty")
             }
 
             // Sprint 27: chapters
@@ -524,7 +540,7 @@ final class PlayerLabPlaybackController: ObservableObject {
              + "buffered≈\(String(format: "%.1f", lastEnqueuedVideoPTS - startPTS.seconds))s  "
              + "v_idx=\(nextVideoSampleIdx)/\(videoSamplesTotal)")
 
-        state = .ready
+        transition(to: .ready, "initial window loaded")
         record("✅ Ready — initial window loaded, feed loop will handle the rest")
     }
 
@@ -534,13 +550,13 @@ final class PlayerLabPlaybackController: ObservableObject {
         switch state {
         case .ready:
             renderer.play(from: startPTS)
-            state = .playing
+            transition(to: .playing, "play()")
             startFeedLoop()
             startTimeTracking()
             record("▶ play() — synchronizer at PTS=\(String(format: "%.4f", startPTS.seconds))s")
         case .paused:
             renderer.resume()
-            state = .playing
+            transition(to: .playing, "resume()")
             startFeedLoop()       // resume feeding (Sprint 17)
             startTimeTracking()
             record("▶ resume() — feed loop restarted")
@@ -554,7 +570,7 @@ final class PlayerLabPlaybackController: ObservableObject {
         // If buffering, synchronizer is already rate=0; renderer.pause() is harmless.
         renderer.pause()
         stopFeedLoop()
-        state = .paused
+        transition(to: .paused, "pause()")
         stopTimeTracking()
         record("⏸ pause() — feed loop stopped, queues preserved")
     }
@@ -566,7 +582,7 @@ final class PlayerLabPlaybackController: ObservableObject {
         demuxer            = nil
         mkvDemuxer         = nil
         detectedContainer  = "—"
-        state              = .idle
+        transition(to: .idle, "stop()")
         framesLoaded       = 0
         hasAudio           = false
         detectedCodec      = "—"
@@ -575,12 +591,13 @@ final class PlayerLabPlaybackController: ObservableObject {
         videoBuffered      = 0
         audioBuffered      = 0
         currentTimeFloor   = 0
-        // Sprint 25/26/27
+        // Sprint 25/26/27/28
         availableAudioTracks    = []
         selectedAudioTrack      = nil
         requestedAudioTrackNumber = nil
         chapters                = []
         subtitleController.reset()
+        pgsController.reset()
         record("⏹ stop() — renderer + feed loop cleared")
     }
 
@@ -683,6 +700,9 @@ final class PlayerLabPlaybackController: ObservableObject {
 
     func restart() async {
         let wasPlaying = (state == .playing || state == .ended)
+        // Sprint 30: seek() guards canSeek which excludes .ended.
+        // Transition to .paused first so cursors are properly reset.
+        if state == .ended { state = .paused }
         await seek(toFraction: 0)
         // If ended or paused, force play after seek-to-0
         if wasPlaying, state != .playing {
@@ -756,7 +776,7 @@ final class PlayerLabPlaybackController: ObservableObject {
         // aggressively until resumeThreshold is reached.
 
         if state == .playing && buffered < underrunThreshold {
-            state = .buffering
+            transition(to: .buffering, "underrun \(String(format: "%.2f", buffered))s")
             renderer.synchronizer.rate = 0     // freeze clock, keep position
             record("[Buffer] video=\(String(format: "%.2f", buffered))s  "
                  + "audio=\(String(format: "%.2f", audioBuffered))s → ENTER BUFFERING")
@@ -781,7 +801,7 @@ final class PlayerLabPlaybackController: ObservableObject {
             videoBuffered = newBuf
 
             if newBuf >= resumeThreshold {
-                state = .playing
+                transition(to: .playing, "buffer recovered \(String(format: "%.2f", newBuf))s")
                 // Resume clock at current media position (rate 1, time unchanged).
                 renderer.synchronizer.setRate(1, time: renderer.currentTime)
                 record("[Buffer] video=\(String(format: "%.2f", newBuf))s → RESUME PLAYBACK")
@@ -979,6 +999,8 @@ final class PlayerLabPlaybackController: ObservableObject {
                     self.currentTime = ct.seconds
                     // Sprint 26: push playhead to subtitle controller every 250 ms
                     self.subtitleController.update(forTime: ct.seconds)
+                    // Sprint 28: update PGS cue timing
+                    self.pgsController.update(forTime: ct.seconds)
                 }
             }
         }
@@ -1288,7 +1310,8 @@ final class PlayerLabPlaybackController: ObservableObject {
         stopFeedLoop()
         stopTimeTracking()
         subtitleController.selectOff()   // clear any lingering cue from screen
-        state = .ended
+        pgsController.selectOff()
+        transition(to: .ended, "end of stream")
         record("⏹ Playback ended — all \(videoSamplesTotal) video samples delivered")
     }
 
@@ -1327,6 +1350,15 @@ final class PlayerLabPlaybackController: ObservableObject {
         let t = currentTime
         // Walk backwards: last chapter whose startTime ≤ currentTime
         return chapters.last { $0.startTime.seconds <= t }
+    }
+
+    // MARK: - Sprint 30: State transition helper (logs every transition)
+
+    private func transition(to newState: State, _ reason: String = "") {
+        guard state != newState else { return }
+        let reasonStr = reason.isEmpty ? "" : " — \(reason)"
+        record("[State] \(state.statusLabel) → \(newState.statusLabel)\(reasonStr)")
+        state = newState
     }
 
     // MARK: - Logging / helpers

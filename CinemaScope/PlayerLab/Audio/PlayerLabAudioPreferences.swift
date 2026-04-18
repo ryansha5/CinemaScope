@@ -80,6 +80,31 @@ struct AudioTrackSelector {
         return supported.max(by: { score($0, policy: policy) < score($1, policy: policy) })
     }
 
+    // MARK: - Sprint 29: Strategy documentation
+    //
+    // TrueHD and DTS/DTS-HD tracks are detected by MKVAudioTrackDescriptor.classification
+    // but are NOT decoded by PlayerLab.  Future options:
+    //
+    //   TrueHD:
+    //     • Apple does not expose a public TrueHD decoder.
+    //     • Option A: Extract core AC3 (many TrueHD streams contain an embedded AC3 core).
+    //     • Option B: HDMI passthrough via AVAudioSession (.playAndRecord + HDMI route).
+    //     • Option C: Software decode using a third-party library (out of scope).
+    //
+    //   DTS / DTS-HD:
+    //     • DTS-Core (DTS) IS supported via kAudioFormatDTS on supported hardware.
+    //     • DTS-HD MA (lossless) has no Apple decoder path; fall back to DTS-Core.
+    //     • kAudioFormatDTS requires hardware support (ATV, Mac with HDMI out).
+    //     • Recommend: detect DTS-Core availability at runtime; fall back to video-only.
+    //
+    //   Recommended implementation order (future sprints):
+    //     1. DTS-Core passthrough (highest impact, partial framework support)
+    //     2. TrueHD→AC3 core extraction
+    //     3. TrueHD HDMI passthrough
+    //
+    //   Until implemented, AudioTrackSelector.select() skips these tracks entirely
+    //   (isSupported = false), and PlayerLab falls back to video-only playback.
+
     // MARK: - Reason string (for structured logging)
 
     /// Human-readable explanation of why `track` was selected under `policy`.

@@ -41,6 +41,10 @@ struct PlayerLabPlayerView: View {
             SubtitleView(cue: controller.subtitleController.currentCue)
                 .ignoresSafeArea()
 
+            // Sprint 28: PGS bitmap subtitle overlay
+            PGSSubtitleView(cue: controller.pgsController.currentCue)
+                .ignoresSafeArea()
+
             VStack(spacing: 0) {
                 Spacer()
                 bottomHUD
