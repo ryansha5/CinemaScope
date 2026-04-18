@@ -771,9 +771,10 @@ final class MKVDemuxer {
     // NOT scaled by TimecodeScale.  Spec: ChapterTimeStart/End are uint64 ns.
 
     private func parseChapters(at offset: Int64) async throws -> [ChapterInfo] {
-        // Scan the Chapters element for EditionEntry children
-        struct RawChapter { var title: String; var startNS: UInt64; var endNS: UInt64? }
-        var raw = [RawChapter]()
+        // Scan the Chapters element for EditionEntry children.
+        // Use the same named-tuple type that parseEditionAtoms returns so
+        // append(contentsOf:) resolves without a struct↔tuple conversion.
+        var raw = [(title: String, startNS: UInt64, endNS: UInt64?)]()
 
         let limit  = min(reader.contentLength, offset + 131_072)
         var cursor = offset
