@@ -184,16 +184,16 @@ enum ContainerPreparation {
         // audio-track decisions.  Its log messages replace the old ad-hoc audio
         // log block that was here before Sprint 31.
 
-        let audioDecision = PremiumAudioPolicy.decide(
+        var policyDecision = PremiumAudioPolicy.decide(
             tracks:               mkv.availableAudioTracks,
             preferredTrackNumber: preferredAudioTrack,
             preferencePolicy:     audioPolicy
         )
-        logs.append(contentsOf: audioDecision.logMessages)
+        logs.append(contentsOf: policyDecision.logMessages)
 
         // Sprint 32: if the policy wants a different track than the demuxer chose,
         // call reselectAudio to rebuild the audio index with the correct track.
-        let policyTrackNumber = audioDecision.selectedTrackNumber
+        let policyTrackNumber = policyDecision.selectedTrackNumber
         if policyTrackNumber != mkv.selectedAudioTrackNumber {
             if let newTrack = policyTrackNumber {
                 logs.append("[Audio] Policy overrides demuxer selection → rescan for track \(newTrack)")
@@ -206,6 +206,44 @@ enum ContainerPreparation {
                 logs.append("  ⚠️ reselectAudio failed: \(error.localizedDescription) — keeping demuxer selection")
             }
         }
+
+        // ── Sprint 34: TrueHD → AC3 Core probe ───────────────────────────────
+        //
+        // When the initial decision is fallbackToAVPlayer, check whether a
+        // TrueHD track carries an embedded AC3 core we can extract inline.
+        // If the probe succeeds, we override the decision to .useTrueHDAC3Core
+        // and stay in PlayerLab.  If it fails, fallbackToAVPlayer stands.
+
+        if case .fallbackToAVPlayer = policyDecision.action,
+           let trueHDTrackNum = PremiumAudioPolicy.trueHDTrackToProbe(in: mkv.availableAudioTracks) {
+
+            logs.append("[Audio] A_TRUEHD detected (track \(trueHDTrackNum)) — probing for embedded AC3 core")
+
+            // Reselect audio index to the TrueHD track so probeTrueHDForAC3 has frames to check.
+            do {
+                try await mkv.reselectAudio(trackNumber: trueHDTrackNum)
+            } catch {
+                logs.append("  ⚠️ reselectAudio (TrueHD probe) failed: \(error.localizedDescription)")
+            }
+
+            let probeFound = await mkv.probeTrueHDForAC3(trackNumber: trueHDTrackNum)
+
+            if probeFound,
+               let trueHDDesc = mkv.availableAudioTracks.first(where: { $0.trackNumber == trueHDTrackNum }) {
+                logs.append("[Audio] AC3 core confirmed — enabling TrueHD AC3 extraction (track \(trueHDTrackNum))")
+                mkv.enableTrueHDAC3Extraction(
+                    channelCount: trueHDDesc.channelCount,
+                    sampleRate:   trueHDDesc.sampleRate
+                )
+                let overrideAction: AudioPlaybackAction = .useTrueHDAC3Core(trackNumber: trueHDTrackNum)
+                policyDecision = AudioPlaybackDecision(action: overrideAction,
+                                                        logMessages: policyDecision.logMessages)
+            } else {
+                logs.append("[Audio] TrueHD probe: no usable AC3 core found — routing to AVPlayer")
+            }
+        }
+
+        let audioDecision = policyDecision
 
         if mkv.availableAudioTracks.isEmpty {
             logs.append("  ℹ️ No audio tracks in MKV")

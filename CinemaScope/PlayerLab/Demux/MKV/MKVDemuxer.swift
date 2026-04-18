@@ -229,6 +229,15 @@ final class MKVDemuxer {
     private var pgsTrackNum_:      UInt64?       = nil
     private var parsedMKVTracks_:  [MKVTrackInfo] = []
 
+    // MARK: - Sprint 34: TrueHD → AC3 core extraction mode
+    //
+    // When enabled, extractAudioPackets() pipes each TrueHD packet through
+    // TrueHDCoreExtractor and returns only the extracted AC3 frame.
+    // Packets with no embedded AC3 frame are silently dropped.
+    // The audioTrack codecFourCC is updated to "ac-3" by enableTrueHDAC3Extraction().
+
+    private var truehDAC3Mode: Bool = false
+
     // MARK: - Init
 
     init(reader: MediaReader) {
@@ -529,6 +538,78 @@ final class MKVDemuxer {
         log("  ✅ [reselectAudio] track \(trackNum) (\(audioFourCC))  "
           + "\(audioFrameIndex.count) audio / \(frameIndex.count) video / "
           + "\(subtitleCues.count) SRT / \(pgsCues.count) PGS frames")
+    }
+
+    // MARK: - Sprint 34: TrueHD → AC3 Core probe + extraction enablement
+
+    /// Lightweight probe: reads the first `maxChecks` audio block payloads from
+    /// the TrueHD track and checks each one for an embedded AC3 sync word.
+    ///
+    /// Returns `true` if at least one packet contains an AC3 frame.
+    /// The demuxer state is not modified; call `enableTrueHDAC3Extraction` to
+    /// activate extraction mode.
+    ///
+    /// - Parameters:
+    ///   - trackNumber: The A_TRUEHD track number to probe (must be in audioFrameIndex).
+    ///   - maxChecks:   Maximum number of audio packets to inspect (default 10).
+    func probeTrueHDForAC3(trackNumber: UInt64, maxChecks: Int = 10) async -> Bool {
+        guard !audioFrameIndex.isEmpty else { return false }
+        // Run through first maxChecks frames from the audio index.
+        let checkCount = min(maxChecks, audioFrameIndex.count)
+        for i in 0..<checkCount {
+            let frame = audioFrameIndex[i]
+            guard frame.size > 0 else { continue }
+            guard let data = try? await reader.read(offset: frame.fileOffset, length: frame.size)
+            else { continue }
+            if TrueHDCoreExtractor.hasAC3Core(in: data) {
+                log("  [Sprint34] AC3 core found in TrueHD packet \(i) "
+                  + "(track \(trackNumber), size=\(frame.size))")
+                return true
+            }
+        }
+        log("  [Sprint34] No AC3 core found in first \(checkCount) TrueHD packets (track \(trackNumber))")
+        return false
+    }
+
+    /// Enables AC3-core extraction mode for the currently-indexed TrueHD track.
+    ///
+    /// After this call, `extractAudioPackets()` will pipe each TrueHD packet
+    /// through `TrueHDCoreExtractor` and yield only the embedded AC3 frame.
+    /// The `audioTrack` metadata is updated so that `AudioFormatFactory` routes
+    /// to the AC3 path (codecFourCC = "ac-3", 1536 frames/packet).
+    ///
+    /// - Parameters:
+    ///   - channelCount: Channel count from the MKV track descriptor.
+    ///   - sampleRate:   Sample rate from the MKV track descriptor.
+    func enableTrueHDAC3Extraction(channelCount: Int, sampleRate: Double) {
+        truehDAC3Mode        = true
+        audioFramesPerPacket = 1536
+        audioSampleRate      = sampleRate > 0 ? sampleRate : 48_000
+
+        // Rebuild audioTrack with "ac-3" codec so AudioFormatFactory uses the AC3 path.
+        guard let existing = audioTrack else { return }
+        let sr  = sampleRate > 0 ? sampleRate : 48_000
+        let ch  = channelCount > 0 ? UInt16(channelCount) : existing.channelCount
+        let updated = TrackInfo(
+            trackID:         existing.trackID,
+            trackType:       .audio,
+            timescale:       existing.timescale,
+            durationTicks:   existing.durationTicks,
+            sampleCount:     existing.sampleCount,
+            codecFourCC:     "ac-3",
+            displayWidth:    nil,
+            displayHeight:   nil,
+            avcCData:        nil,
+            hvcCData:        nil,
+            esdsData:        nil,
+            channelCount:    ch,
+            audioSampleRate: sr
+        )
+        audioTrack = updated
+        tracks = tracks.filter { $0.trackType != .audio }
+        tracks.append(updated)
+        log("  [Sprint34] TrueHD AC3-extraction enabled — "
+          + "ch=\(channelCount) sr=\(Int(sr)) Hz  codecFourCC→\"ac-3\"")
     }
 
     // MARK: - Segment Search
@@ -1118,16 +1199,44 @@ final class MKVDemuxer {
                                          duration: .invalid)
     }
 
-    // MARK: - Public: extractAudioPackets  (Sprint 22)
+    // MARK: - Public: extractAudioPackets  (Sprint 22 / Sprint 34)
 
     func extractAudioPackets(from startIndex: Int, count: Int) async throws -> [DemuxPacket] {
         guard !audioFrameIndex.isEmpty else { return [] }
         let durTimescale = CMTimeScale(max(1, Int(audioSampleRate)))
         let durPerPacket = CMTime(value: Int64(audioFramesPerPacket), timescale: durTimescale)
-        return try await extractPackets(from: audioFrameIndex.map { ($0.fileOffset, $0.size, $0.pts, true) },
-                                         startIndex: startIndex, count: count,
-                                         streamType: .audio,
-                                         duration: durPerPacket)
+        let raw = try await extractPackets(
+            from:       audioFrameIndex.map { ($0.fileOffset, $0.size, $0.pts, true) },
+            startIndex: startIndex,
+            count:      count,
+            streamType: .audio,
+            duration:   durPerPacket
+        )
+
+        // Sprint 34: TrueHD AC3-core extraction mode.
+        // Each TrueHD packet is scanned for an embedded AC3 sync frame.
+        // Packets with no AC3 core are silently dropped (they carry only TrueHD
+        // extension data).  The extracted AC3 frame replaces the original data,
+        // and the packet's duration is updated to reflect 1536 PCM frames.
+        guard truehDAC3Mode else { return raw }
+
+        var extracted = [DemuxPacket]()
+        extracted.reserveCapacity(raw.count)
+        for pkt in raw {
+            guard let ac3Data = TrueHDCoreExtractor.extractFirstAC3Frame(from: pkt.data)
+            else { continue }   // no AC3 core in this packet — drop it
+            extracted.append(DemuxPacket(
+                streamType: pkt.streamType,
+                index:      pkt.index,
+                pts:        pkt.pts,
+                dts:        pkt.dts,
+                data:       ac3Data,
+                isKeyframe: pkt.isKeyframe,
+                byteOffset: pkt.byteOffset,
+                duration:   durPerPacket
+            ))
+        }
+        return extracted
     }
 
     /// Shared batched-read extraction used by both video and audio.

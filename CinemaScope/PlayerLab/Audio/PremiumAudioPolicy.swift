@@ -1,6 +1,7 @@
 // MARK: - PlayerLab / Audio / PremiumAudioPolicy
 // Sprint 31 — Centralized premium-audio decision layer.
 // Sprint 33 — Extended with DTS-Core passthrough path.
+// Sprint 34 — useTrueHDAC3Core action for embedded AC3 extraction.
 //
 // All premium-audio decisions flow through this file.
 // The controller and ContainerPreparation never embed audio-decision logic
@@ -19,6 +20,8 @@
 //   attemptPassthrough — Sprint 33: DTS-Core track found; attempt hardware
 //                        passthrough via kAudioFormatDTS; may yield silence on
 //                        devices without DTS hardware
+//   useTrueHDAC3Core   — Sprint 34: A_TRUEHD track probed and contains an AC3
+//                        core; extract AC3 frames inline during demux
 //   fallbackToAVPlayer — no playable track exists; caller should route the
 //                        entire file to AVPlayer
 //   videoOnly          — file contains no audio tracks at all
@@ -79,6 +82,11 @@ enum AudioPlaybackAction: Equatable {
     /// Sprint 33: DTS-Core is the best available audio; attempt hardware passthrough.
     case attemptPassthrough(trackNumber: UInt64, codec: String)
 
+    /// Sprint 34: A_TRUEHD track was probed and contains an embedded AC3 core.
+    /// ContainerPreparation enables inline AC3 extraction on the demuxer; the
+    /// controller treats this track like a native AC3 track from this point on.
+    case useTrueHDAC3Core(trackNumber: UInt64)
+
     /// No playable audio track exists in PlayerLab; caller should route to AVPlayer.
     case fallbackToAVPlayer(reason: String)
 
@@ -93,6 +101,7 @@ enum AudioPlaybackAction: Equatable {
         case .useDirect(let n):             return n
         case .useFallback(let n, _, _):     return n
         case .attemptPassthrough(let n, _): return n
+        case .useTrueHDAC3Core(let n):      return n
         default:                            return nil
         }
     }
@@ -105,12 +114,13 @@ enum AudioPlaybackAction: Equatable {
 
     public static func == (lhs: AudioPlaybackAction, rhs: AudioPlaybackAction) -> Bool {
         switch (lhs, rhs) {
-        case (.videoOnly, .videoOnly):                                             return true
-        case (.useDirect(let a), .useDirect(let b)):                               return a == b
-        case (.useFallback(let a, _, _), .useFallback(let b, _, _)):               return a == b
+        case (.videoOnly, .videoOnly):                                              return true
+        case (.useDirect(let a), .useDirect(let b)):                                return a == b
+        case (.useFallback(let a, _, _), .useFallback(let b, _, _)):                return a == b
         case (.attemptPassthrough(let a, _), .attemptPassthrough(let b, _)):        return a == b
-        case (.fallbackToAVPlayer(let a), .fallbackToAVPlayer(let b)):             return a == b
-        default:                                                                    return false
+        case (.useTrueHDAC3Core(let a), .useTrueHDAC3Core(let b)):                  return a == b
+        case (.fallbackToAVPlayer(let a), .fallbackToAVPlayer(let b)):              return a == b
+        default:                                                                     return false
         }
     }
 }
@@ -319,6 +329,32 @@ struct PremiumAudioPolicy {
             fallbackScore($0, preferredLanguage: preferredLanguage) <
             fallbackScore($1, preferredLanguage: preferredLanguage)
         }
+    }
+
+    // MARK: - Sprint 34: TrueHD probe candidate selection
+
+    /// Returns a TrueHD track number to probe for an embedded AC3 core, or nil.
+    ///
+    /// A TrueHD track is only offered for probing when:
+    ///   • No fully-supported (AAC/AC3/EAC3) tracks exist.
+    ///   • No DTS-Core passthrough candidate exists.
+    ///   • At least one A_TRUEHD track is present.
+    ///
+    /// If the probe succeeds, ContainerPreparation replaces the `fallbackToAVPlayer`
+    /// decision with `.useTrueHDAC3Core`.
+    static func trueHDTrackToProbe(
+        in tracks: [MKVAudioTrackDescriptor]
+    ) -> UInt64? {
+        // Only probe TrueHD when there is no other PlayerLab-playable option.
+        guard tracks.filter({ $0.isSupported }).isEmpty else { return nil }
+        guard tracks.filter({ $0.isDTSCore  }).isEmpty else { return nil }
+
+        // Prefer the default-flagged TrueHD track; fall back to the first one.
+        let trueHDTracks = tracks.filter { $0.isTrueHD }
+        guard !trueHDTracks.isEmpty else { return nil }
+
+        let candidate = trueHDTracks.first(where: { $0.isDefault }) ?? trueHDTracks[0]
+        return candidate.trackNumber
     }
 
     // MARK: - Scoring (private)

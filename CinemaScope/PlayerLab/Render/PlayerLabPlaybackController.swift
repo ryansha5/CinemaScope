@@ -260,7 +260,7 @@ final class PlayerLabPlaybackController: ObservableObject {
             subtitleCoordinator.apply(mkvResult: r)   // SC5
             chapters = r.chapters
 
-            // Sprint 31/32: log audio decision action -------------------------
+            // Sprint 31/32/34: log audio decision action ----------------------
             switch r.audioDecision.action {
             case .useDirect(let n):
                 record("[Audio] Direct playback — track \(n)")
@@ -269,9 +269,12 @@ final class PlayerLabPlaybackController: ObservableObject {
             case .attemptPassthrough(let n, let codec):
                 record("[Audio] ⚠️ Attempting \(codec) passthrough — track \(n) "
                      + "(silence possible on this device)")
+            case .useTrueHDAC3Core(let n):
+                record("[Audio] TrueHD with AC3 core extracted — track \(n)")
             case .fallbackToAVPlayer(let reason):
-                record("[Audio] ⚠️ No compatible PlayerLab audio path — "
-                     + "\(reason)  (route to AVPlayer for full audio)")
+                record("[Audio] No compatible PlayerLab audio path — \(reason)")
+                fail("No compatible audio — route to AVPlayer: \(reason)")
+                return
             case .videoOnly:
                 record("[Audio] No audio tracks — video-only playback")
             }
