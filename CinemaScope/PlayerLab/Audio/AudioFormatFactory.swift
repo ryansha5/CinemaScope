@@ -214,9 +214,12 @@ enum AudioFormatFactory {
         record("[4b] Building CMAudioFormatDescription (DTS-Core)…")
         record("  ⚠️ DTS-Core: hardware passthrough only — may yield silence on this device")
 
+        // kAudioFormatDTS ('dtsc' = 0x64747363) — not exported by the tvOS SDK headers;
+        // use the raw FourCC directly. Value is stable across all Apple platforms.
+        let kAudioFormatDTScore: AudioFormatID = 0x64747363
         var asbd = AudioStreamBasicDescription(
             mSampleRate:       sampleRate > 0 ? sampleRate : 48_000,
-            mFormatID:         kAudioFormatDTS,
+            mFormatID:         kAudioFormatDTScore,
             mFormatFlags:      0,
             mBytesPerPacket:   0,
             mFramesPerPacket:  512,

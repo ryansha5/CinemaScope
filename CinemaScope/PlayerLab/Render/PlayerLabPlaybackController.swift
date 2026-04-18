@@ -272,8 +272,8 @@ final class PlayerLabPlaybackController: ObservableObject {
             switch r.audioDecision.action {
             case .useDirect(let n):
                 record("[Audio] Direct playback — track \(n)")
-            case .useFallback(let n, let from, let to):
-                record("[Audio] Fallback — \(from) → \(to) (track \(n))")
+            case .useFallback(let n, let fromCodec, let toCodec):
+                record("[Audio] Fallback — \(fromCodec) → \(toCodec) (track \(n))")
             case .attemptPassthrough(let n, let codec):
                 record("[Audio] ⚠️ \(codec) passthrough attempt — track \(n) "
                      + "(device: \(DTSCapabilityHeuristic.capabilityLabel); "

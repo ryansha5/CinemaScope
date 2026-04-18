@@ -79,7 +79,7 @@ enum AudioPlaybackAction: Equatable {
     case useDirect(trackNumber: UInt64)
 
     /// Preferred / default track is unsupported; a compatible fallback was found.
-    case useFallback(trackNumber: UInt64, from originalCodec: String, to fallbackCodec: String)
+    case useFallback(trackNumber: UInt64, fromCodec: String, toCodec: String)
 
     /// Sprint 33: DTS-Core is the best available audio; attempt hardware passthrough.
     case attemptPassthrough(trackNumber: UInt64, codec: String)
@@ -261,9 +261,9 @@ struct PremiumAudioPolicy {
                                                 from: supportedTracks) {
                 logs.append("[Audio] Found \(fallback.codecID) fallback (track \(fallback.trackNumber)) — switching")
                 return AudioPlaybackDecision(
-                    action: .useFallback(trackNumber:   fallback.trackNumber,
-                                         from:          preferredDesc.codecID,
-                                         to:            fallback.codecID),
+                    action: .useFallback(trackNumber: fallback.trackNumber,
+                                         fromCodec:   preferredDesc.codecID,
+                                         toCodec:     fallback.codecID),
                     logMessages: logs)
             }
 
@@ -296,8 +296,8 @@ struct PremiumAudioPolicy {
                           + "— fallback to \(best.codecID) (track \(best.trackNumber))")
                 return AudioPlaybackDecision(
                     action: .useFallback(trackNumber: best.trackNumber,
-                                         from:        natural.codecID,
-                                         to:          best.codecID),
+                                         fromCodec:   natural.codecID,
+                                         toCodec:     best.codecID),
                     logMessages: logs)
             }
             let reason = AudioTrackSelector.selectionReason(for: best, policy: preferencePolicy)
