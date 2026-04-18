@@ -23,13 +23,16 @@
 // SC1        — AudioFormatFactory: audio format-description logic extracted to Audio/
 // SC2        — ContainerPreparation: container routing + parsing extracted to Core/
 // SC7        — PacketFeeder: fetch/enqueue pipeline + cursor state extracted to Core/
+// SC3A       — VideoFormatFactory: video format-description logic extracted to Decode/
+// SC6        — BufferPolicy: buffer thresholds + feed-decision helpers extracted to Core/
+// SC5        — SubtitleSetupCoordinator: subtitle wiring extracted to Subtitle/
 //
 // Controller is now an orchestrator:
 //   prepare()    → reset → open reader → ContainerPreparation → apply result
-//                → build format descriptions (AudioFormatFactory / H264/HEVCDecoder)
-//                → configure PacketFeeder → load initial window → .ready
+//                → VideoFormatFactory + AudioFormatFactory → configure PacketFeeder
+//                → load initial window → .ready
 //   play/pause/seek → direct transport calls
-//   feedIfNeeded    → ask PacketFeeder to fill / enqueue
+//   feedIfNeeded    → ask PacketFeeder to fill / enqueue (thresholds via BufferPolicy)
 //
 // NOT production-ready. Debug / lab use only.
 
@@ -133,9 +136,18 @@ final class PlayerLabPlaybackController: ObservableObject {
     private var requestedAudioTrackNumber: UInt64? = nil
 
     // MARK: - Sprint 26 / 28: Subtitle controllers
+    //
+    // Owned here so the view can bind directly; SubtitleSetupCoordinator (SC5)
+    // holds matching references and orchestrates reset / apply / selectOff calls.
+    // Declared without inline defaults so they can be forwarded to the
+    // coordinator in the two-phase init without triggering a "use before init" error.
 
-    let subtitleController = PlayerLabSubtitleController()
-    let pgsController      = PGSSubtitleController()
+    let subtitleController: PlayerLabSubtitleController
+    let pgsController:      PGSSubtitleController
+
+    // MARK: - SubtitleSetupCoordinator (SC5)
+
+    private let subtitleCoordinator: SubtitleSetupCoordinator
 
     // MARK: - Streaming state
 
@@ -144,14 +156,9 @@ final class PlayerLabPlaybackController: ObservableObject {
     /// Lower bound for currentTime; guards against a stale timebase after seek.
     private var currentTimeFloor: Double = 0
 
-    // MARK: - Buffer config
+    // MARK: - Buffer policy (SC6)
 
-    private let initialWindowSeconds: Double = 3.0
-    private let targetBufferSeconds:  Double = 8.0
-    private let lowWatermarkSeconds:  Double = 2.0
-    private let feedChunkSeconds:     Double = 2.0
-    private let underrunThreshold:    Double = 0.5
-    private let resumeThreshold:      Double = 1.5
+    private let policy = BufferPolicy()
 
     // MARK: - Background tasks
 
@@ -161,9 +168,15 @@ final class PlayerLabPlaybackController: ObservableObject {
     // MARK: - Init
 
     init() {
-        let r = FrameRenderer()
-        renderer = r
-        feeder   = PacketFeeder(renderer: r)
+        let r   = FrameRenderer()
+        let srt = PlayerLabSubtitleController()
+        let pgs = PGSSubtitleController()
+        renderer            = r
+        feeder              = PacketFeeder(renderer: r)
+        subtitleController  = srt
+        pgsController       = pgs
+        subtitleCoordinator = SubtitleSetupCoordinator(srtController: srt,
+                                                       pgsController:  pgs)
         r.onFirstFrame = { [weak self] size in
             self?.firstFrameSize = size
         }
@@ -200,8 +213,7 @@ final class PlayerLabPlaybackController: ObservableObject {
         availableAudioTracks = []
         selectedAudioTrack   = nil
         chapters             = []
-        subtitleController.reset()
-        pgsController.reset()
+        subtitleCoordinator.reset()   // SC5
         feeder.reset()
 
         renderer.flushAll()
@@ -245,14 +257,7 @@ final class PlayerLabPlaybackController: ObservableObject {
             selectedAudioTrack   = r.availableAudioTracks
                 .first { $0.trackNumber == r.selectedAudioTrackNumber }
 
-            subtitleController.setAvailableTracks(r.availableSubtitleTracks)
-            if let subTrack = r.selectedSubtitleTrack, !r.subtitleCues.isEmpty {
-                subtitleController.loadCues(r.subtitleCues, for: subTrack)
-            }
-            if let pgsTrack = r.selectedPGSTrack, !r.pgsCues.isEmpty {
-                pgsController.setAvailableTracks(r.availableSubtitleTracks)
-                pgsController.loadCues(r.pgsCues, for: pgsTrack)
-            }
+            subtitleCoordinator.apply(mkvResult: r)   // SC5
             chapters = r.chapters
 
         case .mp4(let r):
@@ -274,24 +279,10 @@ final class PlayerLabPlaybackController: ObservableObject {
              + "\(videoTrack.sampleCount) samples  "
              + "\(String(format: "%.2f", videoTrack.durationSeconds))s")
 
-        // ── Step 5: Build CMVideoFormatDescription ────────────────────────────
-        record("[5] Building CMVideoFormatDescription (\(fourCC))…")
+        // ── Step 5: Build CMVideoFormatDescription (SC3A — VideoFormatFactory) ─
         do {
-            if videoTrack.isH264 {
-                guard let avcC = videoTrack.avcCData else {
-                    fail("H.264 track has no avcC data"); return
-                }
-                feeder.videoFormatDesc = try H264Decoder.makeFormatDescription(from: avcC)
-                record("  ✅ H.264 format description (avcC \(avcC.count) bytes)")
-            } else if videoTrack.isHEVC {
-                guard let hvcC = videoTrack.hvcCData else {
-                    fail("HEVC track has no hvcC data"); return
-                }
-                feeder.videoFormatDesc = try HEVCDecoder.makeFormatDescription(from: hvcC)
-                record("  ✅ HEVC format description (hvcC \(hvcC.count) bytes)")
-            } else {
-                fail("Unsupported video codec: \(fourCC)"); return
-            }
+            feeder.videoFormatDesc = try VideoFormatFactory.make(for: videoTrack,
+                                                                 record: record(_:))
         } catch {
             fail("Format description failed: \(error.localizedDescription)"); return
         }
@@ -332,13 +323,13 @@ final class PlayerLabPlaybackController: ObservableObject {
         // Activate AVAudioSession before the first audio buffer is enqueued.
         if hasAudio { activateAudioSession() }
 
-        let initVideoCount = feeder.videoSamplesFor(seconds: initialWindowSeconds)
-        record("[7] Loading initial window (\(Int(initialWindowSeconds))s "
+        let initVideoCount = feeder.videoSamplesFor(seconds: policy.initialWindowSeconds)
+        record("[7] Loading initial window (\(Int(policy.initialWindowSeconds))s "
              + "≈ \(initVideoCount) video "
-             + "/ \(feeder.audioSamplesFor(seconds: initialWindowSeconds)) audio samples)…")
+             + "/ \(feeder.audioSamplesFor(seconds: policy.initialWindowSeconds)) audio samples)…")
 
         let loaded = await feeder.feedWindow(videoCount:   initVideoCount,
-                                             audioSeconds: initialWindowSeconds,
+                                             audioSeconds: policy.initialWindowSeconds,
                                              label:        "initial",
                                              log:          record(_:))
         guard loaded > 0 else {
@@ -405,8 +396,7 @@ final class PlayerLabPlaybackController: ObservableObject {
         selectedAudioTrack        = nil
         requestedAudioTrackNumber = nil
         chapters                  = []
-        subtitleController.reset()
-        pgsController.reset()
+        subtitleCoordinator.reset()   // SC5
         feeder.reset()
         record("⏹ stop() — renderer + feed loop cleared")
     }
@@ -450,11 +440,11 @@ final class PlayerLabPlaybackController: ObservableObject {
         stopFeedLoop()
 
         // ── Phase 1: PRE-FETCH (async IO, no flush yet) ───────────────────────
-        record("  [seek] pre-fetching \(String(format: "%.0f", initialWindowSeconds))s window…")
-        let initVideoCount = feeder.videoSamplesFor(seconds: initialWindowSeconds)
+        record("  [seek] pre-fetching \(String(format: "%.0f", policy.initialWindowSeconds))s window…")
+        let initVideoCount = feeder.videoSamplesFor(seconds: policy.initialWindowSeconds)
         let fetched = await feeder.fetchPackets(
             videoCount:   initVideoCount,
-            audioSeconds: initialWindowSeconds,
+            audioSeconds: policy.initialWindowSeconds,
             fromVideoIdx: keyframeIdx,
             fromAudioIdx: audioIdx,
             label:        "seek",
@@ -530,7 +520,7 @@ final class PlayerLabPlaybackController: ObservableObject {
         videoBuffered = buffered
         audioBuffered = max(0, feeder.lastEnqueuedAudioPTS - nowSec)
 
-        if logCycle % 10 == 0 {
+        if logCycle % policy.periodicLogInterval == 0 {
             record("[feed] t=\(String(format: "%.1f", nowSec))s  "
                  + "buf=\(String(format: "%.1f", buffered))s  "
                  + "v=\(feeder.nextVideoSampleIdx)/\(feeder.videoSamplesTotal)  "
@@ -539,13 +529,14 @@ final class PlayerLabPlaybackController: ObservableObject {
         }
 
         // End-of-stream: all samples fed, wait for buffer to drain.
-        if feeder.nextVideoSampleIdx >= feeder.videoSamplesTotal {
-            if buffered < 0.5 { onPlaybackEnded() }
+        let atEOS = feeder.nextVideoSampleIdx >= feeder.videoSamplesTotal
+        if atEOS {
+            if policy.isEndOfStream(isAtEOS: atEOS, bufferedSeconds: buffered) { onPlaybackEnded() }
             return
         }
 
         // ── Underrun detection (Sprint 19) ────────────────────────────────────
-        if state == .playing && buffered < underrunThreshold {
+        if state == .playing && policy.isUnderrun(bufferedSeconds: buffered) {
             transition(to: .buffering, "underrun \(String(format: "%.2f", buffered))s")
             renderer.synchronizer.rate = 0
             record("[Buffer] video=\(String(format: "%.2f", buffered))s  "
@@ -553,14 +544,14 @@ final class PlayerLabPlaybackController: ObservableObject {
         }
 
         if state == .buffering {
-            let toFill     = targetBufferSeconds - buffered
-            let videoCount = feeder.videoSamplesFor(seconds: max(toFill, feedChunkSeconds))
-            if logCycle % 5 == 0 {
+            let toFill     = policy.refillSeconds(currentlyBuffered: buffered)
+            let videoCount = feeder.videoSamplesFor(seconds: toFill)
+            if logCycle % policy.bufferingLogInterval == 0 {
                 record("[Buffer] refilling \(String(format: "%.1f", toFill))s "
                      + "≈ \(videoCount) samples…")
             }
             await feeder.feedWindow(videoCount:   videoCount,
-                                    audioSeconds: max(toFill, feedChunkSeconds),
+                                    audioSeconds: toFill,
                                     label:        "buf-refill",
                                     log:          record(_:))
             framesLoaded = feeder.nextVideoSampleIdx
@@ -570,7 +561,7 @@ final class PlayerLabPlaybackController: ObservableObject {
             let newBuf    = max(0, feeder.lastEnqueuedVideoPTS - nowSec2)
             videoBuffered = newBuf
 
-            if newBuf >= resumeThreshold {
+            if policy.isRecovered(bufferedSeconds: newBuf) {
                 transition(to: .playing, "buffer recovered \(String(format: "%.2f", newBuf))s")
                 renderer.synchronizer.setRate(1, time: renderer.currentTime)
                 record("[Buffer] video=\(String(format: "%.2f", newBuf))s → RESUME PLAYBACK")
@@ -579,11 +570,12 @@ final class PlayerLabPlaybackController: ObservableObject {
         }
 
         // ── Normal low-watermark refill (Sprint 17) ───────────────────────────
-        guard buffered < lowWatermarkSeconds else { return }
+        guard policy.isLowWatermark(bufferedSeconds: buffered) else { return }
 
-        let toFill     = targetBufferSeconds - buffered
+        let toFill     = policy.refillSeconds(currentlyBuffered: buffered)
         let videoCount = feeder.videoSamplesFor(seconds: toFill)
-        record("[feed] ⚠️ low watermark (\(String(format: "%.1f", buffered))s < \(lowWatermarkSeconds)s) "
+        record("[feed] ⚠️ low watermark (\(String(format: "%.1f", buffered))s "
+             + "< \(policy.lowWatermarkSeconds)s) "
              + "— refilling \(String(format: "%.1f", toFill))s ≈\(videoCount) samples")
 
         await feeder.feedWindow(videoCount:   videoCount,
@@ -636,8 +628,7 @@ final class PlayerLabPlaybackController: ObservableObject {
         if state == .buffering { renderer.synchronizer.rate = 0 }
         stopFeedLoop()
         stopTimeTracking()
-        subtitleController.selectOff()
-        pgsController.selectOff()
+        subtitleCoordinator.onPlaybackEnded()   // SC5
         transition(to: .ended, "end of stream")
         record("⏹ Playback ended — all \(feeder.videoSamplesTotal) video samples delivered")
     }
