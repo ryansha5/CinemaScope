@@ -187,8 +187,8 @@ final class PlayerLabPlaybackController: ObservableObject {
     // SC1/SC2/SC7 restructure:
     //   1. Reset state (incl. feeder.reset())
     //   2. Open MediaReader
-    //   3. ContainerPreparation.prepare()  → ContainerResult
-    //   4. Apply result to controller + feeder
+    //   3. ContainerPreparation.prepare()  → ContainerResult (incl. audioDecision)
+    //   4. Apply result to controller + feeder; log audioDecision action
     //   5. Build CMVideoFormatDescription  → feeder.videoFormatDesc
     //   6. Build CMAudioFormatDescription  via AudioFormatFactory → feeder.audioFormatDesc
     //   7. feeder.feedWindow()             → initial window
@@ -259,6 +259,22 @@ final class PlayerLabPlaybackController: ObservableObject {
 
             subtitleCoordinator.apply(mkvResult: r)   // SC5
             chapters = r.chapters
+
+            // Sprint 31/32: log audio decision action -------------------------
+            switch r.audioDecision.action {
+            case .useDirect(let n):
+                record("[Audio] Direct playback — track \(n)")
+            case .useFallback(let n, let from, let to):
+                record("[Audio] Fallback — \(from) → \(to) (track \(n))")
+            case .attemptPassthrough(let n, let codec):
+                record("[Audio] ⚠️ Attempting \(codec) passthrough — track \(n) "
+                     + "(silence possible on this device)")
+            case .fallbackToAVPlayer(let reason):
+                record("[Audio] ⚠️ No compatible PlayerLab audio path — "
+                     + "\(reason)  (route to AVPlayer for full audio)")
+            case .videoOnly:
+                record("[Audio] No audio tracks — video-only playback")
+            }
 
         case .mp4(let r):
             demuxer           = r.demuxer

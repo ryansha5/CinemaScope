@@ -1,17 +1,22 @@
 // MARK: - PlayerLab / Core / ContainerPreparation
 // Spring Cleaning SC2 — Container routing + parsing extracted from
 // PlayerLabPlaybackController.prepare(url:).
+// Sprint 31/32 — PremiumAudioPolicy wired in; audio decision propagated to controller.
+// Sprint 33   — DTS-Core reselectAudio path added.
 //
 // Responsibilities:
 //   • Detect container format from file extension
 //   • Construct and call the appropriate demuxer
-//   • Surface track/subtitle/chapter/chapter model in typed result structs
+//   • Run PremiumAudioPolicy.decide() to centralize audio-track selection
+//   • Call MKVDemuxer.reselectAudio() when the policy overrides the demuxer's
+//     initial selection (e.g. Sprint 33 DTS-Core passthrough path)
+//   • Surface track/subtitle/chapter/audio-decision in typed result structs
 //   • Collect log messages for the controller to apply via record()
 //
 // The controller's prepare() retains responsibility for:
 //   • MediaReader open
 //   • State reset
-//   • Format-description construction (AudioFormatFactory / H264Decoder / HEVCDecoder)
+//   • Format-description construction (AudioFormatFactory / VideoFormatFactory)
 //   • Initial window loading (PacketFeeder)
 //   • Published-state writes
 //   • State transition to .ready
@@ -55,6 +60,16 @@ struct MKVPreparationResult {
     let chapters:                 [ChapterInfo]
     /// Log messages produced during preparation; apply via record() in the controller.
     let logMessages:              [String]
+
+    // MARK: - Sprint 31/32: PremiumAudioPolicy decision
+
+    /// Full audio decision produced by PremiumAudioPolicy.decide().
+    /// The controller reads this to configure the feeder and log what happened.
+    let audioDecision: AudioPlaybackDecision
+
+    /// True when no compatible PlayerLab audio path exists and the file
+    /// should be routed to AVPlayer.  Derived from audioDecision.action.
+    var requiresAVPlayerFallback: Bool { audioDecision.requiresAVPlayerFallback }
 }
 
 /// All information extracted from a successfully parsed MP4/MOV container.
@@ -163,24 +178,36 @@ enum ContainerPreparation {
             throw ContainerPreparationError.unsupportedCodec(codec)
         }
 
-        // ── Audio track log ───────────────────────────────────────────────────
-        if !mkv.availableAudioTracks.isEmpty {
-            logs.append("[Audio] \(mkv.availableAudioTracks.count) track(s) found:")
-            for t in mkv.availableAudioTracks {
-                let supportMark = t.isSupported ? "✅" : "⚠️ unsupported"
-                let defMark     = t.isDefault ? " [default]" : ""
-                logs.append("  track \(t.trackNumber): \(t.codecID)  "
-                          + "ch=\(t.channelCount)  sr=\(Int(t.sampleRate)) Hz  "
-                          + "lang=\(t.language)\(defMark)  \(supportMark)")
-            }
-            if let selNum = mkv.selectedAudioTrackNumber {
-                let selCodec = mkv.availableAudioTracks
-                    .first { $0.trackNumber == selNum }?.codecID ?? "?"
-                logs.append("  → Selected: track \(selNum)  (\(selCodec))")
+        // ── Sprint 31/32: Audio decision via PremiumAudioPolicy ──────────────
+        //
+        // PremiumAudioPolicy.decide() is the single authoritative source for all
+        // audio-track decisions.  Its log messages replace the old ad-hoc audio
+        // log block that was here before Sprint 31.
+
+        let audioDecision = PremiumAudioPolicy.decide(
+            tracks:               mkv.availableAudioTracks,
+            preferredTrackNumber: preferredAudioTrack,
+            preferencePolicy:     audioPolicy
+        )
+        logs.append(contentsOf: audioDecision.logMessages)
+
+        // Sprint 32: if the policy wants a different track than the demuxer chose,
+        // call reselectAudio to rebuild the audio index with the correct track.
+        let policyTrackNumber = audioDecision.selectedTrackNumber
+        if policyTrackNumber != mkv.selectedAudioTrackNumber {
+            if let newTrack = policyTrackNumber {
+                logs.append("[Audio] Policy overrides demuxer selection → rescan for track \(newTrack)")
             } else {
-                logs.append("  → No supported audio track — video only")
+                logs.append("[Audio] Policy: video-only → clearing audio index")
             }
-        } else {
+            do {
+                try await mkv.reselectAudio(trackNumber: policyTrackNumber)
+            } catch {
+                logs.append("  ⚠️ reselectAudio failed: \(error.localizedDescription) — keeping demuxer selection")
+            }
+        }
+
+        if mkv.availableAudioTracks.isEmpty {
             logs.append("  ℹ️ No audio tracks in MKV")
         }
 
@@ -216,7 +243,8 @@ enum ContainerPreparation {
             selectedPGSTrack:         mkv.selectedPGSTrack,
             pgsCues:                  mkv.pgsCues,
             chapters:                 mkv.chapters,
-            logMessages:              logs
+            logMessages:              logs,
+            audioDecision:            audioDecision
         )
     }
 

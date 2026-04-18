@@ -1,17 +1,22 @@
 // MARK: - PlayerLab / Audio / AudioFormatFactory
 // Spring Cleaning SC1 — Centralized audio format-description construction.
 // Extracted from PlayerLabPlaybackController (Sprints 13, 22, 24).
+// Sprint 33 — DTS-Core passthrough path added.
 //
 // Handles:
 //   • MP4 AAC   (esds payload → parseAudioSpecificConfig → magic cookie)
 //   • MKV AAC   (CodecPrivate IS the raw AudioSpecificConfig — no parsing needed)
 //   • AC3 / EAC3 (self-framing; no magic cookie required)
+//   • DTS-Core  (Sprint 33: "dtsc" → kAudioFormatDTS; self-framing; hardware passthrough)
 //
 // Dispatch logic (inside `make(for:codecPrivate:record:)`):
 //   isAAC  + esdsData present   → MP4 path: strip esds wrapper, use ASC as magic cookie
 //   isAAC  + esdsData nil       → MKV path: codecPrivate IS the raw AudioSpecificConfig
 //   "ac-3"                      → AC3 (kAudioFormatAC3, 1536 frames/packet)
 //   "ec-3"                      → E-AC3 (kAudioFormatEnhancedAC3, 1536 frames/packet)
+//   "dtsc"                      → DTS-Core (kAudioFormatDTS, 512 frames/packet)
+//                                  ⚠️ Requires DTS-capable hardware or HDMI passthrough.
+//                                     Yields silence on devices without DTS support.
 //
 // NOT production-ready. Debug / lab use only.
 
@@ -72,6 +77,11 @@ enum AudioFormatFactory {
         }
         if audioTrack.codecFourCC == "ec-3" {
             return makeAC3(channelCount: ch, sampleRate: sr, isEAC3: true, record: record)
+        }
+
+        // ── DTS-Core (Sprint 33) ──────────────────────────────────────────────
+        if audioTrack.codecFourCC == "dtsc" {
+            return makeDTSCore(channelCount: ch, sampleRate: sr, record: record)
         }
 
         record("  ⚠️ AudioFormatFactory: unsupported codec '\(codecLabel)'")
@@ -160,6 +170,58 @@ enum AudioFormatFactory {
             record("  ⚠️ CMAudioFormatDescriptionCreate (\(label)) failed: \(status)")
             return nil
         }
+        return desc
+    }
+
+    // MARK: - DTS-Core (Sprint 33)
+    //
+    // kAudioFormatDTS ('dtsc') — standard DTS-Core passthrough.
+    //
+    // DTS-Core frames in MKV are self-contained sync frames; no magic cookie is
+    // required.  Standard frame size is 512 PCM samples.  The system will attempt
+    // hardware passthrough via AVAudioSession; on devices without a DTS-capable
+    // output route the audio renderer will enqueue samples silently (no crash).
+    //
+    // Timing note: mFramesPerPacket is 512 as a safe default for DTS-Core CD-rate
+    // content.  PTS is driven by the MKV block timestamp, not this field, so a
+    // small mismatch does not affect A/V sync.
+
+    private static func makeDTSCore(
+        channelCount: UInt16,
+        sampleRate:   Double,
+        record:       (String) -> Void
+    ) -> CMAudioFormatDescription? {
+        record("[4b] Building CMAudioFormatDescription (DTS-Core)…")
+        record("  ⚠️ DTS-Core: hardware passthrough only — may yield silence on this device")
+
+        var asbd = AudioStreamBasicDescription(
+            mSampleRate:       sampleRate > 0 ? sampleRate : 48_000,
+            mFormatID:         kAudioFormatDTS,
+            mFormatFlags:      0,
+            mBytesPerPacket:   0,
+            mFramesPerPacket:  512,
+            mBytesPerFrame:    0,
+            mChannelsPerFrame: UInt32(channelCount > 0 ? channelCount : 6),
+            mBitsPerChannel:   0,
+            mReserved:         0
+        )
+        var desc: CMAudioFormatDescription?
+        let status = CMAudioFormatDescriptionCreate(
+            allocator:            kCFAllocatorDefault,
+            asbd:                 &asbd,
+            layoutSize:           0,
+            layout:               nil,
+            magicCookieSize:      0,
+            magicCookie:          nil,
+            extensions:           nil,
+            formatDescriptionOut: &desc
+        )
+        if status != noErr {
+            record("  ⚠️ CMAudioFormatDescriptionCreate (DTS-Core) failed: \(status)")
+            return nil
+        }
+        record("  ✅ DTS-Core format description  ch=\(channelCount) sr=\(Int(sampleRate)) Hz  "
+             + "(attempting passthrough)")
         return desc
     }
 

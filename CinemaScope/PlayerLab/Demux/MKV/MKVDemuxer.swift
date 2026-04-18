@@ -10,6 +10,9 @@
 // Sprint 28 — PGS subtitle track detection, packet extraction, and cue decoding
 // Sprint 29 — TrueHD/DTS/DTS-HD audio track detection and classification
 // Sprint 30 — DTS fix for B-frame H.264 (dts:.invalid for video packets)
+// Sprint 31 — MKVAudioTrackDescriptor: isDTSCore / isDTSHD; PremiumAudioPolicy-ready
+// Sprint 32 — reselectAudio(): re-scan clusters when policy overrides initial selection
+// Sprint 33 — DTS-Core: "dtsc" fourCC mapping; 512 frames/packet; passthrough path
 //
 // Architecture (unchanged from Sprint 20):
 //   parse()  → EBML validation → Segment → Info + Tracks + Chapters → scanClusters
@@ -31,7 +34,7 @@
 import Foundation
 import CoreMedia
 
-// MARK: - MKVAudioTrackDescriptor  (Sprint 23)
+// MARK: - MKVAudioTrackDescriptor  (Sprint 23 / Sprint 31 / Sprint 33)
 
 struct MKVAudioTrackDescriptor {
     let trackNumber:  UInt64
@@ -45,19 +48,32 @@ struct MKVAudioTrackDescriptor {
     var isAC3:  Bool { codecID == "A_AC3"  }
     var isEAC3: Bool { codecID == "A_EAC3" }
     var isTrueHD: Bool { codecID == "A_TRUEHD" }
-    var isDTS:    Bool { codecID == "A_DTS" || codecID.hasPrefix("A_DTS") }
 
+    // Sprint 33: DTS family decomposed into three tiers.
+    //   isDTSCore — standard DTS-Core (A_DTS exact match).
+    //               kAudioFormatDTS passthrough is attempted on capable hardware.
+    //   isDTSHD   — DTS-HD variants (A_DTS/HRA, A_DTS/LOSSLESS, A_DTS/X, etc.).
+    //               Not currently decodable; treated as unsupported.
+    //   isDTS     — broad "any DTS family" check (union of the above).
+    var isDTSCore: Bool { codecID == "A_DTS" }
+    var isDTSHD:   Bool { codecID.hasPrefix("A_DTS/") }
+    var isDTS:     Bool { isDTSCore || isDTSHD }
+
+    /// Fully-supported codecs that PlayerLab can always decode reliably.
+    /// DTS-Core is NOT listed here; it is handled separately as an attempted
+    /// passthrough path by PremiumAudioPolicy (Sprint 33).
     var isSupported: Bool { isAAC || isAC3 || isEAC3 }
 
-    /// Sprint 29: three-tier classification for audio selection logging.
+    /// Sprint 29 / Sprint 31: three-tier classification delegated to PremiumAudioPolicy.
+    /// Kept here for backward-compatibility with existing logging sites.
     enum Classification {
-        case supported          // AAC, AC3, EAC3 — can be decoded by PlayerLab
-        case unsupportedKnown   // TrueHD, DTS, DTS-HD — recognized but not yet supported
-        case unknown            // codec ID not recognized
+        case supported          // AAC, AC3, EAC3
+        case unsupportedKnown   // TrueHD, DTS, DTS-HD — recognized but not decodable
+        case unknown
     }
     var classification: Classification {
-        if isSupported                         { return .supported }
-        if isTrueHD || isDTS                   { return .unsupportedKnown }
+        if isSupported              { return .supported }
+        if isTrueHD || isDTS        { return .unsupportedKnown }
         return .unknown
     }
 }
@@ -111,14 +127,16 @@ private struct MKVTrackInfo {
     let isAudio:      Bool
     let isSubtitle:   Bool    // Sprint 26: trackType == 17
 
-    var isH264:  Bool { codecID == "V_MPEG4/ISO/AVC" }
-    var isHEVC:  Bool { codecID == "V_MPEGH/ISO/HEVC" }
-    var isAAC:   Bool { codecID == "A_AAC" || codecID.hasPrefix("A_AAC/") }
-    var isAC3:   Bool { codecID == "A_AC3"  }
-    var isEAC3:  Bool { codecID == "A_EAC3" }
-    var isAudioSupported: Bool { isAAC || isAC3 || isEAC3 }
+    var isH264:    Bool { codecID == "V_MPEG4/ISO/AVC" }
+    var isHEVC:    Bool { codecID == "V_MPEGH/ISO/HEVC" }
+    var isAAC:     Bool { codecID == "A_AAC" || codecID.hasPrefix("A_AAC/") }
+    var isAC3:     Bool { codecID == "A_AC3"  }
+    var isEAC3:    Bool { codecID == "A_EAC3" }
+    /// Sprint 33: standard DTS-Core — passthrough attempt via kAudioFormatDTS.
+    var isDTSCore: Bool { codecID == "A_DTS" }
+    var isAudioSupported: Bool { isAAC || isAC3 || isEAC3 }   // DTS-Core excluded (handled separately)
     var isSRTText: Bool { codecID == "S_TEXT/UTF8" }  // Sprint 26
-    var isPGS: Bool { codecID == "S_HDMV/PGS" }    // Sprint 28
+    var isPGS:     Bool { codecID == "S_HDMV/PGS"  }  // Sprint 28
 }
 
 // MARK: - MKVDemuxError
@@ -199,6 +217,18 @@ final class MKVDemuxer {
     private var audioSampleRate:     Double      = 44_100
     private var audioFramesPerPacket: Int        = 1024
 
+    // MARK: - Sprint 32: reselectAudio infra
+    //
+    // Stored after parse() so that reselectAudio() can re-scan clusters without
+    // re-parsing the container header.  All four values are set in parse() before
+    // scanClusters() is called.
+
+    private var segmentOffset_:    Int64         = 0
+    private var videoTrackNum_:    UInt64        = 0
+    private var subtitleTrackNum_: UInt64?       = nil
+    private var pgsTrackNum_:      UInt64?       = nil
+    private var parsedMKVTracks_:  [MKVTrackInfo] = []
+
     // MARK: - Init
 
     init(reader: MediaReader) {
@@ -267,7 +297,9 @@ final class MKVDemuxer {
             selectedAudioTrackNumber = a.trackNumber
             audioSampleRate          = a.sampleRate > 0 ? a.sampleRate : 44_100
             audioCodecPrivate        = a.isAAC ? a.codecPrivate : nil
-            audioFramesPerPacket     = (a.isAC3 || a.isEAC3) ? 1536 : 1024
+            audioFramesPerPacket     = (a.isAC3 || a.isEAC3) ? 1536
+                                     : a.isDTSCore              ? 512    // Sprint 33
+                                     :                             1024
             let reason = AudioTrackSelector.selectionReason(
                 for: MKVAudioTrackDescriptor(trackNumber: a.trackNumber, codecID: a.codecID,
                                              channelCount: a.channelCount, sampleRate: a.sampleRate,
@@ -288,9 +320,17 @@ final class MKVDemuxer {
                 log("    [Audio] track \(t.trackNumber): \(t.codecID) — ❓ unknown codec")
             }
         }
+        // Sprint 29 / 31: log a summary when no supported track was found.
+        // PremiumAudioPolicy (called from ContainerPreparation) will produce the
+        // authoritative decision log; this is a quick demuxer-level diagnostic.
         let allUnsupported = availableAudioTracks.allSatisfy { !$0.isSupported }
         if allUnsupported && !availableAudioTracks.isEmpty {
-            log("  ⚠️ [Sprint29] All audio tracks are unsupported (TrueHD/DTS/unknown) — video-only playback. Future: implement passthrough or decode path.")
+            let hasDTSCore = availableAudioTracks.contains { $0.isDTSCore }
+            if hasDTSCore {
+                log("  ⚠️ No supported audio track — DTS-Core candidate detected (Sprint 33 passthrough path)")
+            } else {
+                log("  ⚠️ All audio tracks unsupported (TrueHD/DTS-HD/unknown) — PremiumAudioPolicy will decide")
+            }
         }
 
         // ── Subtitle track discovery (Sprint 26) ─────────────────────────────
@@ -332,6 +372,13 @@ final class MKVDemuxer {
             log("  ✅ PGS: track \(pgs.trackNumber) lang=\(pgs.language)")
         }
 
+        // ── Store reselectAudio infra (Sprint 32) ─────────────────────────────
+        segmentOffset_    = segmentOffset
+        videoTrackNum_    = videoMKVTrack.trackNumber
+        subtitleTrackNum_ = selectedSubMKVTrack?.trackNumber
+        pgsTrackNum_      = selectedPGSMKVTrack?.trackNumber
+        parsedMKVTracks_  = mkvTracks
+
         // ── Scan clusters ─────────────────────────────────────────────────────
         try await scanClusters(inSegment:        segmentOffset,
                                 videoTrackNumber: videoMKVTrack.trackNumber,
@@ -368,10 +415,11 @@ final class MKVDemuxer {
         // ── Build audio TrackInfo (Sprint 22) ─────────────────────────────────
         if let a = selectedAudioMKVTrack, !audioFrameIndex.isEmpty {
             let audioFourCC: String
-            if      a.isAAC  { audioFourCC = "mp4a" }
-            else if a.isAC3  { audioFourCC = "ac-3" }
-            else if a.isEAC3 { audioFourCC = "ec-3" }
-            else              { audioFourCC = a.codecID }
+            if      a.isAAC     { audioFourCC = "mp4a" }
+            else if a.isAC3     { audioFourCC = "ac-3" }
+            else if a.isEAC3    { audioFourCC = "ec-3" }
+            else if a.isDTSCore { audioFourCC = "dtsc" }   // Sprint 33: DTS-Core passthrough
+            else                { audioFourCC = a.codecID }
 
             audioTrack = TrackInfo(
                 trackID: UInt32(a.trackNumber), trackType: .audio,
@@ -386,6 +434,101 @@ final class MKVDemuxer {
         }
 
         log("✅ parse() complete — dur≈\(String(format: "%.1f", durationSec))s")
+    }
+
+    // MARK: - Sprint 32: reselectAudio
+    //
+    // Re-scan clusters with a different audio track after parse() has completed.
+    // Used by ContainerPreparation when PremiumAudioPolicy dictates a different
+    // track than the one the demuxer auto-selected (e.g. Sprint 33 DTS-Core path).
+    //
+    // Rebuilds: audioFrameIndex, audioTrack, selectedAudioTrackNumber,
+    //           audioCodecPrivate, frameIndex (rebuilt in full by scanClusters),
+    //           subtitleCues, pgsRawPackets, pgsCues.
+    //
+    // Safe to call for nil (switches to video-only without re-scanning).
+
+    func reselectAudio(trackNumber: UInt64?) async throws {
+        guard segmentOffset_ > 0 else {
+            log("  ⚠️ [reselectAudio] called before parse() — no-op")
+            return
+        }
+
+        // ── Video-only path ───────────────────────────────────────────────────
+        guard let trackNum = trackNumber else {
+            audioFrameIndex.removeAll()
+            audioTrack           = nil
+            selectedAudioTrackNumber = nil
+            audioCodecPrivate    = nil
+            tracks = tracks.filter { $0.trackType != .audio }
+            log("  [reselectAudio] → video-only (no audio track requested)")
+            return
+        }
+
+        guard let mkvTrack = parsedMKVTracks_.first(where: { $0.trackNumber == trackNum && $0.isAudio })
+        else {
+            log("  ⚠️ [reselectAudio] track \(trackNum) not found in parsed tracks — no-op")
+            return
+        }
+
+        log("  [reselectAudio] switching audio → track \(trackNum) (\(mkvTrack.codecID))")
+
+        // ── Update per-track audio config ────────────────────────────────────
+        audioSampleRate      = mkvTrack.sampleRate > 0 ? mkvTrack.sampleRate : 44_100
+        audioCodecPrivate    = mkvTrack.isAAC ? mkvTrack.codecPrivate : nil
+        audioFramesPerPacket = (mkvTrack.isAC3 || mkvTrack.isEAC3) ? 1536
+                             : mkvTrack.isDTSCore                    ? 512
+                             :                                          1024
+
+        // ── Re-scan all clusters with new audio track ─────────────────────────
+        // scanClusters resets frameIndex, audioFrameIndex, subtitleCues, pgsRawPackets.
+        try await scanClusters(inSegment:        segmentOffset_,
+                                videoTrackNumber: videoTrackNum_,
+                                audioTrackNumber: trackNum,
+                                subtitleTrackNum: subtitleTrackNum_,
+                                pgsTrackNum:      pgsTrackNum_)
+
+        // Re-process PGS bitmap packets collected during the rescan
+        if !pgsRawPackets.isEmpty {
+            pgsCues = await processPGSPackets(pgsRawPackets)
+        } else {
+            pgsCues.removeAll()
+        }
+
+        selectedAudioTrackNumber = trackNum
+
+        // ── Rebuild audioTrack TrackInfo ──────────────────────────────────────
+        let audioFourCC: String
+        if      mkvTrack.isAAC     { audioFourCC = "mp4a" }
+        else if mkvTrack.isAC3     { audioFourCC = "ac-3" }
+        else if mkvTrack.isEAC3    { audioFourCC = "ec-3" }
+        else if mkvTrack.isDTSCore { audioFourCC = "dtsc" }
+        else                        { audioFourCC = mkvTrack.codecID }
+
+        let durationSec   = frameIndex.last.map { $0.pts.seconds } ?? 0
+        let durationTicks = UInt64(durationSec * Double(outputTimescale))
+
+        if !audioFrameIndex.isEmpty {
+            let newAudioTrack = TrackInfo(
+                trackID:    UInt32(mkvTrack.trackNumber), trackType: .audio,
+                timescale:  UInt32(outputTimescale), durationTicks: durationTicks,
+                sampleCount: audioFrameIndex.count, codecFourCC: audioFourCC,
+                displayWidth: nil, displayHeight: nil,
+                avcCData: nil, hvcCData: nil, esdsData: nil,
+                channelCount:    mkvTrack.channelCount > 0 ? UInt16(mkvTrack.channelCount) : nil,
+                audioSampleRate: mkvTrack.sampleRate   > 0 ? mkvTrack.sampleRate : nil
+            )
+            audioTrack = newAudioTrack
+            tracks = tracks.filter { $0.trackType != .audio }
+            tracks.append(newAudioTrack)
+        } else {
+            audioTrack = nil
+            tracks = tracks.filter { $0.trackType != .audio }
+        }
+
+        log("  ✅ [reselectAudio] track \(trackNum) (\(audioFourCC))  "
+          + "\(audioFrameIndex.count) audio / \(frameIndex.count) video / "
+          + "\(subtitleCues.count) SRT / \(pgsCues.count) PGS frames")
     }
 
     // MARK: - Segment Search
