@@ -11,7 +11,7 @@ struct TrackInfo {
 
     // MARK: - Track type
 
-    enum TrackType: CustomStringConvertible {
+    enum TrackType: CustomStringConvertible, Equatable {
         case video
         case audio
         case other(String)      // raw handler FourCC e.g. "subt", "meta"
