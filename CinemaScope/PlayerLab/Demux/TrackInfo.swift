@@ -47,6 +47,11 @@ struct TrackInfo {
     /// nil for non-H.264 tracks.
     let avcCData:       Data?
 
+    /// Raw payload of the hvcC box embedded inside the hvc1/hev1 sample entry.
+    /// Contains VPS, SPS, and PPS NAL units for HEVC.
+    /// nil for non-HEVC tracks.
+    let hvcCData:       Data?
+
     // MARK: - Derived
 
     var durationSeconds: Double {
@@ -56,5 +61,10 @@ struct TrackInfo {
 
     var isH264: Bool {
         codecFourCC == "avc1" || codecFourCC == "avc3"
+    }
+
+    /// Sprint 12: HEVC / H.265 codec families.
+    var isHEVC: Bool {
+        codecFourCC == "hvc1" || codecFourCC == "hev1"
     }
 }

@@ -74,6 +74,7 @@ final class MP4Demuxer {
     private var accDisplayWidth:   UInt16? = nil
     private var accDisplayHeight:  UInt16? = nil
     private var accAvcCData:       Data?   = nil
+    private var accHvcCData:       Data?   = nil    // Sprint 12: HEVC parameter sets
 
     // Sample table accumulator
     private var accSttsEntries:     [(count: Int, delta: Int)] = []
@@ -295,7 +296,11 @@ final class MP4Demuxer {
     //   [94+]   child boxes of avc1 (avcC is first)
 
     private func parseStsd(_ box: MP4Box) async throws {
-        let readLen = Int(min(box.payloadSize, 1024))
+        // 8 192 bytes: enough for any realistic stsd payload (hvcC from libx265
+        // can include colr/pasp/btrt boxes before hvcC, and ffmpeg may append a
+        // 4th NAL array (prefix SEI) that pushes the hvcC payload deeper than the
+        // old 1 024-byte cap allowed).
+        let readLen = Int(min(box.payloadSize, 8192))
         guard readLen >= 16 else { return }
         let data = try await reader.read(offset: box.payloadOffset, length: readLen)
 
@@ -304,8 +309,13 @@ final class MP4Demuxer {
         accCodecFourCC = entryType
 
         if entryType == "avc1" || entryType == "avc3" {
-            // Scan for avcC starting after the 94-byte fixed VisualSampleEntry structure
+            // Scan for avcC starting after the 94-byte fixed VisualSampleEntry structure.
             accAvcCData = findChildBox(type: "avcC", in: data, from: 94)
+        } else if entryType == "hvc1" || entryType == "hev1" {
+            // Sprint 12: HEVC — hvcC lives at the same offset as avcC in H.264.
+            // Both codecs share the same VisualSampleEntry base layout (86-byte
+            // fixed header visible from the stsd entry, child boxes at offset 94).
+            accHvcCData = findChildBox(type: "hvcC", in: data, from: 94)
         }
     }
 
@@ -483,6 +493,7 @@ final class MP4Demuxer {
         accDurationTicks = 0;  accSampleCount = 0
         accCodecFourCC = nil;  accDisplayWidth = nil;  accDisplayHeight = nil
         accAvcCData = nil
+        accHvcCData = nil
         accSttsEntries = [];  accCttsEntries = [];  accStssSet = []
         accStscEntries = [];  accSampleSizes = [];  accFixedSampleSize = 0
         accChunkOffsets = [];  accHasCtts = false;  accHasStss = false
@@ -516,7 +527,8 @@ final class MP4Demuxer {
             codecFourCC:    accCodecFourCC,
             displayWidth:   accDisplayWidth,
             displayHeight:  accDisplayHeight,
-            avcCData:       accAvcCData
+            avcCData:       accAvcCData,
+            hvcCData:       accHvcCData       // Sprint 12
         )
         tracks.append(info)
 

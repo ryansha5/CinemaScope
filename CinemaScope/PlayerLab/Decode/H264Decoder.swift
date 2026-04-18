@@ -70,6 +70,81 @@ final class H264Decoder {
 
     private let lock = NSLock()
 
+    // MARK: - Format Description Factory (Sprint 10)
+    //
+    // Shared by the Sprint-9 VTDecompressionSession path (configure()) AND the
+    // Sprint-10 AVSampleBufferDisplayLayer path (PlayerLabPlaybackController).
+
+    /// Parse a raw avcC box payload and return a CMVideoFormatDescription.
+    /// Does NOT create a VTDecompressionSession — use configure() for that.
+    static func makeFormatDescription(from avcCData: Data) throws -> CMVideoFormatDescription {
+        guard avcCData.count >= 7 else {
+            throw H264DecoderError.invalidAvcC("payload too short (\(avcCData.count) bytes)")
+        }
+
+        var idx = 0
+        guard avcCData[idx] == 1 else {
+            throw H264DecoderError.invalidAvcC("configurationVersion is \(avcCData[0]), expected 1")
+        }
+        idx += 1    // configurationVersion
+        idx += 3    // AVCProfileIndication, profile_compatibility, AVCLevelIndication
+
+        let nalUnitLength = Int(avcCData[idx] & 0x03) + 1
+        idx += 1
+
+        // SPS
+        var spsSet: [Data] = []
+        let numSPS = Int(avcCData[idx] & 0x1F); idx += 1
+        for _ in 0..<numSPS {
+            guard idx + 2 <= avcCData.count else {
+                throw H264DecoderError.invalidAvcC("SPS length field truncated")
+            }
+            let len = Int(avcCData[idx]) << 8 | Int(avcCData[idx + 1]); idx += 2
+            guard idx + len <= avcCData.count else {
+                throw H264DecoderError.invalidAvcC("SPS data truncated")
+            }
+            spsSet.append(avcCData.subdata(in: idx..<(idx + len))); idx += len
+        }
+        guard !spsSet.isEmpty else { throw H264DecoderError.noSPSFound }
+
+        // PPS
+        var ppsSet: [Data] = []
+        guard idx < avcCData.count else {
+            throw H264DecoderError.invalidAvcC("PPS count missing")
+        }
+        let numPPS = Int(avcCData[idx]); idx += 1
+        for _ in 0..<numPPS {
+            guard idx + 2 <= avcCData.count else {
+                throw H264DecoderError.invalidAvcC("PPS length field truncated")
+            }
+            let len = Int(avcCData[idx]) << 8 | Int(avcCData[idx + 1]); idx += 2
+            guard idx + len <= avcCData.count else {
+                throw H264DecoderError.invalidAvcC("PPS data truncated")
+            }
+            ppsSet.append(avcCData.subdata(in: idx..<(idx + len))); idx += len
+        }
+        guard !ppsSet.isEmpty else { throw H264DecoderError.noPPSFound }
+
+        let allSets   = spsSet + ppsSet
+        let nsDataArr = allSets.map { $0 as NSData }
+        var ptrs      = nsDataArr.map { $0.bytes.assumingMemoryBound(to: UInt8.self) }
+        var sizes     = nsDataArr.map { $0.length }
+
+        var fmtDesc: CMVideoFormatDescription?
+        let status = CMVideoFormatDescriptionCreateFromH264ParameterSets(
+            allocator:             kCFAllocatorDefault,
+            parameterSetCount:     allSets.count,
+            parameterSetPointers:  &ptrs,
+            parameterSetSizes:     &sizes,
+            nalUnitHeaderLength:   Int32(nalUnitLength),
+            formatDescriptionOut:  &fmtDesc
+        )
+        guard status == noErr, let fmtDesc = fmtDesc else {
+            throw H264DecoderError.formatDescriptionFailed(status)
+        }
+        return fmtDesc
+    }
+
     // MARK: - Configure
 
     /// Parse the raw avcC box payload and create a VTDecompressionSession.

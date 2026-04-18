@@ -725,6 +725,7 @@ private struct PlayerLabPanel: View {
     @State private var labIsRunning: Bool   = false
     @State private var labLog:       String = ""
     @State private var labSuccess:   Bool?  = nil
+    @State private var labShowPlayer: Bool  = false
 
     var body: some View {
         ScrollView(.vertical, showsIndicators: false) {
@@ -774,7 +775,7 @@ private struct PlayerLabPanel: View {
                         .strokeBorder(CinemaTheme.peacockLight.opacity(0.15), lineWidth: 1)
                 }
 
-                // Run / Clear buttons
+                // Run / Clear / Watch buttons
                 HStack(spacing: 16) {
                     SettingsButton(
                         icon:      labIsRunning ? "arrow.triangle.2.circlepath" : "play.circle.fill",
@@ -786,12 +787,29 @@ private struct PlayerLabPanel: View {
                     }
                     .disabled(labIsRunning || labFilePath.trimmingCharacters(in: .whitespaces).isEmpty)
 
+                    // Sprint 10: open the debug video player
+                    SettingsButton(
+                        icon:      "tv.fill",
+                        label:     "Watch Video",
+                        style:     .ghost,
+                        colorMode: colorMode
+                    ) {
+                        labShowPlayer = true
+                    }
+                    .disabled(labFilePath.trimmingCharacters(in: .whitespaces).isEmpty)
+
                     if !labLog.isEmpty {
                         SettingsButton(icon: "arrow.counterclockwise", label: "Clear", style: .ghost, colorMode: colorMode) {
                             labLog     = ""
                             labSuccess = nil
                         }
                     }
+                }
+                .fullScreenCover(isPresented: $labShowPlayer) {
+                    PlayerLabPlayerView(
+                        url:         URL(fileURLWithPath: labFilePath.trimmingCharacters(in: .whitespaces)),
+                        packetCount: 300
+                    )
                 }
 
                 // Result status
@@ -817,25 +835,30 @@ private struct PlayerLabPanel: View {
                     }
                 }
 
-                // Log output
+                // Log output — show the last 40 lines so the newest output
+                // (step 5 decode results) is always visible without needing to
+                // scroll an inner view on tvOS.
                 if !labLog.isEmpty {
+                    let tail: String = {
+                        let lines = labLog.components(separatedBy: "\n")
+                        let slice = lines.suffix(40)
+                        return slice.joined(separator: "\n")
+                    }()
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("Log")
+                        let total = labLog.components(separatedBy: "\n").count
+                        Text("Log (last 40 of \(total) lines)")
                             .font(.system(size: 16, weight: .semibold))
                             .foregroundStyle(CinemaTheme.secondary(colorMode))
-                        ScrollView(.vertical, showsIndicators: false) {
-                            Text(labLog)
-                                .font(.system(size: 12, design: .monospaced))
-                                .foregroundStyle(CinemaTheme.secondary(colorMode))
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(16)
-                        }
-                        .frame(height: 360)
-                        .background(CinemaTheme.peacockDeep.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
-                        .overlay {
-                            RoundedRectangle(cornerRadius: 10)
-                                .strokeBorder(CinemaTheme.peacockLight.opacity(0.15), lineWidth: 1)
-                        }
+                        Text(tail)
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundStyle(CinemaTheme.secondary(colorMode))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(16)
+                            .background(CinemaTheme.peacockDeep.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
+                            .overlay {
+                                RoundedRectangle(cornerRadius: 10)
+                                    .strokeBorder(CinemaTheme.peacockLight.opacity(0.15), lineWidth: 1)
+                            }
                     }
                 }
             }

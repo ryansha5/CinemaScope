@@ -366,6 +366,9 @@ final class PlayerLabHarness {
                 record(.info, "    avcC: \(avcC.count) bytes (SPS+PPS present)")
                 logAvcCSummary(avcC)
             }
+            if let hvcC = track.hvcCData {
+                record(.info, "    hvcC: \(hvcC.count) bytes (VPS+SPS+PPS present)")
+            }
         }
 
         guard let vt = demuxer.videoTrack else {
@@ -455,17 +458,18 @@ final class PlayerLabHarness {
     }
 
     private func logPacketTable(_ packets: [DemuxPacket]) {
-        let header = String(format: "  %-5s  %-8s  %-10s  %-10s  %-7s  %s",
+        let header = String(format: "  %-5@  %-8@  %-10@  %-10@  %-7@  %@",
                             "idx", "bytes", "pts(s)", "dts(s)", "key", "offset")
         record(.data, header)
         for pkt in packets.prefix(10) {
-            let pts = pkt.pts.seconds.isNaN ? 0 : pkt.pts.seconds
-            let dts = pkt.dts.seconds.isNaN ? 0 : pkt.dts.seconds
-            let row = String(format: "  %-5d  %-8d  %-10.4f  %-10.4f  %-7s  %lld",
-                             pkt.index, pkt.data.count,
-                             pts, dts,
-                             pkt.isKeyframe ? "KEY" : "-",
-                             pkt.byteOffset)
+            let pts    = pkt.pts.seconds.isNaN ? 0 : pkt.pts.seconds
+            let dts    = pkt.dts.seconds.isNaN ? 0 : pkt.dts.seconds
+            let keyStr = pkt.isKeyframe ? "KEY" : "-"
+            let row    = String(format: "  %-5d  %-8d  %-10.4f  %-10.4f  %-7@  %lld",
+                                pkt.index, pkt.data.count,
+                                pts, dts,
+                                keyStr,
+                                pkt.byteOffset)
             record(.data, row)
         }
     }
