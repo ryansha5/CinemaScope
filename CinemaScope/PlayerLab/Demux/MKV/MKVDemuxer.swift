@@ -49,13 +49,22 @@ struct MKVAudioTrackDescriptor {
     var isEAC3: Bool { codecID == "A_EAC3" }
     var isTrueHD: Bool { codecID == "A_TRUEHD" }
 
-    // Sprint 33: DTS family decomposed into three tiers.
+    // Sprint 33 / Sprint 35: DTS family decomposed into four tiers.
     //   isDTSCore — standard DTS-Core (A_DTS exact match).
     //               kAudioFormatDTS passthrough is attempted on capable hardware.
-    //   isDTSHD   — DTS-HD variants (A_DTS/HRA, A_DTS/LOSSLESS, A_DTS/X, etc.).
-    //               Not currently decodable; treated as unsupported.
-    //   isDTS     — broad "any DTS family" check (union of the above).
+    //   isDTSHDMA — DTS-HD MA, DTS:X (lossless / object-based).
+    //               Never decodable on Apple platforms; always falls back.
+    //   isDTSHD   — other DTS-HD variants (HRA, etc.).
+    //               Not decodable; treated as unsupported.
+    //   isDTS     — broad "any DTS family" check (union of all three above).
+    //
+    // isDTSHDMA must be checked before isDTSHD (both match the "A_DTS/" prefix).
     var isDTSCore: Bool { codecID == "A_DTS" }
+    var isDTSHDMA: Bool {
+        codecID == "A_DTS/MA"       ||
+        codecID == "A_DTS/LOSSLESS" ||  // alternate encoder spelling
+        codecID == "A_DTS/X"           // DTS:X is built atop DTS-HD MA
+    }
     var isDTSHD:   Bool { codecID.hasPrefix("A_DTS/") }
     var isDTS:     Bool { isDTSCore || isDTSHD }
 
@@ -229,14 +238,22 @@ final class MKVDemuxer {
     private var pgsTrackNum_:      UInt64?       = nil
     private var parsedMKVTracks_:  [MKVTrackInfo] = []
 
-    // MARK: - Sprint 34: TrueHD → AC3 core extraction mode
+    // MARK: - Sprint 34 / Sprint 36: TrueHD → AC3 core extraction mode
     //
     // When enabled, extractAudioPackets() pipes each TrueHD packet through
     // TrueHDCoreExtractor and returns only the extracted AC3 frame.
     // Packets with no embedded AC3 frame are silently dropped.
-    // The audioTrack codecFourCC is updated to "ac-3" by enableTrueHDAC3Extraction().
+    //
+    // Sprint 36: audioTrack.codecFourCC is NO LONGER mutated to "ac-3".
+    // The original identifier (e.g. "A_TRUEHD") is preserved.
+    // AudioFormatFactory dispatches via audioPlaybackMode.effectiveCodecFourCC instead.
 
     private var truehDAC3Mode: Bool = false
+
+    /// Truthful record of how the current audio track is being decoded.
+    /// `.native` for all standard paths; `.extractedCore` when TrueHD AC3
+    /// extraction is active (Sprint 36).
+    private(set) var audioPlaybackMode: AudioTrackPlaybackMode = .native
 
     // MARK: - Init
 
@@ -463,6 +480,11 @@ final class MKVDemuxer {
             return
         }
 
+        // Sprint 36: reset extraction mode; enableTrueHDAC3Extraction() will
+        // re-apply it if needed after the rescan.
+        truehDAC3Mode     = false
+        audioPlaybackMode = .native
+
         // ── Video-only path ───────────────────────────────────────────────────
         guard let trackNum = trackNumber else {
             audioFrameIndex.removeAll()
@@ -575,41 +597,28 @@ final class MKVDemuxer {
     ///
     /// After this call, `extractAudioPackets()` will pipe each TrueHD packet
     /// through `TrueHDCoreExtractor` and yield only the embedded AC3 frame.
-    /// The `audioTrack` metadata is updated so that `AudioFormatFactory` routes
-    /// to the AC3 path (codecFourCC = "ac-3", 1536 frames/packet).
+    ///
+    /// Sprint 36: `audioTrack.codecFourCC` is preserved as-is ("A_TRUEHD").
+    /// `AudioFormatFactory` dispatches via `audioPlaybackMode.effectiveCodecFourCC`
+    /// ("ac-3") instead of the track's own fourCC — no metadata mutation needed.
     ///
     /// - Parameters:
-    ///   - channelCount: Channel count from the MKV track descriptor.
+    ///   - channelCount: Channel count from the MKV track descriptor (informational).
     ///   - sampleRate:   Sample rate from the MKV track descriptor.
     func enableTrueHDAC3Extraction(channelCount: Int, sampleRate: Double) {
         truehDAC3Mode        = true
         audioFramesPerPacket = 1536
         audioSampleRate      = sampleRate > 0 ? sampleRate : 48_000
 
-        // Rebuild audioTrack with "ac-3" codec so AudioFormatFactory uses the AC3 path.
-        guard let existing = audioTrack else { return }
-        let sr  = sampleRate > 0 ? sampleRate : 48_000
-        let ch  = channelCount > 0 ? UInt16(channelCount) : existing.channelCount
-        let updated = TrackInfo(
-            trackID:         existing.trackID,
-            trackType:       .audio,
-            timescale:       existing.timescale,
-            durationTicks:   existing.durationTicks,
-            sampleCount:     existing.sampleCount,
-            codecFourCC:     "ac-3",
-            displayWidth:    nil,
-            displayHeight:   nil,
-            avcCData:        nil,
-            hvcCData:        nil,
-            esdsData:        nil,
-            channelCount:    ch,
-            audioSampleRate: sr
-        )
-        audioTrack = updated
-        tracks = tracks.filter { $0.trackType != .audio }
-        tracks.append(updated)
-        log("  [Sprint34] TrueHD AC3-extraction enabled — "
-          + "ch=\(channelCount) sr=\(Int(sr)) Hz  codecFourCC→\"ac-3\"")
+        // Sprint 36: record source → decoded mapping; do NOT mutate audioTrack.
+        // audioTrack was built by reselectAudio() with the correct channel count
+        // and sample rate from the TrueHD descriptor; no rebuild is needed.
+        let sourceCodecID = audioTrack?.codecFourCC ?? "A_TRUEHD"
+        audioPlaybackMode = .extractedCore(sourceCodecID: sourceCodecID, decodedAs: "ac-3")
+
+        log("  [Sprint36] TrueHD AC3-extraction enabled — "
+          + "ch=\(channelCount) sr=\(Int(audioSampleRate)) Hz  "
+          + "playback: \(audioPlaybackMode.displayLabel)")
     }
 
     // MARK: - Segment Search

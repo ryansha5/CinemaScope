@@ -2,6 +2,8 @@
 // Sprint 31 — Centralized premium-audio decision layer.
 // Sprint 33 — Extended with DTS-Core passthrough path.
 // Sprint 34 — useTrueHDAC3Core action for embedded AC3 extraction.
+// Sprint 35 — Device-aware DTS classify(); DTS-HD MA tier; dtsCoreCandidate guard.
+// Sprint 37 — Integration hardening; log audit.
 //
 // All premium-audio decisions flow through this file.
 // The controller and ContainerPreparation never embed audio-decision logic
@@ -158,22 +160,41 @@ struct PremiumAudioPolicy {
     // MARK: - Track classification
 
     /// Classify a single track by its codec ID.
+    ///
+    /// Sprint 35: DTS-Core classification is now device-aware.
+    /// On non-capable devices, DTS-Core is marked `unsupported` rather than
+    /// `dtsCoreAttempt`; `dtsCoreCandidate()` will also return nil in that case,
+    /// so the system falls through cleanly to AVPlayer.
     static func classify(_ track: MKVAudioTrackDescriptor) -> AudioTrackClassification {
         if track.isAAC   { return .supported(codec: "AAC")   }
         if track.isAC3   { return .supported(codec: "AC3")   }
         if track.isEAC3  { return .supported(codec: "E-AC3") }
 
-        // Sprint 33: DTS-Core passthrough attempt (A_DTS exact match only)
-        if track.isDTSCore { return .dtsCoreAttempt }
+        // Sprint 33 / Sprint 35: DTS-Core — only attempt passthrough on capable devices.
+        if track.isDTSCore {
+            if DTSCapabilityHeuristic.isLikelyCapable {
+                return .dtsCoreAttempt
+            } else {
+                return .unsupported(codec: "DTS-Core",
+                    reason: "device not DTS-capable — passthrough would yield silence")
+            }
+        }
 
         if track.isTrueHD {
             return .unsupported(codec: "TrueHD",
                 reason: "no Apple decoder; requires AC3 core extraction or HDMI passthrough")
         }
-        // DTS-HD variants (A_DTS/HRA, A_DTS/LOSSLESS, etc.)
+
+        // Sprint 35: DTS-HD MA / DTS:X classified separately for accurate logging.
+        // Must check isDTSHDMA before isDTSHD (both match the "A_DTS/" prefix).
+        if track.isDTSHDMA {
+            return .unsupported(codec: "DTS-HD MA (\(track.codecID))",
+                reason: "lossless DTS-HD MA — not decodable; requires HDMI passthrough hardware")
+        }
+        // Other DTS-HD variants (HRA, etc.)
         if track.isDTSHD {
             return .unsupported(codec: "DTS-HD (\(track.codecID))",
-                reason: "lossless/HD DTS not decodable via Apple frameworks")
+                reason: "DTS-HD variant — not decodable via Apple frameworks")
         }
         // Any remaining A_DTS* not caught above
         if track.isDTS {
@@ -215,6 +236,11 @@ struct PremiumAudioPolicy {
                       + "→ \(cls.label)")
         }
 
+        // Sprint 35: emit a device-capability note whenever any DTS-Core track is present.
+        if tracks.contains(where: { $0.isDTSCore }) {
+            logs.append("[Audio] DTS-Core detected — device: \(DTSCapabilityHeuristic.capabilityLabel)")
+        }
+
         let supportedTracks = tracks.filter { $0.isSupported }
 
         // ── Case A: Explicit preferred track ─────────────────────────────────
@@ -228,7 +254,7 @@ struct PremiumAudioPolicy {
                                              logMessages: logs)
             }
 
-            // Preferred track is not directly supported — look for a reliable fallback
+            // Preferred track is not directly supported — look for a reliable fallback.
             logs.append("[Audio] Requested track \(preferred) (\(preferredDesc.codecID)) — \(cls.label)")
 
             if let fallback = findBestFallback(preferredLanguage: preferredDesc.language,
@@ -241,15 +267,17 @@ struct PremiumAudioPolicy {
                     logMessages: logs)
             }
 
-            // Sprint 33: no reliable fallback — try DTS-Core passthrough
+            // Sprint 33 / Sprint 35: no reliable fallback — try DTS-Core passthrough
+            // (only on capable devices; dtsCoreCandidate returns nil otherwise).
             if let dts = dtsCoreCandidate(preferredLanguage: preferredDesc.language, from: tracks) {
-                logs.append("[Audio] No reliable fallback; attempting DTS-Core via passthrough (track \(dts.trackNumber))")
+                logs.append("[Audio] No reliable fallback; DTS-Core passthrough attempt — "
+                          + "track \(dts.trackNumber) (device: \(DTSCapabilityHeuristic.capabilityLabel))")
                 return AudioPlaybackDecision(
                     action: .attemptPassthrough(trackNumber: dts.trackNumber, codec: "DTS-Core"),
                     logMessages: logs)
             }
 
-            logs.append("[Audio] No compatible fallback for \(preferredDesc.codecID) — recommend AVPlayer")
+            logs.append("[Audio] No compatible fallback for \(preferredDesc.codecID) — routing to AVPlayer")
             return AudioPlaybackDecision(
                 action: .fallbackToAVPlayer(reason: "\(preferredDesc.codecID) unsupported, no fallback"),
                 logMessages: logs)
@@ -279,17 +307,28 @@ struct PremiumAudioPolicy {
         }
 
         // No supported tracks at all.
-        // Sprint 33: check for DTS-Core passthrough candidate.
+        // Sprint 33 / Sprint 35: check for DTS-Core passthrough candidate.
+        // dtsCoreCandidate returns nil on non-capable devices (Sprint 35 guard).
         if let dts = dtsCoreCandidate(preferredLanguage: preferencePolicy.preferredLanguage,
                                        from: tracks) {
-            logs.append("[Audio] No supported tracks; attempting DTS-Core via passthrough (track \(dts.trackNumber))")
+            logs.append("[Audio] No supported tracks; DTS-Core passthrough attempt — "
+                      + "track \(dts.trackNumber) (device: \(DTSCapabilityHeuristic.capabilityLabel))")
             return AudioPlaybackDecision(
                 action: .attemptPassthrough(trackNumber: dts.trackNumber, codec: "DTS-Core"),
                 logMessages: logs)
         }
 
+        // Sprint 35: if DTS-Core tracks exist but device isn't capable, explain why.
+        if tracks.contains(where: { $0.isDTSCore }) && !DTSCapabilityHeuristic.isLikelyCapable {
+            let codecList = tracks.map { $0.codecID }.joined(separator: ", ")
+            logs.append("[Audio] DTS-Core present but device not DTS-capable — routing to AVPlayer")
+            return AudioPlaybackDecision(
+                action: .fallbackToAVPlayer(reason: "DTS-Core: device not capable (\(codecList))"),
+                logMessages: logs)
+        }
+
         let codecList = tracks.map { $0.codecID }.joined(separator: ", ")
-        logs.append("[Audio] No compatible audio track (\(codecList)) — recommend AVPlayer")
+        logs.append("[Audio] No compatible audio track (\(codecList)) — routing to AVPlayer")
         return AudioPlaybackDecision(
             action: .fallbackToAVPlayer(reason: "no supported audio (\(codecList))"),
             logMessages: logs)
@@ -313,14 +352,21 @@ struct PremiumAudioPolicy {
     // MARK: - Sprint 33: DTS-Core candidate selection
 
     /// Returns the best A_DTS (standard DTS-Core) track for passthrough attempt.
-    /// Returns nil if no standard DTS-Core tracks exist, or if a supported
-    /// (AAC/AC3/EAC3) track is also present (reliable tracks take priority).
+    ///
+    /// Returns nil if:
+    ///   • Fully-supported (AAC/AC3/EAC3) tracks exist — reliable tracks take priority.
+    ///   • Sprint 35: device is not DTS-capable — silence is worse than AVPlayer.
+    ///   • No DTS-Core tracks exist.
     static func dtsCoreCandidate(
         preferredLanguage: String?,
         from tracks: [MKVAudioTrackDescriptor]
     ) -> MKVAudioTrackDescriptor? {
         // Only consider DTS-Core when there are no fully-supported alternatives.
         guard tracks.filter({ $0.isSupported }).isEmpty else { return nil }
+
+        // Sprint 35: skip passthrough on incapable devices.
+        // Falling through to AVPlayer produces audible audio; silence does not.
+        guard DTSCapabilityHeuristic.isLikelyCapable else { return nil }
 
         let dtsCandidates = tracks.filter { $0.isDTSCore }
         guard !dtsCandidates.isEmpty else { return nil }

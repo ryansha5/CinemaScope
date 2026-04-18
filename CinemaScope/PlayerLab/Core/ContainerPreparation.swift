@@ -3,6 +3,7 @@
 // PlayerLabPlaybackController.prepare(url:).
 // Sprint 31/32 — PremiumAudioPolicy wired in; audio decision propagated to controller.
 // Sprint 33   — DTS-Core reselectAudio path added.
+// Sprint 36   — audioPlaybackMode propagated through MKVPreparationResult.
 //
 // Responsibilities:
 //   • Detect container format from file extension
@@ -70,6 +71,13 @@ struct MKVPreparationResult {
     /// True when no compatible PlayerLab audio path exists and the file
     /// should be routed to AVPlayer.  Derived from audioDecision.action.
     var requiresAVPlayerFallback: Bool { audioDecision.requiresAVPlayerFallback }
+
+    // MARK: - Sprint 36: AudioTrackPlaybackMode
+
+    /// Truthful record of how the audio track is being decoded.
+    /// `.native` for AAC/AC3/EAC3/DTS-Core; `.extractedCore` when TrueHD AC3
+    /// extraction is active.  Passed to AudioFormatFactory for dispatch.
+    let audioPlaybackMode: AudioTrackPlaybackMode
 }
 
 /// All information extracted from a successfully parsed MP4/MOV container.
@@ -282,7 +290,8 @@ enum ContainerPreparation {
             pgsCues:                  mkv.pgsCues,
             chapters:                 mkv.chapters,
             logMessages:              logs,
-            audioDecision:            audioDecision
+            audioDecision:            audioDecision,
+            audioPlaybackMode:        mkv.audioPlaybackMode   // Sprint 36
         )
     }
 

@@ -2,19 +2,22 @@
 // Spring Cleaning SC1 — Centralized audio format-description construction.
 // Extracted from PlayerLabPlaybackController (Sprints 13, 22, 24).
 // Sprint 33 — DTS-Core passthrough path added.
+// Sprint 36 — AudioTrackPlaybackMode parameter; effectiveFourCC dispatch.
 //
 // Handles:
 //   • MP4 AAC   (esds payload → parseAudioSpecificConfig → magic cookie)
 //   • MKV AAC   (CodecPrivate IS the raw AudioSpecificConfig — no parsing needed)
 //   • AC3 / EAC3 (self-framing; no magic cookie required)
 //   • DTS-Core  (Sprint 33: "dtsc" → kAudioFormatDTS; self-framing; hardware passthrough)
+//   • TrueHD / extracted AC3 core (Sprint 36: playbackMode = .extractedCore → AC3 path)
 //
-// Dispatch logic (inside `make(for:codecPrivate:record:)`):
+// Dispatch logic (inside `make(for:playbackMode:codecPrivate:record:)`):
+//   Sprint 36: effectiveFourCC = playbackMode.effectiveCodecFourCC ?? audioTrack.codecFourCC
 //   isAAC  + esdsData present   → MP4 path: strip esds wrapper, use ASC as magic cookie
 //   isAAC  + esdsData nil       → MKV path: codecPrivate IS the raw AudioSpecificConfig
-//   "ac-3"                      → AC3 (kAudioFormatAC3, 1536 frames/packet)
-//   "ec-3"                      → E-AC3 (kAudioFormatEnhancedAC3, 1536 frames/packet)
-//   "dtsc"                      → DTS-Core (kAudioFormatDTS, 512 frames/packet)
+//   effectiveFourCC "ac-3"      → AC3 (kAudioFormatAC3, 1536 frames/packet)
+//   effectiveFourCC "ec-3"      → E-AC3 (kAudioFormatEnhancedAC3, 1536 frames/packet)
+//   effectiveFourCC "dtsc"      → DTS-Core (kAudioFormatDTS, 512 frames/packet)
 //                                  ⚠️ Requires DTS-capable hardware or HDMI passthrough.
 //                                     Yields silence on devices without DTS support.
 //
@@ -36,10 +39,14 @@ enum AudioFormatFactory {
     ///
     /// - Parameters:
     ///   - audioTrack:   TrackInfo for the selected audio track.
+    ///   - playbackMode: How the track is being decoded.  Default = `.native`.
+    ///                   Pass `.extractedCore` when the outer codec differs from the
+    ///                   actual decode format (e.g. TrueHD carrying AC3 core).
     ///   - codecPrivate: MKV CodecPrivate bytes (nil for MP4 tracks).
     ///   - record:       Logging callback forwarded from the controller.
     static func make(
         for audioTrack: TrackInfo,
+        playbackMode:   AudioTrackPlaybackMode = .native,
         codecPrivate:   Data?,
         record:         (String) -> Void
     ) -> CMAudioFormatDescription? {
@@ -50,10 +57,21 @@ enum AudioFormatFactory {
             return nil
         }
 
-        let codecLabel = audioTrack.codecFourCC ?? "?"
-        record("[4b] Building CMAudioFormatDescription (\(codecLabel))…")
+        // Sprint 36: derive the effective codec for dispatch.
+        // For .native, this is the track's own codecFourCC.
+        // For .extractedCore (e.g. TrueHD → AC3), this is the extracted codec.
+        let effectiveFourCC = playbackMode.effectiveCodecFourCC ?? audioTrack.codecFourCC
+
+        // Log accurately: include extraction context when relevant.
+        switch playbackMode {
+        case .native:
+            record("[4b] Building CMAudioFormatDescription (\(effectiveFourCC ?? "?"))…")
+        case .extractedCore:
+            record("[4b] Building CMAudioFormatDescription (\(playbackMode.displayLabel))…")
+        }
 
         // ── AAC ────────────────────────────────────────────────────────────────
+        // isAAC checks codecFourCC ("mp4a" / "A_AAC/..."); unaffected by playbackMode.
         if audioTrack.isAAC {
             // MP4 path: esdsData wraps the AudioSpecificConfig inside a descriptor tree.
             if let esds = audioTrack.esdsData {
@@ -72,19 +90,21 @@ enum AudioFormatFactory {
         }
 
         // ── AC3 / E-AC3 ───────────────────────────────────────────────────────
-        if audioTrack.codecFourCC == "ac-3" {
+        // Sprint 36: dispatch on effectiveFourCC so extracted AC3 from TrueHD
+        // reaches this path even though audioTrack.codecFourCC is "A_TRUEHD".
+        if effectiveFourCC == "ac-3" {
             return makeAC3(channelCount: ch, sampleRate: sr, isEAC3: false, record: record)
         }
-        if audioTrack.codecFourCC == "ec-3" {
+        if effectiveFourCC == "ec-3" {
             return makeAC3(channelCount: ch, sampleRate: sr, isEAC3: true, record: record)
         }
 
         // ── DTS-Core (Sprint 33) ──────────────────────────────────────────────
-        if audioTrack.codecFourCC == "dtsc" {
+        if effectiveFourCC == "dtsc" {
             return makeDTSCore(channelCount: ch, sampleRate: sr, record: record)
         }
 
-        record("  ⚠️ AudioFormatFactory: unsupported codec '\(codecLabel)'")
+        record("  ⚠️ AudioFormatFactory: unsupported codec '\(effectiveFourCC ?? "?")'")
         return nil
     }
 

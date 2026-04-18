@@ -260,17 +260,19 @@ final class PlayerLabPlaybackController: ObservableObject {
             subtitleCoordinator.apply(mkvResult: r)   // SC5
             chapters = r.chapters
 
-            // Sprint 31/32/34: log audio decision action ----------------------
+            // Sprint 31/32/34/35/37: log audio decision action ---------------
             switch r.audioDecision.action {
             case .useDirect(let n):
                 record("[Audio] Direct playback — track \(n)")
             case .useFallback(let n, let from, let to):
                 record("[Audio] Fallback — \(from) → \(to) (track \(n))")
             case .attemptPassthrough(let n, let codec):
-                record("[Audio] ⚠️ Attempting \(codec) passthrough — track \(n) "
-                     + "(silence possible on this device)")
+                record("[Audio] ⚠️ \(codec) passthrough attempt — track \(n) "
+                     + "(device: \(DTSCapabilityHeuristic.capabilityLabel); "
+                     + "silence possible if device lacks DTS hardware)")
             case .useTrueHDAC3Core(let n):
-                record("[Audio] TrueHD with AC3 core extracted — track \(n)")
+                // Sprint 36/37: use audioPlaybackMode for accurate log.
+                record("[Audio] \(r.audioPlaybackMode.displayLabel) — track \(n)")
             case .fallbackToAVPlayer(let reason):
                 record("[Audio] No compatible PlayerLab audio path — \(reason)")
                 fail("No compatible audio — route to AVPlayer: \(reason)")
@@ -307,17 +309,22 @@ final class PlayerLabPlaybackController: ObservableObject {
         }
 
         // ── Step 6: Build CMAudioFormatDescription (SC1 — AudioFormatFactory) ─
-        let activeAudioTrack: TrackInfo?
-        let mkvCodecPrivate: Data?
+        let activeAudioTrack:    TrackInfo?
+        let mkvCodecPrivate:     Data?
+        let activePlaybackMode:  AudioTrackPlaybackMode  // Sprint 36
         switch prepared {
-        case .mkv(let r): activeAudioTrack = r.demuxer.audioTrack
-                          mkvCodecPrivate  = r.demuxer.audioCodecPrivate
-        case .mp4(let r): activeAudioTrack = r.demuxer.audioTrack
-                          mkvCodecPrivate  = nil
+        case .mkv(let r): activeAudioTrack   = r.demuxer.audioTrack
+                          mkvCodecPrivate    = r.demuxer.audioCodecPrivate
+                          activePlaybackMode = r.audioPlaybackMode
+        case .mp4(let r): activeAudioTrack   = r.demuxer.audioTrack
+                          mkvCodecPrivate    = nil
+                          activePlaybackMode = .native
         }
 
         if let at = activeAudioTrack, let ch = at.channelCount, let sr = at.audioSampleRate {
-            let fmtDesc = AudioFormatFactory.make(for: at, codecPrivate: mkvCodecPrivate,
+            let fmtDesc = AudioFormatFactory.make(for: at,
+                                                  playbackMode: activePlaybackMode,
+                                                  codecPrivate: mkvCodecPrivate,
                                                   record: record(_:))
             if let fmtDesc {
                 feeder.audioFormatDesc   = fmtDesc
