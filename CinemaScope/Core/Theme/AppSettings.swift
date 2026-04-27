@@ -1,6 +1,56 @@
 import Foundation
 import Combine
 
+// MARK: - PlaybackEngineMode
+//
+// Controls which playback engine handles media in HomeView.
+//
+//   avPlayerOnly       — bypass PlayerLab entirely; use Emby's DirectPlay /
+//                        TranscodingUrl path only. Use this to restore a known-
+//                        good baseline or diagnose PlayerLab regressions.
+//
+//   playerLabPreferred — two-stage routing: PlayerLab handles compatible files
+//                        (raw-stream MKV/MP4 meeting the confidence threshold);
+//                        AVPlayer handles everything else. This is the normal
+//                        production mode once PlayerLab is stable.
+//
+//   playerLabOnlyDebug — always route to PlayerLab, never fall back. Use only
+//                        during active PlayerLab development; expected to fail
+//                        on files PlayerLab does not yet support.
+
+enum PlaybackEngineMode: String, CaseIterable, Codable {
+    case avPlayerOnly        = "avPlayerOnly"
+    case playerLabPreferred  = "playerLabPreferred"
+    case playerLabOnlyDebug  = "playerLabOnlyDebug"
+
+    var displayLabel: String {
+        switch self {
+        case .avPlayerOnly:       return "AVPlayer Only"
+        case .playerLabPreferred: return "PlayerLab (Preferred)"
+        case .playerLabOnlyDebug: return "PlayerLab Only (Debug)"
+        }
+    }
+
+    var shortLabel: String {
+        switch self {
+        case .avPlayerOnly:       return "AVPlayer"
+        case .playerLabPreferred: return "PlayerLab + AVPlayer"
+        case .playerLabOnlyDebug: return "PlayerLab (debug)"
+        }
+    }
+
+    /// True when PlayerLab should be consulted at all for a given play() call.
+    var playerLabEnabled: Bool {
+        switch self {
+        case .avPlayerOnly:       return false
+        case .playerLabPreferred: return true
+        case .playerLabOnlyDebug: return true
+        }
+    }
+}
+
+// MARK: - AppSettings
+
 final class AppSettings: ObservableObject {
 
     static let shared = AppSettings()
@@ -60,14 +110,36 @@ final class AppSettings: ObservableObject {
         didSet { UserDefaults.standard.set(hasCompletedOnboarding, forKey: "hasCompletedOnboarding") }
     }
 
-    // MARK: - PlayerLab  (Sprint 15)
+    // MARK: - HyperView (experimental)
 
-    /// When true the PlayerLab custom playback engine is enabled.
-    /// Compatible local MP4 files (H.264/HEVC + AAC) can be played through
-    /// PlayerLab instead of AVPlayer.  Default: false.
-    @Published var playerLabEnabled: Bool {
-        didSet { UserDefaults.standard.set(playerLabEnabled, forKey: "playerLabEnabled") }
+    /// When true, browsing a non-pinned ribbon transforms the top 2/3 of the
+    /// home screen into a full-bleed backdrop with metadata for the focused item.
+    /// Disabled by default — feature is still being refined.
+    @Published var hyperViewEnabled: Bool {
+        didSet { UserDefaults.standard.set(hyperViewEnabled, forKey: "hyperViewEnabled") }
     }
+
+    // MARK: - PlayerLab First Frame Mode  (Sprint 44)
+
+    /// Debug mode: prepare and render only the first keyframe, then stop.
+    /// Proves the raw MKV → HEVC → CMSampleBuffer → displayLayer pipeline
+    /// without requiring a full feed loop.  Off by default.
+    @Published var playerLabFirstFrameMode: Bool {
+        didSet { UserDefaults.standard.set(playerLabFirstFrameMode, forKey: "playerLabFirstFrameMode") }
+    }
+
+    // MARK: - PlayerLab / Playback Engine  (Sprint 15 → Sprint 43)
+
+    /// Controls which playback engine is used.  Replaces the old `playerLabEnabled`
+    /// bool with a three-way enum so the debug/off/on distinction is explicit.
+    /// Default: .avPlayerOnly for a safe out-of-the-box baseline.
+    @Published var playbackEngineMode: PlaybackEngineMode {
+        didSet { UserDefaults.standard.set(playbackEngineMode.rawValue, forKey: "playbackEngineMode") }
+    }
+
+    /// Convenience accessor: true when PlayerLab should be consulted at all.
+    /// Use this instead of reading `playbackEngineMode` in non-routing code.
+    var playerLabEnabled: Bool { playbackEngineMode.playerLabEnabled }
 
     /// Last file path the user tested in PlayerLab — persisted across sessions.
     @Published var playerLabLastPath: String {
@@ -98,10 +170,21 @@ final class AppSettings: ObservableObject {
         let tabRaw  = UserDefaults.standard.string(forKey: "startupTab") ?? NavTab.home.rawValue
         self.startupTab = NavTab(rawValue: tabRaw) ?? .home
         self.hasCompletedOnboarding = UserDefaults.standard.bool(forKey: "hasCompletedOnboarding")
-        self.playerLabEnabled       = UserDefaults.standard.bool(forKey: "playerLabEnabled")
+        // HyperView defaults to OFF — experimental feature, not ready for daily use
+        self.hyperViewEnabled       = UserDefaults.standard.object(forKey: "hyperViewEnabled") as? Bool ?? false
+        // Sprint 43: playbackEngineMode replaces the old playerLabEnabled Bool.
+        // Migration: if the old Bool was saved as true, default to .playerLabPreferred;
+        // otherwise default to .avPlayerOnly (safest baseline).
+        let modeRaw = UserDefaults.standard.string(forKey: "playbackEngineMode")
+        if let modeRaw, let mode = PlaybackEngineMode(rawValue: modeRaw) {
+            self.playbackEngineMode = mode
+        } else {
+            // First launch or migration from old Bool key.
+            let legacyEnabled = UserDefaults.standard.bool(forKey: "playerLabEnabled")
+            self.playbackEngineMode = legacyEnabled ? .playerLabPreferred : .avPlayerOnly
+        }
+        self.playerLabFirstFrameMode = UserDefaults.standard.bool(forKey: "playerLabFirstFrameMode")
         self.playerLabLastPath      = UserDefaults.standard.string(forKey: "playerLabLastPath") ?? ""
-        // Sprint 43: default to .high — only route to PlayerLab when all codecs are
-        // deterministically supported. Operators can lower to .medium to expand coverage.
         let confRaw = UserDefaults.standard.object(forKey: "playerLabMinConfidence") as? Int
             ?? PlaybackConfidence.high.rawValue
         self.playerLabMinConfidence = PlaybackConfidence(rawValue: confRaw) ?? .high

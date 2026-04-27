@@ -235,7 +235,8 @@ enum CinemaTheme {
     // ─────────────────────────────────────────────
 
     static let scopeRatio:         Double  = 2.39
-    static let navRailWidth:        CGFloat = 240
+    static let navRailWidth:         CGFloat = 240
+    static let navRailCollapsedWidth: CGFloat = 68    // icon-only collapsed state
     static let scopeCardWidth:      CGFloat = 140
     static let scopeCardHeight:     CGFloat = 210
     static let standardCardWidth:   CGFloat = 200

@@ -214,8 +214,62 @@ final class MKVDemuxer {
 
     // MARK: - Private state
 
-    private let parser: MKVParser
-    private let reader: MediaReader
+    private let parser:         MKVParser
+    private let reader:         MediaReader        // raw reader — used for large batched packet extraction
+    private let bufferedReader: EBMLBufferedReader // 512 KB window reader — used for all header/scan reads
+
+    // MARK: - Sprint 43: Two-phase indexing (startup + background)
+    //
+    // Phase A — Startup scan:
+    //   scanClusters() indexes only `startupScanSeconds` of content (~8 s) so
+    //   parse() returns quickly and playback can begin.  At 497 clusters / 25 s
+    //   (the original 120 s target) the overhead was prohibitive for remote MKV.
+    //   At 8 s the startup index completes in ~1–2 s for typical H.265 content.
+    //
+    // Phase B — Background / on-demand indexing:
+    //   continueIndexing(untilSeconds:) resumes from `backgroundScanCursor` and
+    //   appends to frameIndex / audioFrameIndex / subtitleCues without clearing
+    //   them.  The feed loop calls this synchronously when the playhead approaches
+    //   the end of the indexed window.
+    //
+    // `minStartupScanSeconds` guarantees we never hand off fewer than 3 s to the
+    // feeder even when a file has very large sparse clusters.
+    private static let minStartupScanSeconds: Double =   3.0
+    private static let startupScanSeconds:    Double =   8.0
+
+    // MARK: - Sprint 43: Background-indexing state
+
+    /// File offset from which continueIndexing() will resume scanning.
+    private var backgroundScanCursor: Int64 = 0
+
+    /// Upper bound for cluster scanning (= reader.contentLength at parse time).
+    private var backgroundScanLimit:  Int64 = 0
+
+    /// True once scanClusters has reached EOF (or continueIndexing exhausted the file).
+    private(set) var isFullyIndexed: Bool = false
+
+    /// Duration of the content currently indexed (= last frame PTS after each scan phase).
+    /// Used by the feeder for fps estimation; grows as background indexing proceeds.
+    private(set) var indexedDurationSeconds: Double = 0
+
+    /// Total file duration from the Segment/Info Duration EBML field.
+    /// Used for the seek-bar (PlayerLabPlaybackController.duration) and TrackInfo.
+    /// Zero if the Info element does not include a Duration field.
+    private(set) var fileDurationSeconds: Double = 0
+
+    // MARK: - Indexed-frame accessors (read by controller to update feeder totals)
+
+    /// Number of video frames in the index (grows with background indexing).
+    var indexedVideoFrameCount: Int { frameIndex.count }
+    /// Number of audio frames in the index (grows with background indexing).
+    var indexedAudioFrameCount: Int { audioFrameIndex.count }
+
+    /// Index of the first keyframe in the video frame index.
+    /// Returns 0 when the index is empty (safe default — caller should check
+    /// `indexedVideoFrameCount > 0` before using the result).
+    var firstVideoKeyframeIndex: Int {
+        frameIndex.firstIndex(where: { $0.isKeyframe }) ?? 0
+    }
 
     private var frameIndex:      [MKVFrameInfo]      = []
     private var audioFrameIndex: [MKVAudioFrameInfo] = []
@@ -258,8 +312,13 @@ final class MKVDemuxer {
     // MARK: - Init
 
     init(reader: MediaReader) {
-        self.reader = reader
-        self.parser = MKVParser(reader: reader)
+        self.reader         = reader
+        // Sprint 43: wrap the raw reader in a 512 KB buffered reader so that
+        // all EBML element-header reads (1-byte ID, 1-byte size VINT, etc.)
+        // are served from memory rather than triggering individual HTTP requests.
+        let buf             = EBMLBufferedReader(reader: reader)
+        self.bufferedReader = buf
+        self.parser         = MKVParser(reader: buf)
     }
 
     // MARK: - Parse
@@ -422,9 +481,14 @@ final class MKVDemuxer {
           + "\(subtitleCues.count) SRT / \(pgsCues.count) PGS subtitle frames")
 
         // ── Build video TrackInfo ─────────────────────────────────────────────
+        // Sprint 43: durationTicks uses fileDurationSeconds (true file duration from Info EBML)
+        // so the seek bar reflects the correct total length even when only 8 s are indexed.
+        // sampleCount is the startup-indexed count; the feeder updates its copy as background
+        // indexing proceeds.
         let codecFourCC = videoMKVTrack.isH264 ? "avc1" : "hev1"
-        let durationSec   = frameIndex.last.map { $0.pts.seconds } ?? 0
-        let durationTicks = UInt64(durationSec * Double(outputTimescale))
+        let indexedSec    = frameIndex.last.map { $0.pts.seconds } ?? 0
+        let trueDurSec    = fileDurationSeconds > 0 ? fileDurationSeconds : indexedSec
+        let durationTicks = UInt64(trueDurSec * Double(outputTimescale))
 
         videoTrack = TrackInfo(
             trackID: UInt32(videoMKVTrack.trackNumber), trackType: .video,
@@ -459,7 +523,10 @@ final class MKVDemuxer {
             tracks.append(audioTrack!)
         }
 
-        log("✅ parse() complete — dur≈\(String(format: "%.1f", durationSec))s")
+        log("✅ parse() complete — "
+          + "indexed=\(String(format: "%.1f", indexedSec))s  "
+          + "fileDur=\(fileDurationSeconds > 0 ? String(format: "%.1f", fileDurationSeconds) + "s" : "unknown")  "
+          + "v=\(frameIndex.count)  a=\(audioFrameIndex.count)")
     }
 
     // MARK: - Sprint 32: reselectAudio
@@ -560,6 +627,88 @@ final class MKVDemuxer {
         log("  ✅ [reselectAudio] track \(trackNum) (\(audioFourCC))  "
           + "\(audioFrameIndex.count) audio / \(frameIndex.count) video / "
           + "\(subtitleCues.count) SRT / \(pgsCues.count) PGS frames")
+    }
+
+    // MARK: - Sprint 43: Background / on-demand indexing
+
+    /// Continues cluster scanning from where the startup scan stopped.
+    ///
+    /// Called by the feed loop when the playhead approaches the end of the
+    /// indexed window.  Appends new frames to `frameIndex` / `audioFrameIndex` /
+    /// `subtitleCues` without clearing them.  PGS bitmap decoding is skipped
+    /// for performance; SRT subtitles are collected.
+    ///
+    /// - Parameter targetSeconds: Scan until at least this many seconds of content
+    ///   are indexed (measured from the start of the file).
+    /// - Returns: `(videoAdded, audioAdded)` — number of newly indexed frames.
+    @discardableResult
+    func continueIndexing(untilSeconds targetSeconds: Double) async throws -> (videoAdded: Int, audioAdded: Int) {
+        guard !isFullyIndexed else { return (0, 0) }
+        guard backgroundScanCursor > 0, backgroundScanCursor < backgroundScanLimit else {
+            isFullyIndexed = true
+            return (0, 0)
+        }
+
+        let videoCountBefore = frameIndex.count
+        let audioCountBefore = audioFrameIndex.count
+        let scanStart        = Date()
+        var clusterCount     = 0
+
+        var cursor = backgroundScanCursor
+        let limit  = backgroundScanLimit
+
+        while cursor < limit {
+            guard let (elem, hdrBytes) = try await parser.nextElement(at: cursor, limit: limit)
+            else { break }
+
+            if elem.knownID == .cluster {
+                let clusterEnd = elem.payloadSize >= 0
+                    ? elem.payloadOffset + elem.payloadSize : limit
+                // Pass pgsTrackNum: nil to skip expensive bitmap decoding in background.
+                try await parseCluster(at:               elem.payloadOffset,
+                                       end:              clusterEnd,
+                                       videoTrackNum:    videoTrackNum_,
+                                       audioTrackNum:    selectedAudioTrackNumber,
+                                       subtitleTrackNum: subtitleTrackNum_,
+                                       pgsTrackNum:      nil)
+                clusterCount += 1
+
+                let indexedSec = frameIndex.last?.pts.seconds ?? 0
+                if indexedSec >= targetSeconds { break }
+            }
+
+            let total = Int64(hdrBytes) + (elem.payloadSize >= 0 ? elem.payloadSize : 0)
+            if total <= 0 { break }
+            cursor += total
+        }
+
+        // Update cursor and EOF flag.
+        backgroundScanCursor = cursor
+        if cursor >= limit { isFullyIndexed = true }
+
+        // Sort only the newly added slice (new frames have higher cluster timestamps,
+        // so the sort is O(k log k) for the new k frames, not O(N log N) for all).
+        if frameIndex.count > videoCountBefore {
+            frameIndex[videoCountBefore...].sort { $0.pts < $1.pts }
+        }
+        if audioFrameIndex.count > audioCountBefore {
+            audioFrameIndex[audioCountBefore...].sort { $0.pts < $1.pts }
+        }
+        if subtitleCues.count > 0 {
+            subtitleCues.sort { $0.startTime.seconds < $1.startTime.seconds }
+        }
+
+        indexedDurationSeconds = frameIndex.last?.pts.seconds ?? 0
+        let videoAdded = frameIndex.count - videoCountBefore
+        let audioAdded = audioFrameIndex.count - audioCountBefore
+        let elapsed    = Date().timeIntervalSince(scanStart)
+
+        log("  [Background] indexed to \(String(format: "%.0f", indexedDurationSeconds))s "
+          + "+\(videoAdded)v/+\(audioAdded)a  \(clusterCount) clusters  "
+          + "\(String(format: "%.2f", elapsed))s"
+          + (isFullyIndexed ? "  ✅ fully indexed" : ""))
+
+        return (videoAdded, audioAdded)
     }
 
     // MARK: - Sprint 34: TrueHD → AC3 Core probe + extraction enablement
@@ -665,16 +814,34 @@ final class MKVDemuxer {
     // MARK: - Info Parsing
 
     private func parseInfo(at offset: Int64) async throws {
-        let limit  = offset + 256
+        // Sprint 43: increased limit to 1024 to handle files with long Title/App strings.
+        let limit  = offset + 1_024
         var cursor = offset
+
+        // Collect both values before computing fileDurationSeconds (order not guaranteed).
+        var rawDurationTicks: Double = 0
+
         while cursor < limit {
             guard let (elem, hdrBytes) = try await parser.nextElement(at: cursor, limit: limit)
             else { break }
-            if elem.knownID == .timecodeScale {
+            switch elem.knownID {
+            case .timecodeScale:
                 timecodeScaleNS = try await parser.readUInt(elem)
+            case .duration:
+                // Info/Duration is an IEEE 754 float expressing segment duration
+                // in TimecodeScale ticks.  Sprint 43: parse for true file duration.
+                rawDurationTicks = try await parser.readFloat(elem)
+            default: break
             }
             let total = Int64(hdrBytes) + (elem.payloadSize >= 0 ? elem.payloadSize : 0)
             cursor += max(1, total)
+        }
+
+        // Convert ticks → seconds using the (now-parsed) timecodeScale.
+        if rawDurationTicks > 0 {
+            fileDurationSeconds = rawDurationTicks * Double(timecodeScaleNS) / 1_000_000_000.0
+            log("  [Info] Duration=\(String(format: "%.1f", fileDurationSeconds))s  "
+              + "TimecodeScale=\(timecodeScaleNS)ns")
         }
     }
 
@@ -869,8 +1036,16 @@ final class MKVDemuxer {
         subtitleCues.removeAll()   // Sprint 26
         pgsRawPackets.removeAll()   // Sprint 28
 
-        var cursor = segOffset
+        let scanStart = Date()
+        var clusterCount = 0
+
         let limit  = reader.contentLength
+        backgroundScanLimit = limit   // Sprint 43: captured for continueIndexing()
+        var cursor = segOffset
+
+        log("  [Startup] Index target: \(Self.startupScanSeconds)s "
+          + "(minimum: \(Self.minStartupScanSeconds)s)")
+
         while cursor < limit {
             guard let (elem, hdrBytes) = try await parser.nextElement(at: cursor, limit: limit)
             else { break }
@@ -883,14 +1058,44 @@ final class MKVDemuxer {
                                        audioTrackNum: audioTrackNumber,
                                        subtitleTrackNum: subtitleTrackNum,
                                        pgsTrackNum: pgsTrackNum)
+                clusterCount += 1
+
+                // ── Sprint 43: startup early exit ─────────────────────────────
+                // Exit after startupScanSeconds so parse() returns quickly.
+                // continueIndexing() resumes from backgroundScanCursor on-demand.
+                let indexedSec = frameIndex.last?.pts.seconds ?? 0
+                if indexedSec >= Self.startupScanSeconds {
+                    backgroundScanCursor = cursor  // resume point for background indexing
+                    let elapsed = Date().timeIntervalSince(scanStart)
+                    log("  [Startup] Startup index complete — "
+                      + "\(String(format: "%.1f", indexedSec))s indexed  "
+                      + "\(clusterCount) clusters  "
+                      + "\(String(format: "%.2f", elapsed))s elapsed  "
+                      + "fills=\(bufferedReader.fillCount)")
+                    break
+                }
             }
             let total = Int64(hdrBytes) + (elem.payloadSize >= 0 ? elem.payloadSize : 0)
             if total <= 0 { break }
             cursor += total
         }
+
+        // If we reached EOF without early exit: mark fully indexed.
+        if backgroundScanCursor == 0 || cursor >= limit {
+            isFullyIndexed = true
+            backgroundScanCursor = limit
+            let elapsed = Date().timeIntervalSince(scanStart)
+            let indexedSec = frameIndex.last?.pts.seconds ?? 0
+            log("  [Startup] Reached EOF — fully indexed  "
+              + "\(String(format: "%.1f", indexedSec))s  "
+              + "\(clusterCount) clusters  "
+              + "\(String(format: "%.2f", elapsed))s")
+        }
+
         frameIndex.sort      { $0.pts < $1.pts }
         audioFrameIndex.sort { $0.pts < $1.pts }
         subtitleCues.sort    { $0.startTime.seconds < $1.startTime.seconds }   // Sprint 26
+        indexedDurationSeconds = frameIndex.last?.pts.seconds ?? 0
     }
 
     private func parseCluster(at start: Int64, end: Int64,
@@ -959,7 +1164,9 @@ final class MKVDemuxer {
         guard let (trackNum, vintWidth) = try? await parser.readVINT(at: elem.payloadOffset)
         else { return nil }
         let tcOffset = elem.payloadOffset + Int64(vintWidth)
-        guard let tcBuf = try? await reader.read(offset: tcOffset, length: 3),
+        // Sprint 43: use bufferedReader for this small header read so it is served
+        // from the 512 KB window rather than issuing a separate HTTP Range request.
+        guard let tcBuf = try? await bufferedReader.readBytes(at: tcOffset, length: 3),
               tcBuf.count >= 3 else { return nil }
         let b0     = UInt16(tcBuf[tcBuf.startIndex])
         let b1     = UInt16(tcBuf[tcBuf.index(tcBuf.startIndex, offsetBy: 1)])
@@ -999,7 +1206,8 @@ final class MKVDemuxer {
         guard let (trackNum, vintWidth) = try? await parser.readVINT(at: blk.payloadOffset)
         else { return nil }
         let tcOffset = blk.payloadOffset + Int64(vintWidth)
-        guard let tcBuf = try? await reader.read(offset: tcOffset, length: 3),
+        // Sprint 43: bufferedReader for this 3-byte header read (same as decodeSimpleBlock).
+        guard let tcBuf = try? await bufferedReader.readBytes(at: tcOffset, length: 3),
               tcBuf.count >= 3 else { return nil }
         let b0    = UInt16(tcBuf[tcBuf.startIndex])
         let b1    = UInt16(tcBuf[tcBuf.index(tcBuf.startIndex, offsetBy: 1)])
@@ -1039,7 +1247,8 @@ final class MKVDemuxer {
                                       basePTS: CMTime) async -> [MKVAudioFrameInfo] {
         guard totalSize > 2 else { return [] }
         let readLen = min(512, totalSize)
-        guard let hdr = try? await reader.read(offset: dataOffset, length: readLen),
+        // Sprint 43: lacing header is small and sequential — served from 512 KB window.
+        guard let hdr = try? await bufferedReader.readBytes(at: dataOffset, length: readLen),
               !hdr.isEmpty else { return [] }
         let frameCount = Int(hdr[hdr.startIndex]) + 1
         guard frameCount >= 2 else {
@@ -1068,7 +1277,8 @@ final class MKVDemuxer {
     private func parseFixedLacedAudio(dataOffset: Int64, totalSize: Int,
                                        basePTS: CMTime) async -> [MKVAudioFrameInfo] {
         guard totalSize > 2 else { return [] }
-        guard let hdr = try? await reader.read(offset: dataOffset, length: 1),
+        // Sprint 43: 1-byte header — always within the current window.
+        guard let hdr = try? await bufferedReader.readBytes(at: dataOffset, length: 1),
               !hdr.isEmpty else {
             return [MKVAudioFrameInfo(fileOffset: dataOffset, size: totalSize, pts: basePTS)]
         }
@@ -1111,7 +1321,9 @@ final class MKVDemuxer {
             endPTS = CMTimeAdd(pts, CMTime(seconds: 5.0, preferredTimescale: outputTimescale))
         }
         guard raw.dataSize > 0,
-              let textData = try? await reader.read(offset: raw.dataOffset, length: raw.dataSize),
+              // Sprint 43: subtitle text payloads are small and sequential —
+              // served from the 512 KB window during cluster scan.
+              let textData = try? await bufferedReader.readBytes(at: raw.dataOffset, length: raw.dataSize),
               let text = String(data: textData, encoding: .utf8)?
                   .trimmingCharacters(in: .whitespacesAndNewlines),
               !text.isEmpty
@@ -1134,7 +1346,10 @@ final class MKVDemuxer {
         } else {
             endPTS = nil
         }
-        guard let data = try? await reader.read(offset: raw.dataOffset, length: raw.dataSize)
+        // Sprint 43: PGS payloads are typically <100 KB and sequential — use
+        // the 512 KB window.  Very large PGS packets fall back to a direct read
+        // transparently via EBMLBufferedReader's fallback path.
+        guard let data = try? await bufferedReader.readBytes(at: raw.dataOffset, length: raw.dataSize)
         else { return }
         pgsRawPackets.append(PGSRawPacket(pts: pts, endPTS: endPTS, data: data))
     }

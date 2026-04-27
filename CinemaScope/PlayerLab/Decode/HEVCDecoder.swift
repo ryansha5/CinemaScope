@@ -35,6 +35,16 @@ import Foundation
 import VideoToolbox
 import CoreMedia
 
+// MARK: - Stderr logging (unbuffered — survives hard crash / SIGABRT)
+//
+// FileHandle.standardError bypasses Swift's stdout buffer: writes reach the
+// Xcode console even if the process aborts before stdout can flush.
+
+private func errLog(_ msg: String) {
+    guard let data = (msg + "\n").data(using: .utf8) else { return }
+    FileHandle.standardError.write(data)
+}
+
 // MARK: - Errors
 
 enum HEVCDecoderError: Error, LocalizedError {
@@ -42,16 +52,23 @@ enum HEVCDecoderError: Error, LocalizedError {
     case badConfigVersion(UInt8)
     case malformedNALArray(String)
     case noParameterSets
+    case missingParameterSetType(String)
     case formatDescriptionFailed(OSStatus)
 
     var errorDescription: String? {
         switch self {
-        case .payloadTooShort(let n):        return "hvcC payload too short (\(n) bytes, need ≥ 23)"
-        case .badConfigVersion(let v):       return "hvcC configurationVersion=\(v), expected 1"
-        case .malformedNALArray(let reason): return "Malformed hvcC NAL array: \(reason)"
-        case .noParameterSets:               return "hvcC contains no parameter-set NAL units"
+        case .payloadTooShort(let n):
+            return "hvcC payload too short (\(n) bytes, need ≥ 23)"
+        case .badConfigVersion(let v):
+            return "hvcC configurationVersion=\(v), expected 1"
+        case .malformedNALArray(let reason):
+            return "Malformed hvcC NAL array: \(reason)"
+        case .noParameterSets:
+            return "hvcC contains no parameter-set NAL units (VPS/SPS/PPS)"
+        case .missingParameterSetType(let m):
+            return "Missing HEVC parameter set: \(m)"
         case .formatDescriptionFailed(let s):
-            return "CMVideoFormatDescriptionCreateFromHEVCParameterSets failed: \(s)"
+            return "CMVideoFormatDescriptionCreateFromHEVCParameterSets failed: OSStatus=\(s)"
         }
     }
 }
@@ -60,99 +77,266 @@ enum HEVCDecoderError: Error, LocalizedError {
 
 final class HEVCDecoder {
 
-    // MARK: - Format Description Factory (Sprint 12)
+    // MARK: - Sanity limits (prevent runaway loops on corrupt data)
+    private static let maxArrays:    Int = 16
+    private static let maxNALsPerArray: Int = 64
+    private static let maxNALSize:   Int = 65536   // 64 KB — no real param set is larger
 
-    /// Parse the raw hvcC box payload and return a CMVideoFormatDescription.
+    // MARK: - Format Description Factory
+
+    /// Parse a raw hvcC box payload and return a CMVideoFormatDescription.
     ///
-    /// - Parameter hvcCData: The raw bytes of the hvcC box (payload only,
-    ///   header stripped).  Typically 40–100 bytes.
-    /// - Returns: A CMVideoFormatDescription configured for HEVC decoding.
-    static func makeFormatDescription(from hvcCData: Data) throws -> CMVideoFormatDescription {
-        guard hvcCData.count >= 23 else {
-            throw HEVCDecoderError.payloadTooShort(hvcCData.count)
+    /// All diagnostic output goes to **stderr** (unbuffered) so messages appear
+    /// in the Xcode console even if VideoToolbox crashes the process before
+    /// stdout can flush.
+    ///
+    /// - Important: `hvcCData` is flattened to `[UInt8]` on entry to guarantee
+    ///   0-based indexing.  Swift `Data` slices retain the indices of their
+    ///   parent buffer, so direct subscript `data[0]` on a slice triggers an
+    ///   out-of-bounds trap when the slice does not start at offset 0.
+    ///
+    /// - Parameters:
+    ///   - hvcCData: Raw bytes of the hvcC box (payload only, box header stripped).
+    ///   - label:    Context tag for log lines (e.g. "Prepare #1").
+    static func makeFormatDescription(from hvcCData: Data,
+                                      label: String = "") throws -> CMVideoFormatDescription {
+
+        let tag = label.isEmpty ? "[HEVCDecoder]" : "[HEVCDecoder \(label)]"
+
+        // ── CRITICAL: flatten to [UInt8] ─────────────────────────────────────
+        // Data created via slice subscript (data[lo..<hi]) retains the parent's
+        // indices.  Accessing such a slice with hvcCData[0] crashes when the
+        // slice's startIndex != 0.  Array(hvcCData) always produces 0-based
+        // indices regardless of how the original Data was constructed.
+        let b = Array(hvcCData)
+        let n = b.count
+
+        errLog("\(tag) ── hvcC parse start ─────────────────────────────────")
+        errLog("\(tag) payload=\(n)B  "
+             + "first4=\(b.prefix(4).map { String(format: "%02X", $0) }.joined(separator: " "))")
+
+        // ── Minimum length ────────────────────────────────────────────────────
+        guard n >= 23 else {
+            errLog("\(tag) ❌ payload too short (\(n)B, need ≥23)")
+            throw HEVCDecoderError.payloadTooShort(n)
         }
-        guard hvcCData[0] == 1 else {
-            throw HEVCDecoderError.badConfigVersion(hvcCData[0])
+        errLog("\(tag) length check ✅ (\(n)B ≥ 23)")
+
+        // ── configurationVersion ──────────────────────────────────────────────
+        let configVersion = b[0]
+        errLog("\(tag) configurationVersion=\(configVersion) \(configVersion == 1 ? "✅" : "❌ expected 1")")
+        guard configVersion == 1 else {
+            throw HEVCDecoderError.badConfigVersion(configVersion)
         }
 
-        // byte [21]: ...| lengthSizeMinusOne (2 bits)
-        let nalUnitLength = Int(hvcCData[21] & 0x03) + 1
+        // ── Profile / tier / level ────────────────────────────────────────────
+        let profileSpace = (b[1] >> 6) & 0x03
+        let tierFlag     = (b[1] >> 5) & 0x01
+        let profileIdc   =  b[1]       & 0x1F
+        let levelIdc     = b[12]
+        errLog("\(tag) profile_space=\(profileSpace)  tier_flag=\(tierFlag)  "
+             + "profile_idc=\(profileIdc)  level_idc=\(levelIdc)")
 
-        // byte [22]: numOfArrays
-        let numArrays = Int(hvcCData[22])
+        // ── lengthSizeMinusOne / numOfArrays ─────────────────────────────────
+        let lengthSizeMinusOne = b[21] & 0x03
+        let nalUnitLength      = Int(lengthSizeMinusOne) + 1
+        let numArrays          = Int(b[22])
+        errLog("\(tag) lengthSizeMinusOne=\(lengthSizeMinusOne)  "
+             + "nalUnitLength=\(nalUnitLength)  numOfArrays=\(numArrays)  "
+             + "parse offset after header=23")
 
-        // Collect VPS / SPS / PPS NAL units.
-        // CMVideoFormatDescriptionCreateFromHEVCParameterSets only needs those three
-        // types.  ffmpeg libx265 often appends a 4th array (prefix-SEI, type 39);
-        // including non-parameter-set NALUs in the API call can cause it to fail,
-        // so we filter to the three known types and silently skip the rest.
-        //
-        // HEVC NAL unit types (lower 6 bits of the array-type byte):
-        //   VPS = 32 (0x20)   SPS = 33 (0x21)   PPS = 34 (0x22)
+        guard numArrays > 0 else {
+            errLog("\(tag) ❌ numOfArrays=0 — no parameter sets")
+            throw HEVCDecoderError.noParameterSets
+        }
+        guard numArrays <= HEVCDecoder.maxArrays else {
+            errLog("\(tag) ❌ numOfArrays=\(numArrays) exceeds sanity limit \(HEVCDecoder.maxArrays)")
+            throw HEVCDecoderError.malformedNALArray("numOfArrays=\(numArrays) exceeds limit \(HEVCDecoder.maxArrays)")
+        }
+
+        // ── NAL array parsing ─────────────────────────────────────────────────
+        // Collect VPS(32) / SPS(33) / PPS(34) tagged with their HEVC NAL type.
         let kParameterSetTypes: Set<Int> = [32, 33, 34]
-
-        var parameterSets: [Data] = []
-        var idx = 23
+        typealias TaggedNAL = (nalType: Int, data: Data)
+        var collected: [TaggedNAL] = []
+        var cursor = 23      // current byte offset into b[]
 
         for arrayIdx in 0..<numArrays {
-            // Each array header: 1 byte type + 2 bytes numNalus
-            guard idx + 3 <= hvcCData.count else {
+
+            let cursorBefore = cursor
+
+            // ── Array header: 1-byte type + 2-byte numNalus ──────────────────
+            guard cursor + 3 <= n else {
+                errLog("\(tag) ❌ array[\(arrayIdx)] header truncated: "
+                     + "cursor=\(cursor) need \(cursor + 3) have \(n)")
                 throw HEVCDecoderError.malformedNALArray(
-                    "array \(arrayIdx) header truncated at offset \(idx)"
-                )
+                    "array[\(arrayIdx)] header truncated at cursor=\(cursor), payload=\(n)B")
             }
-            // byte 0: array_completeness(1) | reserved(1) | NAL_unit_type(6)
-            // bytes 1-2: numNalus
-            let nalType  = Int(hvcCData[idx] & 0x3F)   // lower 6 bits = HEVC NAL type
-            let numNalus = Int(hvcCData[idx + 1]) << 8 | Int(hvcCData[idx + 2])
-            idx += 3
 
-            let keep = kParameterSetTypes.contains(nalType)
+            let arrayType = Int(b[cursor] & 0x3F)          // lower 6 bits
+            let numNalus  = Int(b[cursor + 1]) << 8 | Int(b[cursor + 2])
+            cursor += 3
 
+            let typeName: String
+            switch arrayType {
+            case 32: typeName = "VPS"
+            case 33: typeName = "SPS"
+            case 34: typeName = "PPS"
+            case 39: typeName = "prefix-SEI"
+            case 40: typeName = "suffix-SEI"
+            default: typeName = "type\(arrayType)"
+            }
+            let keep = kParameterSetTypes.contains(arrayType)
+            errLog("\(tag) array[\(arrayIdx + 1)/\(numArrays)] "
+                 + "type=\(arrayType) (\(typeName))  numNalus=\(numNalus)  "
+                 + "\(keep ? "→ KEEP" : "→ skip")")
+
+            guard numNalus > 0 else {
+                errLog("\(tag)   ⚠️ numNalus=0 — skipping empty array")
+                continue
+            }
+            guard numNalus <= HEVCDecoder.maxNALsPerArray else {
+                errLog("\(tag) ❌ numNalus=\(numNalus) exceeds sanity limit \(HEVCDecoder.maxNALsPerArray)")
+                throw HEVCDecoderError.malformedNALArray(
+                    "array[\(arrayIdx)] numNalus=\(numNalus) exceeds limit \(HEVCDecoder.maxNALsPerArray)")
+            }
+
+            // ── Individual NAL units ──────────────────────────────────────────
             for naluIdx in 0..<numNalus {
-                guard idx + 2 <= hvcCData.count else {
+
+                // 2-byte length prefix
+                guard cursor + 2 <= n else {
+                    errLog("\(tag) ❌ array[\(arrayIdx)] nalu[\(naluIdx)] "
+                         + "length field truncated: cursor=\(cursor) need \(cursor+2) have \(n)")
                     throw HEVCDecoderError.malformedNALArray(
-                        "array \(arrayIdx) NALU \(naluIdx) length field truncated at \(idx)"
-                    )
+                        "array[\(arrayIdx)] nalu[\(naluIdx)] length field truncated "
+                        + "cursor=\(cursor) payload=\(n)B")
                 }
-                let naluLen = Int(hvcCData[idx]) << 8 | Int(hvcCData[idx + 1])
-                idx += 2
-                guard idx + naluLen <= hvcCData.count else {
+                let naluLen = Int(b[cursor]) << 8 | Int(b[cursor + 1])
+                cursor += 2
+
+                errLog("\(tag)   nalu[\(naluIdx)] declared size=\(naluLen)B  cursor=\(cursor)")
+
+                guard naluLen > 0 else {
+                    errLog("\(tag)   ⚠️ zero-length NALU in \(typeName) — skipping")
+                    // cursor already advanced past the 2-byte length; no payload bytes to skip
+                    continue
+                }
+                guard naluLen <= HEVCDecoder.maxNALSize else {
+                    errLog("\(tag) ❌ nalu[\(naluIdx)] size=\(naluLen) exceeds sanity limit \(HEVCDecoder.maxNALSize)")
                     throw HEVCDecoderError.malformedNALArray(
-                        "array \(arrayIdx) (type \(nalType)) NALU \(naluIdx) data truncated at \(idx); " +
-                        "hvcC payload is \(hvcCData.count) bytes"
-                    )
+                        "\(typeName) nalu[\(naluIdx)] size=\(naluLen) exceeds limit")
                 }
+                guard cursor + naluLen <= n else {
+                    errLog("\(tag) ❌ array[\(arrayIdx)] (\(typeName)) nalu[\(naluIdx)] "
+                         + "payload truncated: cursor=\(cursor) need \(cursor + naluLen) have \(n)")
+                    throw HEVCDecoderError.malformedNALArray(
+                        "array[\(arrayIdx)] (\(typeName)) nalu[\(naluIdx)] "
+                        + "payload truncated cursor=\(cursor) naluLen=\(naluLen) payload=\(n)B")
+                }
+
                 if keep {
-                    parameterSets.append(hvcCData.subdata(in: idx..<(idx + naluLen)))
+                    let naluBytes = Data(b[cursor..<(cursor + naluLen)])
+                    let first4 = naluBytes.prefix(4)
+                        .map { String(format: "%02X", $0) }.joined(separator: " ")
+                    errLog("\(tag)   → collected \(typeName) size=\(naluLen)B  first4=\(first4)")
+                    collected.append((nalType: arrayType, data: naluBytes))
                 }
-                idx += naluLen
+
+                cursor += naluLen
+            }
+
+            // Cursor must have advanced; detect infinite-loop on corrupt data
+            guard cursor > cursorBefore else {
+                errLog("\(tag) ❌ cursor did not advance in array[\(arrayIdx)] — aborting")
+                throw HEVCDecoderError.malformedNALArray(
+                    "cursor stalled at \(cursor) in array[\(arrayIdx)]")
             }
         }
 
-        guard !parameterSets.isEmpty else { throw HEVCDecoderError.noParameterSets }
+        errLog("\(tag) ── array parse complete ──  "
+             + "cursor=\(cursor)/\(n)  collected=\(collected.count)")
 
-        // Build CMVideoFormatDescription from all collected NAL units.
-        // NSData pins the bytes in memory for the duration of the API call.
-        let nsData = parameterSets.map { $0 as NSData }
-        var ptrs   = nsData.map { $0.bytes.assumingMemoryBound(to: UInt8.self) }
-        var sizes  = nsData.map { $0.length }
+        // ── Sort VPS→SPS→PPS and deduplicate ──────────────────────────────────
+        // CMVideoFormatDescriptionCreateFromHEVCParameterSets internally asserts
+        // the order is VPS(32) → SPS(33) → PPS(34).  Passing out-of-order or
+        // duplicate sets causes an EXC_BREAKPOINT trap inside VideoToolbox.
+        let sorted = collected.sorted { $0.nalType < $1.nalType }
+        var seenTypes = Set<Int>()
+        let parameterSets: [Data] = sorted.compactMap { tagged in
+            guard seenTypes.insert(tagged.nalType).inserted else {
+                errLog("\(tag) ⚠️ duplicate type=\(tagged.nalType) — dropped")
+                return nil
+            }
+            return tagged.data
+        }
+        errLog("\(tag) parameterSets after dedup: \(parameterSets.count)")
 
-        var fmtDesc: CMVideoFormatDescription?
-        let status = CMVideoFormatDescriptionCreateFromHEVCParameterSets(
-            allocator:            kCFAllocatorDefault,
-            parameterSetCount:    parameterSets.count,
-            parameterSetPointers: &ptrs,
-            parameterSetSizes:    &sizes,
-            nalUnitHeaderLength:  Int32(nalUnitLength),
-            extensions:           nil,
-            formatDescriptionOut: &fmtDesc
-        )
+        // ── Validate required types ───────────────────────────────────────────
+        let presentTypes = Set(parameterSets.indices.map { sorted[$0].nalType })
+        errLog("\(tag) VPS present: \(presentTypes.contains(32) ? "✅" : "❌ MISSING")")
+        errLog("\(tag) SPS present: \(presentTypes.contains(33) ? "✅" : "❌ MISSING")")
+        errLog("\(tag) PPS present: \(presentTypes.contains(34) ? "✅" : "❌ MISSING")")
 
-        guard status == noErr, let fmtDesc = fmtDesc else {
-            throw HEVCDecoderError.formatDescriptionFailed(status)
+        if !presentTypes.contains(32) { throw HEVCDecoderError.missingParameterSetType("VPS (type 32)") }
+        if !presentTypes.contains(33) { throw HEVCDecoderError.missingParameterSetType("SPS (type 33)") }
+        if !presentTypes.contains(34) { throw HEVCDecoderError.missingParameterSetType("PPS (type 34)") }
+
+        // ── Final summary before CoreMedia call ───────────────────────────────
+        let sizes: [Int] = parameterSets.map { $0.count }
+        errLog("\(tag) ── ready to call CoreMedia ─────────────────────────────")
+        errLog("\(tag) parameterSetCount=\(parameterSets.count)  "
+             + "nalUnitHeaderLength=\(nalUnitLength)  "
+             + "sizes=\(sizes)")
+        for (i, ps) in parameterSets.enumerated() {
+            let nt: UInt8 = ps.count >= 2 ? (ps[0] >> 1) & 0x3F : 0xFF
+            let name = nt == 32 ? "VPS" : nt == 33 ? "SPS" : nt == 34 ? "PPS" : "?\(nt)"
+            errLog("\(tag)   [\(i)] \(name) size=\(ps.count)B  "
+                 + "first4=\(ps.prefix(4).map { String(format: "%02X", $0) }.joined(separator: " "))")
         }
 
-        return fmtDesc
+        // ── Build CMVideoFormatDescription ────────────────────────────────────
+        //
+        // Use value-passing recursive nesting of withUnsafeBytes closures so
+        // ALL Data regions are simultaneously pinned when the CoreMedia call
+        // executes at the base case.
+        //
+        // WHY NOT inout: Swift exclusivity rules prohibit capturing an inout
+        // parameter across a closure boundary.  Passing ptrs by value at each
+        // recursion level (via array concatenation) avoids the violation while
+        // keeping all pinned regions live.
+        func pinAndCall(idx: Int, ptrs: [UnsafePointer<UInt8>]) throws -> CMVideoFormatDescription {
+            if idx < parameterSets.count {
+                return try parameterSets[idx].withUnsafeBytes { rawBuf in
+                    // withUnsafeBytes guarantees non-nil baseAddress.
+                    let ptr = rawBuf.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                    return try pinAndCall(idx: idx + 1, ptrs: ptrs + [ptr])
+                }
+            } else {
+                var mutablePtrs  = ptrs
+                var mutableSizes = sizes
+                errLog("\(tag) ▶ CMVideoFormatDescriptionCreateFromHEVCParameterSets  "
+                     + "count=\(parameterSets.count)  nalUnitHeaderLength=\(nalUnitLength)")
+                var fmtDesc: CMVideoFormatDescription?
+                let status = CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+                    allocator:            kCFAllocatorDefault,
+                    parameterSetCount:    parameterSets.count,
+                    parameterSetPointers: &mutablePtrs,
+                    parameterSetSizes:    &mutableSizes,
+                    nalUnitHeaderLength:  Int32(nalUnitLength),
+                    extensions:           nil,
+                    formatDescriptionOut: &fmtDesc
+                )
+                errLog("\(tag) ◀ status=\(status)  "
+                     + "fmtDesc=\(fmtDesc != nil ? "✅ non-nil" : "❌ nil")")
+                guard status == noErr, let fmtDesc else {
+                    throw HEVCDecoderError.formatDescriptionFailed(status)
+                }
+                return fmtDesc
+            }
+        }
+
+        errLog("\(tag) ── entering pinAndCall ──────────────────────────────────")
+        return try pinAndCall(idx: 0, ptrs: [])
     }
 }

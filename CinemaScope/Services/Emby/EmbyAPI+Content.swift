@@ -65,6 +65,19 @@ extension EmbyAPI {
         return try decode(EmbyItemsResponse.self, from: try await get(url: url, token: token)).items
     }
 
+    // MARK: - Single Item (deep-link resolution)
+
+    static func fetchItem(server: EmbyServer, userId: String, token: String, itemId: String) async throws -> EmbyItem {
+        var comps = try urlComponents(server, path: "/Users/\(userId)/Items/\(itemId)")
+        comps.queryItems = [
+            .init(name: "Fields", value: "PrimaryImageAspectRatio,Overview,RunTimeTicks,UserData,BackdropImageTags,People,Genres,OfficialRating,CommunityRating"),
+            .init(name: "ImageTypeLimit",  value: "1"),
+            .init(name: "EnableImageTypes", value: "Primary,Thumb,Backdrop"),
+        ]
+        guard let url = comps.url else { throw EmbyError.invalidURL }
+        return try decode(EmbyItem.self, from: try await get(url: url, token: token))
+    }
+
     // MARK: - Continue Watching / Recently Added
 
     static func fetchContinueWatching(server: EmbyServer, userId: String, token: String, limit: Int = 25) async throws -> [EmbyItem] {

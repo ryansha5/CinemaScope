@@ -44,19 +44,28 @@ enum VideoFormatFactory {
     ///   • `isHEVC` + `hvcCData` → HEVCDecoder.makeFormatDescription
     ///
     /// Throws `VideoFormatFactoryError` on missing parameter data or unsupported codec.
-    /// The `record` closure receives `[5]`-prefixed status messages matching the
-    /// existing prepare() log style.
     ///
     /// - Parameters:
     ///   - videoTrack: The TrackInfo for the selected video track.
+    ///   - label:      Context tag forwarded to codec decoders for log lines
+    ///                 (e.g. "Prepare #3"). Empty string disables the tag.
     ///   - record:     Logging callback forwarded from the controller.
     static func make(
         for videoTrack: TrackInfo,
+        label:          String = "",
         record:         (String) -> Void
     ) throws -> CMVideoFormatDescription {
 
-        let fourCC = videoTrack.codecFourCC ?? "?"
-        record("[5] Building CMVideoFormatDescription (\(fourCC))…")
+        let fourCC   = videoTrack.codecFourCC ?? "?"
+        let labelTag = label.isEmpty ? "" : " [\(label)]"
+
+        // The controller already logs the full "[5] Building…" line with codec
+        // detail before reaching here.  Log factory-internal progress under a
+        // distinct prefix so the two lines are clearly distinguishable.
+        record("[VideoFormatFactory\(labelTag)] enter  codec=\(fourCC)  "
+             + "isH264=\(videoTrack.isH264)  isHEVC=\(videoTrack.isHEVC)  "
+             + "hvcC=\(videoTrack.hvcCData.map { "\($0.count)B" } ?? "nil")  "
+             + "avcC=\(videoTrack.avcCData.map { "\($0.count)B" } ?? "nil")")
 
         if videoTrack.isH264 {
             guard let avcC = videoTrack.avcCData else {
@@ -64,7 +73,7 @@ enum VideoFormatFactory {
                     "H.264 track has no avcC data")
             }
             let desc = try H264Decoder.makeFormatDescription(from: avcC)
-            record("  ✅ H.264 format description (avcC \(avcC.count) bytes)")
+            record("[VideoFormatFactory\(labelTag)] ✅ H.264 format description  avcC=\(avcC.count)B")
             return desc
         }
 
@@ -73,8 +82,10 @@ enum VideoFormatFactory {
                 throw VideoFormatFactoryError.missingParameterData(
                     "HEVC track has no hvcC data")
             }
-            let desc = try HEVCDecoder.makeFormatDescription(from: hvcC)
-            record("  ✅ HEVC format description (hvcC \(hvcC.count) bytes)")
+            record("[VideoFormatFactory\(labelTag)] → HEVCDecoder.makeFormatDescription  "
+                 + "hvcC=\(hvcC.count)B  (per-step trace on stderr)")
+            let desc = try HEVCDecoder.makeFormatDescription(from: hvcC, label: label)
+            record("[VideoFormatFactory\(labelTag)] ✅ HEVC format description  hvcC=\(hvcC.count)B")
             return desc
         }
 

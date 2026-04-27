@@ -14,10 +14,10 @@ private struct OnboardingPage: Identifiable {
 private let onboardingPages: [OnboardingPage] = [
     OnboardingPage(
         id: 0,
-        icon: "film.stack",
-        title: "Welcome to CinemaScope",
-        subtitle: "Your Emby library, beautifully presented.",
-        body: "Browse your entire movie and TV collection from your personal media server — fast, focused, and distraction-free.",
+        icon: "sparkles",
+        title: "Welcome to PINEA",
+        subtitle: "Your cinema. Elevated.",
+        body: "Browse your entire movie and TV collection from your personal media server — beautifully presented, fast, and distraction-free.",
         accent: CinemaTheme.accentGold
     ),
     OnboardingPage(
@@ -52,7 +52,8 @@ struct OnboardingView: View {
 
     let onComplete: () -> Void
 
-    @State private var currentPage = 0
+    @State private var currentPage   = 0
+    @State private var contentVisible = false
     @FocusState private var focusedButton: OnboardingButton?
 
     enum OnboardingButton: Hashable { case next, skip }
@@ -62,32 +63,78 @@ struct OnboardingView: View {
 
     var body: some View {
         ZStack {
-            // Background
-            CinemaBackground()
+            background
 
-            VStack(spacing: 0) {
-                Spacer()
+            HStack(spacing: 0) {
+                // ── Left: PINEA brand sidebar (fixed across all pages) ──────
+                brandSidebar
+                    .frame(maxWidth: .infinity)
 
-                // Page content
-                VStack(spacing: 0) {
-                    pageContent
-                        .id(currentPage)   // forces re-render + re-animation on page change
-                        .transition(.asymmetric(
-                            insertion: .move(edge: .trailing).combined(with: .opacity),
-                            removal:   .move(edge: .leading).combined(with: .opacity)
-                        ))
-                }
-                .animation(.spring(response: 0.45, dampingFraction: 0.85), value: currentPage)
-                .frame(maxWidth: 820)
+                // ── Right: page content + navigation ───────────────────────
+                contentPanel
+                    .frame(maxWidth: 620)
+            }
+            .opacity(contentVisible ? 1 : 0)
+            .offset(y: contentVisible ? 0 : 28)
+        }
+        .animation(.easeOut(duration: 0.55), value: contentVisible)
+        .onAppear {
+            withAnimation(.easeOut(duration: 0.7).delay(0.15)) { contentVisible = true }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { focusedButton = .next }
+        }
+    }
 
-                Spacer()
+    // MARK: - Brand sidebar
 
-                // Page indicators + nav buttons
-                VStack(spacing: 32) {
+    private var brandSidebar: some View {
+        VStack(spacing: 0) {
+            Spacer()
+
+            VStack(spacing: 28) {
+                Image("pinea_pinecone")
+                    .resizable()
+                    .scaledToFit()
+                    .frame(height: 360)
+                    .shadow(color: CinemaTheme.gold.opacity(0.35), radius: 40, x: 0, y: 8)
+                    .shadow(color: CinemaTheme.accentGold.opacity(0.18), radius: 80, x: 0, y: 0)
+
+                Text("PINEA")
+                    .font(.system(size: 72, weight: .regular, design: .serif))
+                    .foregroundStyle(CinemaTheme.gold)
+                    .tracking(12)
+
+                Text("Your cinema. Elevated.")
+                    .font(.system(size: 22, weight: .light))
+                    .foregroundStyle(.white.opacity(0.40))
+                    .tracking(1)
+            }
+
+            Spacer()
+        }
+        .padding(.horizontal, 80)
+    }
+
+    // MARK: - Content panel (right side)
+
+    private var contentPanel: some View {
+        VStack(spacing: 0) {
+            Spacer()
+
+            VStack(alignment: .leading, spacing: 48) {
+                // Page content — animates on page change
+                pageContent
+                    .id(currentPage)
+                    .transition(.asymmetric(
+                        insertion: .move(edge: .trailing).combined(with: .opacity),
+                        removal:   .move(edge: .leading).combined(with: .opacity)
+                    ))
+                    .animation(.spring(response: 0.45, dampingFraction: 0.85), value: currentPage)
+
+                // Page indicators + buttons
+                VStack(alignment: .leading, spacing: 28) {
                     pageIndicators
 
-                    HStack(spacing: 24) {
-                        // Skip button — only on non-last pages
+                    HStack(spacing: 20) {
                         if !isLastPage {
                             OnboardingActionButton(
                                 label:     "Skip",
@@ -115,48 +162,56 @@ struct OnboardingView: View {
                     }
                     .focusSection()
                 }
-                .padding(.bottom, 72)
             }
-            .padding(.horizontal, 120)
+
+            Spacer()
         }
-        .onAppear { focusedButton = .next }
+        .padding(.horizontal, 64)
+        .padding(.vertical, 60)
+        .background(.ultraThinMaterial.opacity(0.22))
+        .overlay(alignment: .leading) {
+            Rectangle()
+                .fill(LinearGradient(
+                    colors: [CinemaTheme.gold.opacity(0.28), CinemaTheme.peacock.opacity(0.15)],
+                    startPoint: .top, endPoint: .bottom
+                ))
+                .frame(width: 1)
+        }
     }
 
     // MARK: - Page content
 
     private var pageContent: some View {
-        VStack(spacing: 36) {
-            // Icon
+        VStack(alignment: .leading, spacing: 24) {
+            // Icon circle
             ZStack {
                 Circle()
-                    .fill(page.accent.opacity(0.15))
-                    .frame(width: 140, height: 140)
+                    .fill(page.accent.opacity(0.14))
+                    .frame(width: 80, height: 80)
                 Circle()
                     .strokeBorder(page.accent.opacity(0.35), lineWidth: 1.5)
-                    .frame(width: 140, height: 140)
+                    .frame(width: 80, height: 80)
                 Image(systemName: page.icon)
-                    .font(.system(size: 56, weight: .light))
+                    .font(.system(size: 32, weight: .light))
                     .foregroundStyle(page.accent)
             }
 
-            // Text
-            VStack(spacing: 14) {
+            // Title + subtitle + body
+            VStack(alignment: .leading, spacing: 12) {
                 Text(page.title)
-                    .font(.system(size: 48, weight: .bold))
+                    .font(.system(size: 38, weight: .bold))
                     .foregroundStyle(.white)
-                    .multilineTextAlignment(.center)
 
                 Text(page.subtitle)
-                    .font(.system(size: 24, weight: .medium))
+                    .font(.system(size: 22, weight: .medium))
                     .foregroundStyle(page.accent)
-                    .multilineTextAlignment(.center)
 
                 Text(page.body)
-                    .font(.system(size: 20))
-                    .foregroundStyle(.white.opacity(0.65))
-                    .multilineTextAlignment(.center)
-                    .lineLimit(4)
-                    .frame(maxWidth: 660)
+                    .font(.system(size: 19))
+                    .foregroundStyle(.white.opacity(0.60))
+                    .lineSpacing(5)
+                    .lineLimit(5)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
@@ -164,16 +219,26 @@ struct OnboardingView: View {
     // MARK: - Page indicators
 
     private var pageIndicators: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 8) {
             ForEach(onboardingPages) { p in
                 Capsule()
                     .fill(currentPage == p.id
                           ? onboardingPages[currentPage].accent
-                          : .white.opacity(0.25))
+                          : .white.opacity(0.22))
                     .frame(width: currentPage == p.id ? 28 : 8, height: 8)
                     .animation(.spring(response: 0.3, dampingFraction: 0.7), value: currentPage)
             }
         }
+    }
+
+    // MARK: - Background
+
+    private var background: some View {
+        ZStack {
+            CinemaTheme.backgroundGradient(.dark)
+            CinemaTheme.radialOverlay(.dark)
+        }
+        .ignoresSafeArea()
     }
 }
 
@@ -189,64 +254,47 @@ private struct OnboardingActionButton: View {
     var body: some View {
         Button(action: action) {
             HStack(spacing: 12) {
-                if isPrimary {
-                    Text(label)
-                        .font(.system(size: 20, weight: .semibold))
-                    Image(systemName: icon)
-                        .font(.system(size: 18, weight: .semibold))
-                } else {
-                    Text(label)
-                        .font(.system(size: 18, weight: .medium))
-                    Image(systemName: icon)
-                        .font(.system(size: 16, weight: .medium))
-                }
+                Text(label)
+                    .font(.system(size: isPrimary ? 20 : 18,
+                                  weight: isPrimary ? .semibold : .medium))
+                Image(systemName: icon)
+                    .font(.system(size: isPrimary ? 17 : 15,
+                                  weight: isPrimary ? .semibold : .medium))
             }
             .foregroundStyle(buttonForeground)
-            .padding(.horizontal, isPrimary ? 40 : 32)
+            .padding(.horizontal, isPrimary ? 36 : 28)
             .padding(.vertical, isPrimary ? 18 : 14)
             .background {
                 ZStack {
-                    tintColor.opacity(isFocused ? 0.55 : 0.14)
-                    LinearGradient(
-                        stops: [
-                            .init(color: .white.opacity(isFocused ? 0.50 : 0.20), location: 0),
-                            .init(color: .white.opacity(isFocused ? 0.12 : 0.04), location: 0.45),
-                            .init(color: .clear,                                   location: 0.72),
-                        ],
-                        startPoint: .top, endPoint: .bottom
-                    )
+                    if isPrimary {
+                        RoundedRectangle(cornerRadius: 14)
+                            .fill(isFocused ? CinemaTheme.accentGold : CinemaTheme.accentGold.opacity(0.15))
+                    } else {
+                        RoundedRectangle(cornerRadius: 14)
+                            .fill(.white.opacity(isFocused ? 0.14 : 0.06))
+                    }
+                    RoundedRectangle(cornerRadius: 14)
+                        .strokeBorder(
+                            isPrimary
+                                ? (isFocused ? Color.clear : CinemaTheme.accentGold.opacity(0.4))
+                                : Color.white.opacity(isFocused ? 0.28 : 0.12),
+                            lineWidth: 1
+                        )
                 }
             }
-            .clipShape(RoundedRectangle(cornerRadius: 14))
-            .overlay {
-                RoundedRectangle(cornerRadius: 14)
-                    .strokeBorder(
-                        LinearGradient(
-                            stops: [
-                                .init(color: .white.opacity(isFocused ? 0.82 : 0.35), location: 0),
-                                .init(color: .white.opacity(isFocused ? 0.30 : 0.12), location: 1),
-                            ],
-                            startPoint: .topLeading, endPoint: .bottomTrailing
-                        ),
-                        lineWidth: isFocused ? 1.5 : 1.0
-                    )
-            }
-            .scaleEffect(isFocused ? 1.06 : 1.0)
-            .shadow(color: tintColor.opacity(isFocused ? 0.55 : 0), radius: 24)
-            .animation(.spring(response: 0.25, dampingFraction: 0.7), value: isFocused)
+            .scaleEffect(isFocused ? 1.04 : 1.0)
+            .shadow(color: isPrimary && isFocused ? CinemaTheme.accentGold.opacity(0.45) : .clear,
+                    radius: 20, x: 0, y: 6)
+            .animation(.spring(response: 0.25, dampingFraction: 0.72), value: isFocused)
         }
-        .buttonStyle(.plain)
-    }
-
-    private var tintColor: Color {
-        isPrimary ? CinemaTheme.accentGold : CinemaTheme.peacock
+        .focusRingFree()
     }
 
     private var buttonForeground: Color {
         if isPrimary {
             return isFocused ? .black : CinemaTheme.accentGold
         } else {
-            return isFocused ? .white : .white.opacity(0.6)
+            return isFocused ? .white : .white.opacity(0.55)
         }
     }
 }

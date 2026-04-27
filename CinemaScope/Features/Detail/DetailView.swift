@@ -18,6 +18,7 @@ struct DetailView: View {
     let onBack:            () -> Void
 
     @EnvironmentObject var settings: AppSettings
+    @EnvironmentObject var env:      PINEAEnvironment
     @StateObject private var vm: DetailViewModel
 
     init(
@@ -149,6 +150,7 @@ struct DetailView: View {
                 cta:              vm.cta,
                 isFavorited:      $vm.isFavorited,
                 hasTrailer:       vm.hasTrailer,
+                isPINEcueSelected: vm.displayItem.id == env.selectedMovieId,
                 scopeMode:        scopeMode,
                 colorMode:        settings.colorMode,
                 onPlay:           onPlay,

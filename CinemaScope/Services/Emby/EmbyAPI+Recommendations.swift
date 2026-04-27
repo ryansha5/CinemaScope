@@ -47,7 +47,7 @@ extension EmbyAPI {
             simComps.queryItems = [
                 .init(name: "UserId",           value: userId),
                 .init(name: "Limit",            value: "8"),
-                .init(name: "Fields",           value: "PrimaryImageAspectRatio,Overview,RunTimeTicks,UserData,Genres,BackdropImageTags"),
+                .init(name: "Fields",           value: "PrimaryImageAspectRatio,Overview,RunTimeTicks,UserData,Genres,BackdropImageTags,OfficialRating,CommunityRating,Taglines,People"),
                 .init(name: "ImageTypeLimit",   value: "1"),
                 .init(name: "EnableImageTypes", value: "Primary,Thumb,Backdrop"),
             ]

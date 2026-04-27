@@ -46,6 +46,18 @@ final class PlaybackEngine: ObservableObject {
     /// True when ≤ 12 seconds remain — triggers the autoplay countdown overlay.
     @Published private(set) var nearingEnd:         Bool   = false
 
+    // MARK: - Audio track state
+    //
+    // Populated from the Emby MediaSource after PlaybackInfo is fetched.
+    // The OSD audio picker will bind to these when implemented.
+    // `selectedAudioTrackIndex` is the Emby stream index handed to PlaybackInfo,
+    // either chosen automatically or overridden by the user via selectAudioTrack().
+
+    /// All audio tracks available for the current item.
+    @Published private(set) var availableAudioTracks: [AvailableAudioTrack] = []
+    /// The Emby stream index that was actually requested (automatic or explicit).
+    @Published private(set) var selectedAudioTrackIndex: Int? = nil
+
     // MARK: - Effective content ratio
     //
     // This is the SINGLE source of truth for the video's aspect ratio.
@@ -93,6 +105,12 @@ final class PlaybackEngine: ObservableObject {
 
     private var retryHandler: (() async -> Void)? = nil
 
+    // MARK: - Diagnostic context (for HTTP 500 / transcode failure logging)
+
+    private var diagnosticItemName: String = ""
+    private var diagnosticIsRetry:  Bool   = false
+    private var currentURL:         URL?   = nil
+
     // MARK: - Playback context (must be called before load())
 
     /// Set the UI context so the engine can choose the correct default viewport.
@@ -120,14 +138,18 @@ final class PlaybackEngine: ObservableObject {
             timeObserver = nil
         }
 
-        playbackState        = .loading
-        videoDimensions      = nil
-        aspectBucket         = .unclassified
-        detectedContentRatio = nil
-        currentTime          = 0
-        duration             = 0
-        nearingEnd           = false
-        hasReportedStart     = false
+        playbackState           = .loading
+        videoDimensions         = nil
+        aspectBucket            = .unclassified
+        detectedContentRatio    = nil
+        currentTime             = 0
+        duration                = 0
+        nearingEnd              = false
+        hasReportedStart        = false
+        // Note: availableAudioTracks / selectedAudioTrackIndex are NOT cleared here.
+        // setAvailableAudioTracks() is called before load() by HomeView; keeping
+        // the previous values visible during the loading transition avoids a flicker
+        // if the OSD is open while a retry load begins.
 
         // Mode follows UI setting — not aspect ratio
         presentationMode = PresentationMode.defaultMode(scopeUIEnabled: scopeUIEnabled)
@@ -136,6 +158,7 @@ final class PlaybackEngine: ObservableObject {
         // (aspectRatioOverride is NOT reset here)
 
         pendingStartTicks = startTicks
+        currentURL = url
         let item = AVPlayerItem(url: url)
         player.replaceCurrentItem(with: item)
 
@@ -161,6 +184,53 @@ final class PlaybackEngine: ObservableObject {
         reportingSessionId     = playSessionId
         reportingMediaSourceId = mediaSourceId
         reportingPlayMethod    = playMethod
+    }
+
+    // MARK: - Diagnostic info (must be set before each load())
+
+    /// Records item identity and retry state so the engine can emit a rich
+    /// HTTP 500 / transcode-failure log without the caller needing to catch it.
+    func setDiagnosticInfo(itemName: String, isRetry: Bool) {
+        diagnosticItemName = itemName
+        diagnosticIsRetry  = isRetry
+    }
+
+    // MARK: - Audio track management
+
+    /// Populates the available track list from the Emby MediaSource.
+    /// Call this after a successful PlaybackInfo fetch, before load().
+    /// `selectedIndex` is the stream index that was actually requested —
+    /// either the automatic fallback pick or a previously-stored override.
+    func setAvailableAudioTracks(_ tracks: [AvailableAudioTrack], selectedIndex: Int?) {
+        availableAudioTracks   = tracks
+        selectedAudioTrackIndex = selectedIndex
+        let names = tracks.map { t in
+            "\(t.streamIndex):\(t.label)\(t.isDefault ? "*" : "")"
+        }.joined(separator: ", ")
+        print("[PlaybackEngine] audio tracks: [\(names)] selected=\(selectedIndex.map{"\($0)"} ?? "auto")")
+    }
+
+    /// Placeholder for the future OSD audio track picker.
+    /// Stores the selection to `AudioTrackStore` so it persists across sessions.
+    /// The caller is responsible for re-requesting PlaybackInfo with the new
+    /// AudioStreamIndex and reloading the engine.
+    func selectAudioTrack(at streamIndex: Int) {
+        selectedAudioTrackIndex = streamIndex
+        if !serverURL.isEmpty {
+            AudioTrackStore.shared.setOverride(
+                .explicit(streamIndex: streamIndex),
+                serverURL: serverURL,
+                itemId:    itemId
+            )
+        }
+        print("[PlaybackEngine] audio track selected: index=\(streamIndex) — caller must reload with new PlaybackInfo")
+    }
+
+    /// Returns any persisted audio track override for the current item,
+    /// or nil if no override is stored (use automatic selection).
+    func storedAudioTrackIndex() -> Int? {
+        guard !serverURL.isEmpty else { return nil }
+        return AudioTrackStore.shared.override(serverURL: serverURL, itemId: itemId).streamIndex
     }
 
     // MARK: - Aspect ratio override (called from OSD)
@@ -276,11 +346,33 @@ final class PlaybackEngine: ObservableObject {
                         return
                     }
 
+                    // ── HTTP 500 / transcode crash diagnostic dump ────────────────────
+                    // -16847 = HTTP 500 from Emby's transcode endpoint.
+                    // Extract key URL params so we can correlate server-side logs.
+                    if code == -16847 || (under?.code == -16847) {
+                        let urlParams  = self.urlQueryParams(self.currentURL)
+                        let audioIdx   = urlParams["AudioStreamIndex"] ?? "?"
+                        let videoCodec = urlParams["VideoCodec"]       ?? "?"
+                        let audioCodec = urlParams["AudioCodec"]       ?? "?"
+                        let path       = self.currentURL.flatMap { "\($0.path)" } ?? "?"
+                        print("""
+[PlaybackEngine] 💥 HTTP 500 TRANSCODE FAILURE REPORT
+  Item:            \(self.diagnosticItemName) [\(self.reportingItemId ?? "?")]
+  Path attempt:    \(self.diagnosticIsRetry ? "RETRY (forcedTranscodeURL)" : "PRIMARY")
+  PlaySessionId:   \(self.reportingSessionId)
+  URL AudioStreamIndex: \(audioIdx)
+  URL VideoCodec:       \(videoCodec)
+  URL AudioCodec:       \(audioCodec)
+  URL path prefix:      \(path.prefix(120))
+""")
+                    }
+
                     let friendly: String
                     switch code {
-                    case -11800: friendly = "Cannot open this file. The server may be unreachable."
-                    case -11850: friendly = "Unsupported format. Check your Emby server transcoding settings."
+                    case -11800:  friendly = "Cannot open this file. The server may be unreachable."
+                    case -11850:  friendly = "Unsupported format. Check your Emby server transcoding settings."
                     case -11819, -11828: friendly = "Cannot decode this video on Apple TV."
+                    case -16847:  friendly = "The server failed to transcode this file (HTTP 500). Check Emby logs."
                     default: friendly = msg
                     }
                     self.playbackState = .failed(friendly)
@@ -438,5 +530,19 @@ final class PlaybackEngine: ObservableObject {
     private func stopProgressTimer() {
         progressReportTimer?.invalidate()
         progressReportTimer = nil
+    }
+
+    // MARK: - URL diagnostic helpers
+
+    /// Extracts query-string parameters from a URL into a [key: value] dictionary.
+    /// Used for logging VideoCodec / AudioCodec / AudioStreamIndex on failure.
+    private func urlQueryParams(_ url: URL?) -> [String: String] {
+        guard let url,
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let items = components.queryItems else { return [:] }
+        return Dictionary(items.compactMap { item in
+            guard let value = item.value else { return nil }
+            return (item.name, value)
+        }, uniquingKeysWith: { first, _ in first })
     }
 }

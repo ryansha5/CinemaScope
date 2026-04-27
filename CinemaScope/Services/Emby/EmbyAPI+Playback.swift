@@ -89,74 +89,126 @@ extension EmbyAPI {
         var playSessionId = info.playSessionId ?? UUID().uuidString
 
         // ── Step 2: Gather facts from PlaybackInfo ──────────────────
-        let allStreams          = source.mediaStreams ?? []
+        let allStreams   = source.mediaStreams ?? []
+        let audioStreams = allStreams.filter { $0.type.lowercased() == "audio" }
 
-        // Log every audio stream's index and codec so we can see what Emby exposed
-        let audioStreamsSummary = allStreams
-            .filter { $0.type.lowercased() == "audio" }
-            .map { s -> String in
-                let idx     = s.index.map { "#\($0)" } ?? "#?"
-                let codec   = s.codec ?? "?"
-                let def     = s.isDefault == true ? " [default]" : ""
-                let layout  = s.channelLayout.map { " \($0)" } ?? ""
-                return "\(idx) \(codec)\(layout)\(def)"
-            }
-            .joined(separator: ", ")
+        // Compact audio summary for the final decision log
+        let audioStreamsSummary = audioStreams.enumerated().map { (pos, s) -> String in
+            let embyIdx = s.index.map { "#\($0)" } ?? "#?"
+            let codec   = s.codec ?? "?"
+            let def     = s.isDefault == true ? " [default]" : ""
+            let layout  = s.channelLayout.map { " \($0)" } ?? ""
+            return "\(embyIdx) \(codec)\(layout)\(def)"
+        }.joined(separator: ", ")
         let subStreamsSummary = allStreams
             .filter { $0.type.lowercased() == "subtitle" }
             .map { s -> String in
                 let idx   = s.index.map { "#\($0)" } ?? "#?"
                 let codec = s.codec ?? "?"
-                let def   = s.isDefault == true ? " [default]" : ""
-                return "\(idx) \(codec)\(def)"
+                return "\(idx) \(codec)"
             }
             .joined(separator: ", ")
 
         // ── Step 2b: Difficult-file detection ───────────────────────
         //
-        // Emby can fail to generate a valid master.m3u8 when:
-        //   • The default audio track is TrueHD / MLP lossless — many server
-        //     configurations can't transcode these directly.
-        //   • PGS (bitmap) subtitles are selected for burn-in — this adds a
-        //     second decode step that can stall or abort the transcode job.
+        // Emby fails to produce a working master.m3u8 when:
+        //   • Default audio is TrueHD/MLP — most servers can't transcode this live.
+        //   • PGS bitmap subtitles need burn-in — stalls or aborts the transcode.
         //
-        // Strategy: detect the combination, then re-request PlaybackInfo with:
-        //   • AudioStreamIndex = index of the first AC3/EAC3 fallback track
-        //   • SubtitleStreamIndex = -1  (no subtitles)
-        // Emby will generate a new PlaySessionId and a TranscodingUrl that
-        // targets streams it can actually transcode.
+        // Fix: re-request PlaybackInfo with a conservative H.264-only device profile
+        // and the best AC3/EAC3 fallback track (highest channel count wins).
+        // AudioStreamIndex is embedded in BOTH the POST body and query params for
+        // maximum compatibility across Emby versions.
 
-        var activeSource    = source         // may be replaced by re-fetch below
-        var activeSessionId = playSessionId
+        var activeSource             = source
+        var activeSessionId          = playSessionId
+        var refetchSucceeded         = false
+        var selectedFallbackAudioIndex: Int? = nil  // carried into PlaybackResult + retry
+        /// Set during difficult-file re-fetch if Emby returns the wrong AudioStreamIndex —
+        /// overrides activeSource.transcodingUrl in Rule 3 so the patched URL is used.
+        var overrideTranscodingUrl: String? = nil
 
-        let defaultAudio     = allStreams.first { $0.type.lowercased() == "audio" && $0.isDefault == true }
-                             ?? allStreams.first { $0.type.lowercased() == "audio" }
+        let defaultAudio      = audioStreams.first { $0.isDefault == true } ?? audioStreams.first
         let defaultAudioCodec = (defaultAudio?.codec ?? "").lowercased()
-        let hasTrueHD        = defaultAudioCodec.contains("truehd") || defaultAudioCodec.contains("mlp")
-        let hasPGS           = allStreams.contains {
+        let hasTrueHD         = defaultAudioCodec.contains("truehd") || defaultAudioCodec.contains("mlp")
+        let hasPGS            = allStreams.contains {
             let c = ($0.codec ?? "").lowercased()
-            return $0.type.lowercased() == "subtitle" && (c.contains("pgs") || c.contains("pgssub") || c.contains("hdmv"))
+            return $0.type.lowercased() == "subtitle"
+                && (c.contains("pgs") || c.contains("pgssub") || c.contains("hdmv"))
         }
-        let isDifficult      = hasTrueHD || hasPGS
+        let isDifficult = hasTrueHD || hasPGS
 
         if isDifficult {
-            // Find the best AC3/EAC3 fallback audio track (prefer default/first)
-            let fallbackAudio = allStreams.first {
-                $0.type.lowercased() == "audio" &&
-                (($0.codec ?? "").lowercased() == "ac3" || ($0.codec ?? "").lowercased() == "eac3")
+            // Verbose per-stream log: all metadata fields that help diagnose
+            // language-preference overrides from Emby server.
+            let audioDetailLines = audioStreams.enumerated().map { (pos, s) -> String in
+                let embyIdx    = s.index.map { "\($0)" } ?? "?"
+                let codec      = s.codec ?? "?"
+                let ch         = s.channels.map { "\($0)ch" } ?? "?ch"
+                let layout     = s.channelLayout.map { " \($0)" } ?? ""
+                let lang       = s.language.map      { " lang=\($0)" }       ?? " lang=?"
+                let dispTitle  = s.displayTitle.map  { " | \"\($0)\""  }     ?? ""
+                let titleExtra = (s.title != nil && s.title != s.displayTitle)
+                                  ? s.title.map { " (title: \"\($0)\")" } ?? ""
+                                  : ""
+                let def        = s.isDefault == true  ? " [default]" : ""
+                let forced     = s.isForced  == true  ? " [forced]"  : ""
+                return "[Playback]     display #\(pos+1) | embyIndex=\(embyIdx) | codec=\(codec) | \(ch)\(layout)\(lang)\(dispTitle)\(titleExtra)\(def)\(forced)"
+            }.joined(separator: "\n")
+
+            // Best fallback: AC3/EAC3 with the most channels (5.1 before stereo).
+            //
+            // FUTURE preference policy (not yet implemented):
+            //   .preferOriginalLanguage — pick highest-channel AC3/EAC3 regardless of lang
+            //   .preferEnglish          — bias toward lang="eng" among compatible streams
+            //   .preferHighestChannel   — current behaviour (codec-first, then channels)
+            //
+            // We always use .preferHighestChannel on difficult files because the goal here
+            // is transcoder compatibility, not user language preference. Emby may override
+            // to the user's preferred language anyway — if it does, the mismatch log below
+            // will identify it and the URL patch will restore our selection.
+            let fallbackAudio = audioStreams
+                .filter { let c = ($0.codec ?? "").lowercased(); return c == "ac3" || c == "eac3" }
+                .sorted { ($0.channels ?? 0) > ($1.channels ?? 0) }
+                .first
+
+            selectedFallbackAudioIndex = fallbackAudio?.index
+
+            let fallbackDesc: String
+            if let fa = fallbackAudio {
+                let embyIdx   = fa.index.map { "\($0)" } ?? "?"
+                let ch        = fa.channels.map { "\($0)ch" } ?? "?ch"
+                let layout    = fa.channelLayout.map { " \($0)" } ?? ""
+                let lang      = fa.language.map { " lang=\($0)" } ?? ""
+                let disp      = fa.displayTitle.map { " \"\($0)\"" } ?? ""
+                fallbackDesc  = "embyIndex=\(embyIdx) | \(fa.codec ?? "?")\(layout.isEmpty && ch == "?ch" ? "" : " | \(ch)\(layout)")\(lang)\(disp)"
+            } else {
+                fallbackDesc = "❌ none found — will use default (may fail)"
             }
 
             print("""
 [Playback] ⚠️ Difficult file detected for '\(itemName)':
-[Playback]   hasTrueHD:     \(hasTrueHD) (default audio: \(defaultAudioCodec.isEmpty ? "none" : defaultAudioCodec))
-[Playback]   hasPGS:        \(hasPGS)
-[Playback]   Audio streams: \(audioStreamsSummary.isEmpty ? "none" : audioStreamsSummary)
-[Playback]   Sub streams:   \(subStreamsSummary.isEmpty ? "none" : subStreamsSummary)
-[Playback]   AC3 fallback:  \(fallbackAudio.map { s in "index \(s.index.map { "\($0)" } ?? "?"), codec \(s.codec ?? "?")" } ?? "❌ none found")
-[Playback]   → Re-requesting PlaybackInfo with AudioStreamIndex=\(fallbackAudio?.index.map{"\($0)"} ?? "default") SubtitleStreamIndex=-1
+[Playback]   hasTrueHD: \(hasTrueHD)  (default codec: \(defaultAudioCodec.isEmpty ? "none" : defaultAudioCodec))
+[Playback]   hasPGS:    \(hasPGS)
+[Playback]   Audio streams:
+\(audioDetailLines.isEmpty ? "[Playback]     none" : audioDetailLines)
+[Playback]   Sub streams: \(subStreamsSummary.isEmpty ? "none" : subStreamsSummary)
+[Playback]   Selected fallback: \(fallbackDesc)
+[Playback]   → Re-fetching PlaybackInfo (H.264-only profile, AudioStreamIndex=\(fallbackAudio?.index.map{"\($0)"} ?? "?"), SubtitleStreamIndex=-1)
 """)
 
-            // Re-fetch PlaybackInfo with explicit safe stream selection
+            // ── Targeted AudioCodec: use a single codec matching the selected stream ──
+            // Listing "ac3,aac" can cause Emby to select the AAC track instead of AC3.
+            // When the fallback is a known AC3/EAC3 track, pin to that codec only.
+            let selectedCodec = (fallbackAudio?.codec ?? "").lowercased()
+            let audioCodecString: String
+            switch selectedCodec {
+            case "ac3":        audioCodecString = "ac3"
+            case "eac3":       audioCodecString = "eac3"
+            default:           audioCodecString = "ac3,aac"
+            }
+
+            // Re-fetch — body carries AudioStreamIndex so Emby honours it
             var retryComps = try urlComponents(server, path: "/Items/\(itemId)/PlaybackInfo")
             var retryQuery: [URLQueryItem] = [.init(name: "UserId", value: userId)]
             if let audioIdx = fallbackAudio?.index {
@@ -166,26 +218,103 @@ extension EmbyAPI {
             retryComps.queryItems = retryQuery
             guard let retryURL = retryComps.url else { throw EmbyError.invalidURL }
 
+            let retryBody = conservativeProfile(
+                audioStreamIndex:    fallbackAudio?.index,
+                subtitleStreamIndex: -1,
+                audioCodec:          audioCodecString
+            )
+
+            // ── Log the full POST body before sending ──────────────────────────────
+            if let bodyData = try? JSONSerialization.data(withJSONObject: retryBody, options: .prettyPrinted),
+               let bodyStr  = String(data: bodyData, encoding: .utf8) {
+                print("[Playback] 📤 Difficult-file re-fetch POST to: \(retryURL.absoluteString.prefix(120))")
+                print("[Playback] 📤 POST body:\n\(bodyStr)")
+            }
+
             if let retryInfo = try? decode(EmbyPlaybackInfo.self,
                                            from: try await postJSON(url: retryURL,
-                                                                     body: appleTVDeviceProfile(),
+                                                                     body: retryBody,
                                                                      token: token)),
                let retrySource = retryInfo.mediaSources.first {
-                activeSource    = retrySource
-                activeSessionId = retryInfo.playSessionId ?? UUID().uuidString
-                print("[Playback] ✅ Re-fetch succeeded — new PlaySessionId: \(activeSessionId), TranscodingUrl: \(retrySource.transcodingUrl.map { String($0.prefix(80)) } ?? "nil")")
+                let newTcUrl = retrySource.transcodingUrl ?? ""
+                let oldTcUrl = source.transcodingUrl ?? ""
+                refetchSucceeded = !newTcUrl.isEmpty
+                activeSource     = retrySource
+                activeSessionId  = retryInfo.playSessionId ?? UUID().uuidString
+
+                // ── Validation + patch: did Emby honour our AudioStreamIndex? ──────
+                if let requestedIdx = fallbackAudio?.index, !newTcUrl.isEmpty {
+                    // Resolve to absolute URL so we can inspect and potentially patch it
+                    let wasRelative = !newTcUrl.hasPrefix("http")
+                    let absolute    = wasRelative ? server.url + newTcUrl : newTcUrl
+
+                    if let absURL = URL(string: absolute) {
+                        let returnedIdxStr = URLComponents(url: absURL, resolvingAgainstBaseURL: false)?
+                            .queryItems?.first(where: { $0.name.lowercased() == "audiostreamindex" })?.value
+                        let returnedIdx = returnedIdxStr.flatMap(Int.init)
+
+                        let (patchedURL, wasPatched) = patchAudioStreamIndex(
+                            url: absURL, requestedIndex: requestedIdx, context: "difficult-file refetch")
+
+                        if wasPatched {
+                            // ── Stream identity comparison — diagnose why Emby overrode ──
+                            // Find the stream Emby actually selected so we can compare metadata.
+                            let allRetryStreams = retrySource.mediaStreams ?? []
+
+                            func streamDesc(_ s: EmbyMediaStream?) -> String {
+                                guard let s else { return "unknown" }
+                                let idx    = s.index.map { "#\($0)" } ?? "#?"
+                                let codec  = s.codec ?? "?"
+                                let ch     = s.channels.map { "\($0)ch" } ?? "?ch"
+                                let layout = s.channelLayout.map { " \($0)" } ?? ""
+                                let lang   = s.language.map { " lang=\($0)" } ?? " lang=?"
+                                let disp   = s.displayTitle.map { " \"\($0)\"" } ?? ""
+                                let def    = s.isDefault == true ? " [default]" : ""
+                                let forced = s.isForced  == true ? " [forced]"  : ""
+                                return "\(idx) | \(codec) | \(ch)\(layout)\(lang)\(disp)\(def)\(forced)"
+                            }
+
+                            let requestedStream = allRetryStreams.first(where: { $0.index == requestedIdx })
+                            let returnedStream  = returnedIdx.flatMap { ri in
+                                allRetryStreams.first(where: { $0.index == ri })
+                            }
+
+                            let requestedLang = requestedStream?.language?.lowercased() ?? "?"
+                            let returnedLang  = returnedStream?.language?.lowercased()  ?? "?"
+                            let likelyLangOverride = returnedLang != requestedLang
+                                && (returnedLang == "eng" || returnedLang == "en")
+
+                            print("""
+[Playback] ⚠️ Stream identity comparison (Emby overrode our selection):
+[Playback]   Requested (index=\(requestedIdx)): \(streamDesc(requestedStream))
+[Playback]   Emby returned (index=\(returnedIdxStr ?? "?")): \(streamDesc(returnedStream))
+[Playback]   Probable cause: \(likelyLangOverride
+    ? "Emby overrode to user-preferred language (lang=\(returnedLang)) — patching back to requested track"
+    : "Unknown override reason — patching back to requested track regardless")
+[Playback]   → Patching URL: AC3/EAC3 compatibility takes priority on this fallback path.
+[Playback]   → Future: expose per-item audio override so users can choose between tracks.
+""")
+                            // Store patched absolute URL — Rule 3 will pick this up
+                            overrideTranscodingUrl = patchedURL.absoluteString
+                        } else {
+                            print("[Playback] ✅ AudioStreamIndex in URL: \(returnedIdxStr ?? "absent") — Emby honoured request")
+                        }
+                    }
+                }
+
+                let changed = newTcUrl != oldTcUrl
+                print("[Playback] ✅ Re-fetch succeeded — TranscodingUrl \(changed ? "changed ✅" : "unchanged"): \(newTcUrl.prefix(80))")
             } else {
                 print("[Playback] ⚠️ Re-fetch failed — continuing with original PlaybackInfo")
             }
         }
 
-        let container          = activeSource.container ?? "unknown"
-        let videoCodec         = activeSource.videoStream?.codec ?? "unknown"
-        let audioCodecs        = activeSource.audioStreams.compactMap { $0.codec }.joined(separator: ", ")
-        let subCodecs          = activeSource.subtitleStreams.compactMap { $0.codec }.joined(separator: ", ")
-        let supportsDP         = activeSource.supportsDirectPlay
-        let supportsDS         = activeSource.supportsDirectStream
-        let embyTranscodeUrl   = activeSource.transcodingUrl
+        let container  = activeSource.container ?? "unknown"
+        let videoCodec = activeSource.videoStream?.codec ?? "unknown"
+        let supportsDP          = activeSource.supportsDirectPlay
+        let supportsDS          = activeSource.supportsDirectStream
+        // Use patched URL if Emby returned wrong AudioStreamIndex; otherwise use source directly.
+        let embyTranscodeUrl    = overrideTranscodingUrl ?? activeSource.transcodingUrl
         let embyDirectStreamUrl = activeSource.directStreamUrl
         let codecsSafe         = codecsAreSafeForAVPlayer(activeSource)
         let nativeContainer    = avpDirectPlayContainers.contains(container.lowercased())
@@ -397,7 +526,7 @@ extension EmbyAPI {
 [Playback] Audio streams:        \(audioStreamsSummary.isEmpty ? "none" : audioStreamsSummary)
 [Playback] Sub streams:          \(subStreamsSummary.isEmpty ? "none" : subStreamsSummary)
 [Playback] Difficult file:       \(isDifficult ? "⚠️ yes (hasTrueHD=\(hasTrueHD) hasPGS=\(hasPGS))" : "no")
-[Playback] Stream re-fetch:      \(isDifficult ? (activeSource.id == source.id ? "attempted but used original" : "✅ used re-fetched source") : "n/a")
+[Playback] Stream re-fetch:      \(isDifficult ? (refetchSucceeded ? "✅ succeeded" : "⚠️ failed — using original") : "n/a")
 [Playback] supportsDirectPlay:   \(supportsDP.map { "\($0)" } ?? "nil")
 [Playback] supportsDirectStream: \(supportsDS.map { "\($0)" } ?? "nil")
 [Playback] Emby DirectStreamUrl: \(embyDirectStreamUrl.map { String($0.prefix(80)) } ?? "nil")
@@ -413,22 +542,130 @@ extension EmbyAPI {
 [Playback] ══════════════════════════════════════════
 """)
 
-        // Suppress unused-variable warnings for vars captured only in logging
-        _ = audioCodecs
-        _ = subCodecs
-
         return PlaybackResult(
-            url:            url,
-            playSessionId:  activeSessionId,
-            mediaSourceId:  activeSource.id,
-            playMethod:     playMethod,
-            selectedSource: activeSource
+            url:                     url,
+            playSessionId:           activeSessionId,
+            mediaSourceId:           activeSource.id,
+            playMethod:              playMethod,
+            selectedSource:          activeSource,
+            selectedAudioStreamIndex: selectedFallbackAudioIndex
         )
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // MARK: - Device Profile
+    // MARK: - Device Profiles
     // ─────────────────────────────────────────────────────────────────
+
+    /// Conservative profile for difficult-file transcodes and AVPlayer retries.
+    /// Forces H.264-only video (no HEVC passthrough).
+    ///
+    /// `audioCodec`: Use a single targeted codec (e.g. "ac3") when the selected
+    /// fallback stream is known — listing multiple codecs (e.g. "ac3,aac") can
+    /// cause Emby to pick a different track than requested.
+    ///
+    /// AudioStreamIndex / SubtitleStreamIndex are embedded directly in the POST
+    /// body — Emby embeds them in the generated TranscodingUrl, whereas query-param
+    /// versions are sometimes ignored depending on Emby server version.
+    private static func conservativeProfile(
+        audioStreamIndex:    Int?,
+        subtitleStreamIndex: Int?,
+        audioCodec:          String = "ac3,aac"
+    ) -> [String: Any] {
+        var body: [String: Any] = [
+            "DeviceProfile": [
+                "Name": "Pinea Apple TV 4K (H264 Conservative)",
+                "MaxStreamingBitrate": 40_000_000,
+                "DirectPlayProfiles":  [] as [[String: Any]],
+                "TranscodingProfiles": [[
+                    "Type":               "Video",
+                    "Container":          "ts",
+                    "VideoCodec":         "h264",
+                    "AudioCodec":         audioCodec,
+                    "Protocol":           "hls",
+                    "Context":            "Streaming",
+                    "MaxAudioChannels":   "6",
+                    "BreakOnNonKeyFrames": true,
+                    "MinSegments":        1
+                ]] as [[String: Any]],
+                "ContainerProfiles": [] as [[String: Any]],
+                "CodecProfiles":     [] as [[String: Any]],
+                "SubtitleProfiles":  [] as [[String: Any]]   // no subtitle burn-in
+            ] as [String: Any]
+        ]
+        if let audioIdx = audioStreamIndex    { body["AudioStreamIndex"]    = audioIdx }
+        if let subIdx   = subtitleStreamIndex { body["SubtitleStreamIndex"] = subIdx   }
+        return body
+    }
+
+    // MARK: - URL patching helper
+
+    /// Checks whether the given URL already has the correct AudioStreamIndex.
+    /// If not, replaces it and logs a warning.
+    /// Returns the (possibly patched) URL and a flag indicating whether a patch was applied.
+    private static func patchAudioStreamIndex(
+        url:            URL,
+        requestedIndex: Int,
+        context:        String = ""
+    ) -> (url: URL, wasPatched: Bool) {
+        guard var comps = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return (url, false)
+        }
+        var items = comps.queryItems ?? []
+        let key = "AudioStreamIndex"
+        let currentVal = items.first(where: { $0.name.lowercased() == key.lowercased() })?.value
+
+        guard currentVal != "\(requestedIndex)" else {
+            return (url, false)   // already correct — no patch needed
+        }
+
+        let ctx = context.isEmpty ? "" : " (\(context))"
+        print("[Playback] ⚠️ Emby returned wrong AudioStreamIndex=\(currentVal ?? "absent"); patching URL to requested AudioStreamIndex=\(requestedIndex)\(ctx)")
+        items.removeAll { $0.name.lowercased() == key.lowercased() }
+        items.append(.init(name: key, value: "\(requestedIndex)"))
+        comps.queryItems = items
+        return (comps.url ?? url, true)
+    }
+
+    // MARK: - Raw stream URL (PlayerLab path)
+
+    /// Builds a static byte-range stream URL for PlayerLab's IO layer.
+    ///
+    /// PlayerLab reads the original container file via HTTP byte-range requests
+    /// and handles all demuxing/decoding locally — no Emby transcoding required.
+    ///
+    /// Endpoint: GET /Videos/{itemId}/stream.{container}
+    ///   ?Static=true          → return original file, no transcode
+    ///   &MediaSourceId=...    → disambiguate when a title has multiple versions
+    ///   &api_key=...          → authentication
+    ///
+    /// The Emby server sets Accept-Ranges: bytes on this endpoint, so MediaReader
+    /// can issue arbitrary Range: bytes=N-M requests for seek/demux.
+    ///
+    /// Returns nil if the container is empty or the URL cannot be constructed.
+    static func rawStreamURL(
+        server:        EmbyServer,
+        token:         String,
+        itemId:        String,
+        mediaSourceId: String,
+        container:     String    // original container, e.g. "mkv", "mp4", "mov"
+    ) -> URL? {
+        let ext = container.lowercased().trimmingCharacters(in: .init(charactersIn: "."))
+        guard !ext.isEmpty, !itemId.isEmpty else {
+            print("[Playback] ⚠️ rawStreamURL: cannot build — ext='\(ext)' itemId='\(itemId)'")
+            return nil
+        }
+        guard var comps = try? urlComponents(server, path: "/Videos/\(itemId)/stream.\(ext)") else {
+            return nil
+        }
+        comps.queryItems = [
+            .init(name: "MediaSourceId", value: mediaSourceId),
+            .init(name: "Static",        value: "true"),
+            .init(name: "api_key",       value: token),
+        ]
+        guard let url = comps.url else { return nil }
+        print("[Playback] 🎬 PlayerLab raw stream URL: \(url.absoluteString.prefix(120))")
+        return url
+    }
 
     private static func appleTVDeviceProfile() -> [String: Any] {
         // Transcoding protocol is HLS (not HTTP progressive).
@@ -453,7 +690,7 @@ extension EmbyAPI {
                     {
                         "Type": "Video",
                         "Container": "ts",
-                        "VideoCodec": "h264",
+                        "VideoCodec": "h264,hevc,h265",
                         "AudioCodec": "aac,ac3",
                         "Protocol": "hls",
                         "Context": "Streaming",
@@ -478,60 +715,132 @@ extension EmbyAPI {
     }
 
     // MARK: - Forced Transcode URL
-    // Called by PlaybackEngine retry handler when primary path fails.
-    // Always asks Emby to transcode to a safe H.264/AAC MP4.
+    //
+    // Called by the PlaybackEngine retry handler when the primary URL fails.
+    // Fetches FRESH PlaybackInfo — never reuses the failed session — with:
+    //   • Conservative H.264-only device profile (no HEVC passthrough risk)
+    //   • AudioStreamIndex embedded in both POST body and query params
+    //   • SubtitleStreamIndex=-1 (no burn-in)
+    //
+    // `preferredAudioStreamIndex` is the Emby MediaStream.Index of the best
+    // AC3/EAC3 track selected during the original playbackURL() call.
 
     static func forcedTranscodeURL(
-        server: EmbyServer, userId: String, token: String, itemId: String
+        server:                    EmbyServer,
+        userId:                    String,
+        token:                     String,
+        itemId:                    String,
+        preferredAudioStreamIndex: Int?    = nil,
+        itemName:                  String  = ""
     ) async throws -> PlaybackResult {
-        // Re-fetch PlaybackInfo to get a fresh HLS transcode session
+
+        print("""
+[Playback] 🆘 forcedTranscode for '\(itemName.isEmpty ? itemId : itemName)'
+[Playback]   profile:                    H.264-only (conservative)
+[Playback]   preferredAudioStreamIndex:  \(preferredAudioStreamIndex.map{"\($0)"} ?? "nil (default)")
+[Playback]   SubtitleStreamIndex:        -1
+""")
+
+        // Fresh PlaybackInfo — new PlaySessionId, H.264-only profile
         var infoComps = try urlComponents(server, path: "/Items/\(itemId)/PlaybackInfo")
-        infoComps.queryItems = [.init(name: "UserId", value: userId)]
+        var infoQuery: [URLQueryItem] = [.init(name: "UserId", value: userId)]
+        if let audioIdx = preferredAudioStreamIndex {
+            infoQuery.append(.init(name: "AudioStreamIndex", value: "\(audioIdx)"))
+        }
+        infoQuery.append(.init(name: "SubtitleStreamIndex", value: "-1"))
+        infoComps.queryItems = infoQuery
         guard let infoURL = infoComps.url else { throw EmbyError.invalidURL }
 
+        // For forcedTranscode, pin to a single targeted codec when we know the stream.
+        // "ac3,aac" can cause Emby to drift to a different stream index.
+        let forcedAudioCodec = "ac3"   // Always target AC3 on retry — it's our safest path
+
+        let body = conservativeProfile(
+            audioStreamIndex:    preferredAudioStreamIndex,
+            subtitleStreamIndex: -1,
+            audioCodec:          forcedAudioCodec
+        )
+
+        // ── Log the full POST body before sending ──────────────────────────────
+        if let bodyData = try? JSONSerialization.data(withJSONObject: body, options: .prettyPrinted),
+           let bodyStr  = String(data: bodyData, encoding: .utf8) {
+            print("[Playback] 📤 forcedTranscode POST to: \(infoURL.absoluteString.prefix(120))")
+            print("[Playback] 📤 POST body:\n\(bodyStr)")
+        }
+
         let info = try decode(EmbyPlaybackInfo.self,
-                              from: try await postJSON(url: infoURL,
-                                                       body: appleTVDeviceProfile(),
-                                                       token: token))
+                              from: try await postJSON(url: infoURL, body: body, token: token))
         guard let source = info.mediaSources.first else { throw EmbyError.noMediaSource }
 
         let playSessionId = info.playSessionId ?? UUID().uuidString
+        print("[Playback]   new PlaySessionId: \(playSessionId)")
 
-        // Priority 1: Use Emby's TranscodingUrl exactly — preserve all params,
-        // only append api_key if missing. Never rewrite or reconstruct.
+        // Use Emby's TranscodingUrl — only append api_key if absent
         if let tcUrl = source.transcodingUrl {
             let wasRelative = !tcUrl.hasPrefix("http")
             let absolute    = wasRelative ? server.url + tcUrl : tcUrl
             if var comps = URLComponents(string: absolute) {
                 var items = comps.queryItems ?? []
-                let hadApiKey = items.contains(where: { $0.name == "api_key" })
-                if !hadApiKey { items.append(.init(name: "api_key", value: token)) }
+                if !items.contains(where: { $0.name == "api_key" }) {
+                    items.append(.init(name: "api_key", value: token))
+                }
                 comps.queryItems = items
-                if let url = comps.url {
-                    print("[Playback] 🆘 forcedTranscode: source=PlaybackInfo, playSessionId=\(playSessionId), wasRelative=\(wasRelative), length=\(url.absoluteString.count)")
-                    return PlaybackResult(url: url, playSessionId: playSessionId, mediaSourceId: source.id, playMethod: "Transcode", selectedSource: nil)
+                if var url = comps.url {
+                    // Audit the returned URL
+                    let retVideoCodec = items.first(where: { $0.name.lowercased() == "videocodec"      })?.value ?? "?"
+                    let retAudioCodec = items.first(where: { $0.name.lowercased() == "audiocodec"      })?.value ?? "?"
+                    let retAudioIdx   = items.first(where: { $0.name.lowercased() == "audiostreamindex"})?.value ?? "?"
+                    print("[Playback]   returned VideoCodec=\(retVideoCodec) AudioCodec=\(retAudioCodec) AudioStreamIndex=\(retAudioIdx) len=\(url.absoluteString.count)")
+
+                    // ── Patch if Emby returned wrong AudioStreamIndex ──────────────
+                    if let req = preferredAudioStreamIndex {
+                        let (patched, wasPatched) = patchAudioStreamIndex(
+                            url: url, requestedIndex: req, context: "forcedTranscode")
+                        if wasPatched { url = patched }
+                    }
+
+                    return PlaybackResult(
+                        url:                     url,
+                        playSessionId:           playSessionId,
+                        mediaSourceId:           source.id,
+                        playMethod:              "Transcode",
+                        selectedSource:          nil,
+                        selectedAudioStreamIndex: preferredAudioStreamIndex
+                    )
                 }
             }
         }
 
-        // Priority 2: EMERGENCY manual HLS fallback — only if Emby gave no TranscodingUrl.
-        print("[Playback] 🚨 forcedTranscode EMERGENCY: no Emby TranscodingUrl — constructing manual HLS fallback")
+        // Emergency manual HLS fallback — only if Emby gave no TranscodingUrl
+        print("[Playback] 🚨 forcedTranscode EMERGENCY: no TranscodingUrl — constructing manual H.264 HLS fallback")
         var comps = try urlComponents(server, path: "/Videos/\(itemId)/master.m3u8")
-        comps.queryItems = [
+        var queryItems: [URLQueryItem] = [
             .init(name: "MediaSourceId",   value: source.id),
             .init(name: "api_key",         value: token),
             .init(name: "DeviceId",        value: "cinemascope-appletv"),
             .init(name: "PlaySessionId",   value: playSessionId),
             .init(name: "VideoCodec",      value: "h264"),
-            .init(name: "AudioCodec",      value: "aac,ac3"),
+            .init(name: "AudioCodec",      value: "ac3,aac"),
             .init(name: "MaxVideoBitrate", value: "8000000"),
             .init(name: "AudioBitrate",    value: "192000"),
             .init(name: "AudioChannels",   value: "6"),
             .init(name: "MaxWidth",        value: "1920"),
             .init(name: "MaxHeight",       value: "1080"),
+            .init(name: "SubtitleStreamIndex", value: "-1"),
         ]
+        if let audioIdx = preferredAudioStreamIndex {
+            queryItems.append(.init(name: "AudioStreamIndex", value: "\(audioIdx)"))
+        }
+        comps.queryItems = queryItems
         guard let url = comps.url else { throw EmbyError.invalidURL }
-        print("[Playback] 🚨 forcedTranscode manual HLS fallback: length=\(url.absoluteString.count)")
-        return PlaybackResult(url: url, playSessionId: playSessionId, mediaSourceId: source.id, playMethod: "Transcode", selectedSource: nil)
+        print("[Playback] 🚨 forcedTranscode emergency URL len=\(url.absoluteString.count)")
+        return PlaybackResult(
+            url:                     url,
+            playSessionId:           playSessionId,
+            mediaSourceId:           source.id,
+            playMethod:              "Transcode",
+            selectedSource:          nil,
+            selectedAudioStreamIndex: preferredAudioStreamIndex
+        )
     }
 }

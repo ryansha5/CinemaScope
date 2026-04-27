@@ -273,6 +273,64 @@ enum PlaybackRouter {
         )
     }
 
+    // MARK: - PlayerLab raw-stream evaluation (playMethod-independent)
+
+    /// Evaluates PlayerLab compatibility purely from media metadata, ignoring
+    /// Emby's `playMethod`.
+    ///
+    /// Used when we want to route to PlayerLab using a raw static stream
+    /// (`/Videos/{id}/stream.mkv?Static=true`) even when Emby's PlaybackInfo
+    /// says `playMethod = "Transcode"`.
+    ///
+    /// Emby's DirectPlay / DirectStream flags describe what *AVPlayer* can play
+    /// natively — they have no bearing on PlayerLab's byte-range demuxer.
+    /// For files like "All Quiet on the Western Front" (MKV HEVC TrueHD PGS),
+    /// Emby says "Transcode" because it knows AVPlayer can't handle TrueHD over
+    /// HLS. PlayerLab reads the raw MKV bytes via HTTP Range and demuxes locally,
+    /// so the transcode opinion is irrelevant.
+    ///
+    /// Container / codec / audio checks are identical to `decide()`.
+    static func evaluateForPlayerLab(
+        source:           EmbyMediaSource?,
+        playerLabEnabled: Bool
+    ) -> PlaybackRoute {
+
+        guard playerLabEnabled else {
+            return .useAVPlayer(reason: "PlayerLab disabled in settings")
+        }
+        guard let source else {
+            return .useAVPlayer(reason: "No media source — cannot evaluate for PlayerLab raw stream")
+        }
+
+        // ── Container ────────────────────────────────────────────────────────
+        let rawContainer = source.container ?? ""
+        let container    = rawContainer.lowercased()
+        guard !container.isEmpty, supportedContainers.contains(container) else {
+            let label = container.isEmpty ? "unknown" : container
+            return .useAVPlayer(reason: "Container '\(label)' not supported by PlayerLab raw stream")
+        }
+
+        // ── Video codec ──────────────────────────────────────────────────────
+        let rawVideoCodec = source.videoStream?.codec ?? ""
+        let videoCodec    = rawVideoCodec.lowercased()
+        guard !videoCodec.isEmpty, supportedVideoCodecs.contains(videoCodec) else {
+            let label = videoCodec.isEmpty ? "unknown" : videoCodec
+            return .useAVPlayer(reason: "Video codec '\(label)' not supported by PlayerLab")
+        }
+
+        // ── Audio ─────────────────────────────────────────────────────────────
+        let audioResult = classifyAudio(from: source, container: container)
+        if audioResult.avPlayerRequired {
+            return .useAVPlayer(reason: "Audio: \(audioResult.label) — PlayerLab cannot handle")
+        }
+
+        // ── Route ─────────────────────────────────────────────────────────────
+        let contLabel = container.uppercased()
+        let vidLabel  = canonicalVideoLabel(videoCodec)
+        let reason    = "PlayerLab candidate — \(contLabel) \(vidLabel) \(audioResult.label) (raw stream, bypass Emby transcode)"
+        return .usePlayerLab(reason: reason, confidence: audioResult.confidence)
+    }
+
     // MARK: - Helpers
 
     /// Returns a short human-readable codec label for display in route logs.

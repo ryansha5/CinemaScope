@@ -9,21 +9,29 @@ struct MediaCard: View {
     let scopeMode: Bool
     let onTap:     () -> Void
 
+    /// Optional callbacks fired when this card's focus state changes.
+    /// Used by HyperView to track which item is currently highlighted.
+    var onFocusChanged: ((EmbyItem, Bool) -> Void)? = nil
+
     @EnvironmentObject var settings: AppSettings
     @FocusState private var isFocused: Bool
 
     private var cardWidth: CGFloat {
-        scopeMode
-            ? (cardSize == .poster ? CinemaTheme.scopeCardWidth  : 240)
-            : (cardSize == .poster ? CinemaTheme.standardCardWidth : 320)
+        switch (cardSize, scopeMode) {
+        case (.poster, false): return CinemaTheme.standardCardWidth
+        case (.poster, true):  return CinemaTheme.scopeCardWidth
+        case (.wide,   false): return 416   // +30 % (was 320)
+        case (.wide,   true):  return 312   // +30 % (was 240)
+        default:               return scopeMode ? 240 : 320
+        }
     }
 
     private var cardHeight: CGFloat {
         switch (cardSize, scopeMode) {
         case (.poster, false): return CinemaTheme.standardCardHeight
         case (.poster, true):  return CinemaTheme.scopeCardHeight
-        case (.wide,   false): return 180
-        case (.wide,   true):  return 124
+        case (.wide,   false): return 234   // +30 % (was 180)
+        case (.wide,   true):  return 161   // +30 % (was 124)
         case (.thumb,  false): return 203
         case (.thumb,  true):  return 141
         }
@@ -135,6 +143,9 @@ struct MediaCard: View {
         }
         .focusRingFree()
         .focused($isFocused)
+        .onChange(of: isFocused) { _, focused in
+            onFocusChanged?(item, focused)
+        }
         .accessibilityLabel(accessibilityDescription)
         .accessibilityHint("Activate to view details")
     }
@@ -190,6 +201,9 @@ struct ViewAllCard: View {
     let cardSize:  CardSize
     let scopeMode: Bool
     let onTap:     () -> Void
+    /// Optional: called with `true` when this card gains focus, `false` when it loses it.
+    /// Used by MediaRow to keep hyper mode alive while the user navigates to "View All".
+    var onFocusChanged: ((Bool) -> Void)? = nil
     @EnvironmentObject var settings: AppSettings
     @FocusState private var isFocused: Bool
 
@@ -197,8 +211,8 @@ struct ViewAllCard: View {
         switch (cardSize, scopeMode) {
         case (.poster, false): return CinemaTheme.standardCardWidth
         case (.poster, true):  return CinemaTheme.scopeCardWidth
-        case (.wide,   false): return 320
-        case (.wide,   true):  return 220
+        case (.wide,   false): return 416   // +30 % (was 320)
+        case (.wide,   true):  return 286   // +30 % (was 220)
         case (.thumb,  false): return 360
         case (.thumb,  true):  return 250
         }
@@ -207,8 +221,8 @@ struct ViewAllCard: View {
         switch (cardSize, scopeMode) {
         case (.poster, false): return CinemaTheme.standardCardHeight
         case (.poster, true):  return CinemaTheme.scopeCardHeight
-        case (.wide,   false): return 180
-        case (.wide,   true):  return 124
+        case (.wide,   false): return 234   // +30 % (was 180)
+        case (.wide,   true):  return 161   // +30 % (was 124)
         case (.thumb,  false): return 203   // 16:9 of 360
         case (.thumb,  true):  return 141   // 16:9 of 250
         }
@@ -256,5 +270,8 @@ struct ViewAllCard: View {
         }
         .focusRingFree()
         .focused($isFocused)
+        .onChange(of: isFocused) { _, focused in
+            onFocusChanged?(focused)
+        }
     }
 }

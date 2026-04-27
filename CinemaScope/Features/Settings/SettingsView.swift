@@ -6,6 +6,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
     case homeScreen  = "Home Screen"
     case playback    = "Playback"
     case startup     = "Startup"
+    case server      = "Server"
     case diagnostics = "Diagnostics"
     case playerLab   = "PlayerLab"
 
@@ -16,6 +17,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .homeScreen:  return "rectangle.grid.1x2.fill"
         case .playback:    return "play.circle.fill"
         case .startup:     return "house.fill"
+        case .server:      return "server.rack"
         case .diagnostics: return "stethoscope"
         case .playerLab:   return "skew"
         }
@@ -26,14 +28,16 @@ enum SettingsSection: String, CaseIterable, Identifiable {
 
 struct SettingsView: View {
 
+    @EnvironmentObject var env:      PINEAEnvironment
     @EnvironmentObject var settings: AppSettings
     @EnvironmentObject var session:  EmbySession
     let availableGenres: [String]
     let onDismiss: () -> Void
 
-    @State private var selectedSection: SettingsSection = .homeScreen
-    @State private var showAddRibbon  = false
-    @State private var savedFeedback  = false
+    @State private var selectedSection:   SettingsSection = .homeScreen
+    @State private var showAddRibbon      = false
+    @State private var savedFeedback      = false
+    @State private var showReconnectSheet = false
 
     var body: some View {
         ZStack {
@@ -58,6 +62,18 @@ struct SettingsView: View {
                 },
                 onDismiss: { showAddRibbon = false }
             )
+        }
+        .sheet(isPresented: $showReconnectSheet) {
+            ServerReconnectSheet(
+                session:   session,
+                colorMode: settings.colorMode,
+                onConnect: { server, user, token in
+                    env.didConnectLibrary(server: server, user: user, token: token)
+                    showReconnectSheet = false
+                },
+                onDismiss: { showReconnectSheet = false }
+            )
+            .environmentObject(env)
         }
     }
 
@@ -148,6 +164,7 @@ struct SettingsView: View {
         case .homeScreen:  homeScreenPanel
         case .playback:    playbackPanel
         case .startup:     startupPanel
+        case .server:      serverPanel
         case .diagnostics: diagnosticsPanel
         case .playerLab:   playerLabPanel
         }
@@ -184,6 +201,16 @@ struct SettingsView: View {
                     Spacer()
                 }
                 .padding(.bottom, 8)
+
+                settingsDivider
+                sectionTitle("Experimental")
+
+                toggleRow(
+                    icon:    "sparkles.rectangle.stack.fill",
+                    title:   "HyperView Backdrops",
+                    detail:  "When browsing a content row, fills the top of the screen with full-bleed artwork and metadata for the focused title. Still being refined — off by default.",
+                    value:   $settings.hyperViewEnabled
+                )
 
                 settingsDivider
                 sectionTitle("Rows")
@@ -291,9 +318,98 @@ struct SettingsView: View {
     private var playerLabPanel: some View {
         PlayerLabPanel(
             colorMode:        settings.colorMode,
-            isEnabled:        $settings.playerLabEnabled,
+            engineMode:       $settings.playbackEngineMode,
+            firstFrameMode:   $settings.playerLabFirstFrameMode,
             persistedPath:    $settings.playerLabLastPath
         )
+    }
+
+    // MARK: - Server panel
+
+    private var serverPanel: some View {
+        ScrollView(.vertical, showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 24) {
+                panelHeader(
+                    title:    "Server",
+                    subtitle: "Manage your media server connection and account."
+                )
+
+                settingsDivider
+                sectionTitle("Current Connection")
+
+                // Server details card
+                VStack(spacing: 0) {
+                    serverDetailRow(label: "Server URL", value: session.server?.url ?? "Not connected")
+                    serverDetailRow(label: "Emby User",  value: session.user?.name  ?? "—")
+                    serverDetailRow(label: "Status",
+                                   value: session.isAuthenticated ? "Connected" : "Disconnected",
+                                   valueColor: session.isAuthenticated ? CinemaTheme.teal : .red.opacity(0.8))
+                }
+                .background(CinemaTheme.peacockDeep.opacity(0.4), in: RoundedRectangle(cornerRadius: 12))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 12)
+                        .strokeBorder(CinemaTheme.peacockLight.opacity(0.15), lineWidth: 1)
+                }
+
+                settingsDivider
+                sectionTitle("Actions")
+
+                // Reconnect button
+                HStack(spacing: 16) {
+                    SettingsButton(
+                        icon:      "arrow.triangle.2.circlepath",
+                        label:     "Change Server / User",
+                        style:     .accent,
+                        colorMode: settings.colorMode
+                    ) { showReconnectSheet = true }
+
+                    SettingsButton(
+                        icon:      "rectangle.portrait.and.arrow.left",
+                        label:     "Sign Out of PINEA",
+                        style:     .destructive,
+                        colorMode: settings.colorMode
+                    ) { env.signOut() }
+                }
+
+                settingsDivider
+
+                // Info note
+                HStack(spacing: 14) {
+                    Image(systemName: "info.circle")
+                        .font(.system(size: 18))
+                        .foregroundStyle(CinemaTheme.peacockLight.opacity(0.6))
+                    Text("Signing out removes your PINEA session. Your Emby library and watch history are unaffected and will be available when you sign back in.")
+                        .font(.system(size: 15))
+                        .foregroundStyle(CinemaTheme.tertiary(settings.colorMode))
+                        .lineSpacing(4)
+                }
+                .padding(.horizontal, 20).padding(.vertical, 16)
+                .background(CinemaTheme.peacockDeep.opacity(0.25), in: RoundedRectangle(cornerRadius: 12))
+            }
+            .padding(48)
+        }
+    }
+
+    private func serverDetailRow(label: String, value: String, valueColor: Color? = nil) -> some View {
+        HStack {
+            Text(label)
+                .font(.system(size: 16, weight: .medium))
+                .foregroundStyle(CinemaTheme.secondary(settings.colorMode))
+                .frame(width: 120, alignment: .leading)
+            Text(value)
+                .font(.system(size: 16))
+                .foregroundStyle(valueColor ?? CinemaTheme.primary(settings.colorMode))
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+            Spacer()
+        }
+        .padding(.horizontal, 20).padding(.vertical, 14)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(CinemaTheme.peacockLight.opacity(0.1))
+                .frame(height: 1)
+                .padding(.horizontal, 20)
+        }
     }
 
     // MARK: - Shared panel helpers
@@ -724,8 +840,9 @@ private struct DiagnosticsPanel: View {
 
 private struct PlayerLabPanel: View {
     let colorMode:     ColorMode
-    @Binding var isEnabled:     Bool     // Sprint 15: AppSettings.playerLabEnabled
-    @Binding var persistedPath: String   // Sprint 15: AppSettings.playerLabLastPath
+    @Binding var engineMode:    PlaybackEngineMode  // Sprint 43: replaces old isEnabled Bool
+    @Binding var firstFrameMode: Bool               // Sprint 44: debug — feed only the first keyframe
+    @Binding var persistedPath: String
 
     @State private var labFilePath:   String = ""
     @State private var labIsRunning:  Bool   = false
@@ -742,24 +859,123 @@ private struct PlayerLabPanel: View {
                     Text("PlayerLab")
                         .font(.system(size: 36, weight: .bold))
                         .foregroundStyle(CinemaTheme.primary(colorMode))
-                    Text("Custom MP4 playback engine — H.264/HEVC + AAC, timed presentation, seek.")
+                    Text("Custom demux + decode engine for MKV/MP4. H.264/HEVC via VideoToolbox; AAC/AC3/EAC3/TrueHD audio.")
                         .font(.system(size: 18))
                         .foregroundStyle(CinemaTheme.secondary(colorMode))
                 }
 
                 Divider().background(CinemaTheme.peacockLight.opacity(0.2)).padding(.vertical, 4)
 
-                // Sprint 15: Enable toggle
-                settingsRow(
-                    icon: "flask.fill",
-                    title: "Enable PlayerLab",
-                    subtitle: isEnabled
-                        ? "PlayerLab is active — local MP4 files play through the custom engine"
-                        : "Disabled — all playback uses the standard AVPlayer path"
-                ) {
-                    Toggle("", isOn: $isEnabled)
-                        .labelsHidden()
-                        .tint(CinemaTheme.accentGold)
+                // Playback Engine Mode selector — three-way choice
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack(spacing: 16) {
+                        Image(systemName: "switch.2")
+                            .font(.system(size: 22))
+                            .foregroundStyle(CinemaTheme.accentGold)
+                            .frame(width: 32)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Playback Engine")
+                                .font(.system(size: 18, weight: .semibold))
+                                .foregroundStyle(CinemaTheme.primary(colorMode))
+                            Text(engineMode == .avPlayerOnly
+                                    ? "AVPlayer handles all playback — PlayerLab is bypassed entirely."
+                                 : engineMode == .playerLabPreferred
+                                    ? "PlayerLab plays compatible files; AVPlayer handles the rest and all fallbacks."
+                                    : "PlayerLab is forced for all files. Expect failures on unsupported content.")
+                                .font(.system(size: 14))
+                                .foregroundStyle(CinemaTheme.tertiary(colorMode))
+                        }
+                        Spacer()
+                    }
+                    .padding(.horizontal, 24).padding(.top, 20)
+
+                    // Mode buttons
+                    HStack(spacing: 12) {
+                        ForEach(PlaybackEngineMode.allCases, id: \.rawValue) { mode in
+                            let isSelected = engineMode == mode
+                            Button {
+                                engineMode = mode
+                            } label: {
+                                VStack(spacing: 6) {
+                                    Image(systemName: mode == .avPlayerOnly ? "play.tv.fill"
+                                                     : mode == .playerLabPreferred ? "switch.2"
+                                                     : "flask.fill")
+                                        .font(.system(size: 20))
+                                    Text(mode.shortLabel)
+                                        .font(.system(size: 12, weight: .semibold))
+                                        .multilineTextAlignment(.center)
+                                }
+                                .padding(.vertical, 14)
+                                .padding(.horizontal, 16)
+                                .frame(maxWidth: .infinity)
+                                .foregroundStyle(isSelected ? Color.black : CinemaTheme.primary(colorMode))
+                                .background(isSelected ? CinemaTheme.accentGold : CinemaTheme.peacockDeep.opacity(0.5),
+                                            in: RoundedRectangle(cornerRadius: 10))
+                                .overlay {
+                                    RoundedRectangle(cornerRadius: 10)
+                                        .strokeBorder(isSelected
+                                                      ? CinemaTheme.accentGold
+                                                      : CinemaTheme.peacockLight.opacity(0.2), lineWidth: 1)
+                                }
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.horizontal, 24).padding(.bottom, 20)
+                }
+                .background(CinemaTheme.peacockDeep.opacity(0.4), in: RoundedRectangle(cornerRadius: 12))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 12)
+                        .strokeBorder(CinemaTheme.peacockLight.opacity(0.15), lineWidth: 1)
+                }
+
+                // Restore-baseline hint when AVPlayerOnly is selected
+                if engineMode == .avPlayerOnly {
+                    HStack(spacing: 12) {
+                        Image(systemName: "checkmark.shield.fill")
+                            .foregroundStyle(CinemaTheme.accentGold)
+                        Text("AVPlayer Only is active. All content plays through the standard AVPlayer path. Use this to restore a known-good baseline before debugging PlayerLab.")
+                            .font(.system(size: 14))
+                            .foregroundStyle(CinemaTheme.secondary(colorMode))
+                    }
+                    .padding(16)
+                    .background(CinemaTheme.peacockDeep.opacity(0.3), in: RoundedRectangle(cornerRadius: 10))
+                }
+
+                // First Frame Mode toggle (Sprint 44)
+                VStack(alignment: .leading, spacing: 0) {
+                    HStack(spacing: 20) {
+                        Image(systemName: "photo.on.rectangle.fill")
+                            .font(.system(size: 22))
+                            .foregroundStyle(firstFrameMode ? CinemaTheme.accentGold : CinemaTheme.secondary(colorMode))
+                            .frame(width: 32)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("First Frame Mode")
+                                .font(.system(size: 18, weight: .semibold))
+                                .foregroundStyle(CinemaTheme.primary(colorMode))
+                            Text(firstFrameMode
+                                 ? "PlayerLab will feed exactly one keyframe and stop. Use to prove the MKV→HEVC→displayLayer pipeline before enabling continuous playback."
+                                 : "Normal continuous playback. Disable First Frame Mode for regular use.")
+                                .font(.system(size: 14))
+                                .foregroundStyle(CinemaTheme.tertiary(colorMode))
+                        }
+                        Spacer()
+                        Toggle("", isOn: $firstFrameMode)
+                            .toggleStyle(.switch)
+                            .tint(CinemaTheme.accentGold)
+                            .labelsHidden()
+                    }
+                    .padding(.horizontal, 24).padding(.vertical, 20)
+                }
+                .background(firstFrameMode
+                             ? CinemaTheme.accentGold.opacity(0.08)
+                             : CinemaTheme.peacockDeep.opacity(0.4),
+                             in: RoundedRectangle(cornerRadius: 12))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 12)
+                        .strokeBorder(firstFrameMode
+                                      ? CinemaTheme.accentGold.opacity(0.35)
+                                      : CinemaTheme.peacockLight.opacity(0.15), lineWidth: 1)
                 }
 
                 // Path input card
@@ -813,7 +1029,7 @@ private struct PlayerLabPanel: View {
                     SettingsButton(
                         icon:      "tv.fill",
                         label:     "Watch Video",
-                        style:     isEnabled ? .accent : .ghost,
+                        style:     engineMode.playerLabEnabled ? .accent : .ghost,
                         colorMode: colorMode
                     ) {
                         labShowPlayer = true

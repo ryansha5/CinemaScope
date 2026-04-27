@@ -137,6 +137,19 @@ final class PlayerLabPlaybackController: ObservableObject {
     /// short reason label suitable for logging and routing decisions.
     var onFallbackRequired: ((String) -> Void)?
 
+    // MARK: - Sprint 44: First Frame Mode
+
+    /// When true, prepare() stops after enqueuing exactly one keyframe.
+    /// Used to prove the raw-MKV → HEVC → CMSampleBuffer → displayLayer pipeline
+    /// before enabling continuous feed. Set by PlayerLabHostView from AppSettings.
+    var firstFrameMode: Bool = false
+
+    // MARK: - Prepare instance counter (Sprint 44 diagnostics)
+
+    /// Incremented at the start of every prepare() call.
+    /// Used to tag log lines so concurrent / repeated prepares are distinguishable.
+    private var prepareCounter: Int = 0
+
     // MARK: - Sprint 25: Audio preference state
 
     private var currentURL: URL? = nil
@@ -203,6 +216,9 @@ final class PlayerLabPlaybackController: ObservableObject {
     //   8. Transition to .ready
 
     func prepare(url: URL) async {
+        prepareCounter += 1
+        let prepareID = prepareCounter
+
         state = .loading
         log   = []
 
@@ -228,20 +244,52 @@ final class PlayerLabPlaybackController: ObservableObject {
         stopFeedLoop()
         stopTimeTracking()
 
-        record("[prepare] \(url.lastPathComponent)")
+        record("[Prepare #\(prepareID)] \(url.lastPathComponent)")
+
+        // Sprint 43: wall-clock timestamps for each startup phase.
+        // Filter "[StartupTiming]" in the Xcode console to see the breakdown.
+        let t0 = Date()
 
         // ── Step 1: Open MediaReader ──────────────────────────────────────────
-        record("[1] Opening MediaReader…")
+        let isRawStream = url.pathExtension.lowercased() != "m3u8"
+            && url.query?.contains("Static=true") == true
+        record("[1] Opening MediaReader… "
+             + "(type: \(isRawStream ? "raw static stream" : "HLS/other"), "
+             + "path: \(url.path.prefix(60)))")
         let reader = MediaReader(url: url)
         do {
             try await reader.open()
-            record("  ✅ Opened — \(formatBytes(reader.contentLength))")
+            let tOpen = Date().timeIntervalSince(t0)
+            record("  ✅ Opened — \(formatBytes(reader.contentLength))"
+                 + "  byteRanges=\(reader.supportsByteRanges)"
+                 + (reader.contentType.map { "  type=\($0)" } ?? ""))
+            record("[StartupTiming] open: \(String(format: "%.3f", tOpen))s")
         } catch {
-            fail("Open failed: \(error.localizedDescription)"); return
+            // Emit a structured diagnostic so raw-stream failures are immediately
+            // actionable without digging through MediaReader's stderr logs.
+            let errDesc = error.localizedDescription
+            record("""
+  ❌ Open failed: \(errDesc)
+  ── Raw stream open diagnostic ──────────────────────────────────
+  URL:              \(url.absoluteString.prefix(120))
+  URL type:         \(isRawStream ? "raw static stream (Static=true)" : "HLS or other")
+  Content-Type:     \(reader.contentType ?? "not received (HEAD failed)")
+  Content-Length:   \(reader.contentLength < 0 ? "unknown" : formatBytes(reader.contentLength))
+  Byte-range:       \(reader.supportsByteRanges ? "✅ supported" : "❌ NOT supported")
+  Error:            \(errDesc)
+  ── If this is a raw stream HTTP error ───────────────────────────
+  • 401/403: api_key missing or token expired
+  • 404: itemId or MediaSourceId wrong
+  • 503: Emby server overloaded or file path unavailable
+  • No Accept-Ranges: Emby proxy/CDN is stripping range headers
+""")
+            fail("Open failed: \(errDesc)")
+            return
         }
 
         // ── Step 2: Route + parse container (SC2) ────────────────────────────
         let prepared: ContainerResult
+        let tParseStart = Date()
         do {
             prepared = try await ContainerPreparation.prepare(
                 url:                 url,
@@ -252,6 +300,9 @@ final class PlayerLabPlaybackController: ObservableObject {
         } catch {
             fail(error.localizedDescription); return
         }
+        let tParse = Date().timeIntervalSince(tParseStart)
+        record("[StartupTiming] parse+index: \(String(format: "%.3f", tParse))s  "
+             + "(total so far: \(String(format: "%.3f", Date().timeIntervalSince(t0)))s)")
         for msg in prepared.logMessages { record(msg) }
 
         // ── Step 3: Apply container result ───────────────────────────────────
@@ -299,27 +350,77 @@ final class PlayerLabPlaybackController: ObservableObject {
         }
 
         // ── Step 4: Identify video track + configure feeder totals ───────────
-        let videoTrack       = prepared.videoTrack
-        let fourCC           = videoTrack.codecFourCC ?? "?"
-        detectedCodec        = fourCC
-        duration             = videoTrack.durationSeconds
+        let videoTrack = prepared.videoTrack
+        let fourCC     = videoTrack.codecFourCC ?? "?"
+        detectedCodec  = fourCC
+        // duration (seek bar) uses the true file duration from videoTrack.durationSeconds,
+        // which is computed from fileDurationSeconds in parse().
+        duration                 = videoTrack.durationSeconds
         feeder.videoSamplesTotal = videoTrack.sampleCount
-        feeder.duration          = videoTrack.durationSeconds
 
-        record("  codec=\(fourCC)  "
+        // Sprint 43: feeder.duration must reflect the INDEXED portion (not the full file
+        // duration) so that videoSamplesFor(seconds:) computes the correct fps.
+        // Example: 200 frames / 8 s = 25 fps.  If we used the true 2h file duration,
+        // fps would be 200/7200 = 0.028 — catastrophically wrong for refill sizing.
+        if let mkv = mkvDemuxer {
+            feeder.duration = mkv.indexedDurationSeconds > 0 ? mkv.indexedDurationSeconds
+                                                             : videoTrack.durationSeconds
+        } else {
+            feeder.duration = videoTrack.durationSeconds
+        }
+
+        record("[4] Video track configured  "
+             + "codec=\(fourCC)  "
              + "\(videoTrack.displayWidth ?? 0)×\(videoTrack.displayHeight ?? 0)  "
-             + "\(videoTrack.sampleCount) samples  "
-             + "\(String(format: "%.2f", videoTrack.durationSeconds))s")
+             + "\(videoTrack.sampleCount) startup samples  "
+             + "fileDur=\(String(format: "%.1f", videoTrack.durationSeconds))s  "
+             + "feederDur=\(String(format: "%.1f", feeder.duration))s"
+             + (mkvDemuxer?.isFullyIndexed == true ? "  ✅ fully indexed" : "  ⏳ background indexing pending"))
 
         // ── Step 5: Build CMVideoFormatDescription (SC3A — VideoFormatFactory) ─
+        let t5    = Date()
+        let label = "Prepare #\(prepareID)"
+        record("[5][\(label)] Building CMVideoFormatDescription (\(fourCC))…  "
+             + "codec=\(fourCC)  "
+             + "\(videoTrack.displayWidth ?? 0)×\(videoTrack.displayHeight ?? 0)  "
+             + "hvcC=\(videoTrack.hvcCData.map { "\($0.count)B" } ?? "none")  "
+             + "avcC=\(videoTrack.avcCData.map { "\($0.count)B" } ?? "none")")
+
+        // Watchdog: if VideoFormatFactory.make hangs (e.g. VideoToolbox waiting
+        // on a system resource), log a clear hang marker after 2 s.
+        // DispatchWorkItem runs on the global queue independently of the Swift
+        // cooperative thread pool, so it fires even if this async task is blocked.
+        let hangWork = DispatchWorkItem { [weak self] in
+            let msg = "[StartupHang][\(label)] HEVC format description exceeded 2 s — "
+                    + "possible VideoToolbox hang or missing entitlement"
+            FileHandle.standardError.write((msg + "\n").data(using: .utf8)!)
+            self?.record(msg)
+        }
+        DispatchQueue.global(qos: .background).asyncAfter(deadline: .now() + 2.0,
+                                                          execute: hangWork)
+
         do {
             feeder.videoFormatDesc = try VideoFormatFactory.make(for: videoTrack,
+                                                                 label: label,
                                                                  record: record(_:))
+            hangWork.cancel()
+            let t5elapsed = Date().timeIntervalSince(t5)
+            record("  ✅ [5][\(label)] CMVideoFormatDescription built  "
+                 + "elapsed=\(String(format: "%.3f", t5elapsed))s")
         } catch {
+            hangWork.cancel()
+            record("  ❌ [5][\(label)] VideoFormatFactory.make failed: \(error.localizedDescription)")
             fail("Format description failed: \(error.localizedDescription)"); return
         }
 
+        // ── Sprint 44: First Frame Mode — skip audio, feed one keyframe ─────────
+        if firstFrameMode, let mkv = mkvDemuxer {
+            await runFirstFrameMode(mkv: mkv, t0: t0)
+            return
+        }
+
         // ── Step 6: Build CMAudioFormatDescription (SC1 — AudioFormatFactory) ─
+        let t6 = Date()
         let activeAudioTrack:    TrackInfo?
         let mkvCodecPrivate:     Data?
         let activePlaybackMode:  AudioTrackPlaybackMode  // Sprint 36
@@ -333,25 +434,30 @@ final class PlayerLabPlaybackController: ObservableObject {
         }
 
         if let at = activeAudioTrack, let ch = at.channelCount, let sr = at.audioSampleRate {
+            record("[6] Building CMAudioFormatDescription  "
+                 + "codec=\(at.codecFourCC ?? "?")  ch=\(ch)  sr=\(Int(sr))Hz  "
+                 + "mode=\(activePlaybackMode.displayLabel)  "
+                 + "esds=\(mkvCodecPrivate.map { "\($0.count)B" } ?? "none")")
             let fmtDesc = AudioFormatFactory.make(for: at,
                                                   playbackMode: activePlaybackMode,
                                                   codecPrivate: mkvCodecPrivate,
                                                   record: record(_:))
+            let t6elapsed = Date().timeIntervalSince(t6)
             if let fmtDesc {
                 feeder.audioFormatDesc   = fmtDesc
                 feeder.audioSamplesTotal = at.sampleCount
                 feeder.hasAudio          = true
                 hasAudio                 = true
-                record("  ✅ Audio format description  "
-                     + "ch=\(ch) sr=\(Int(sr)) Hz  \(at.sampleCount) samples")
+                record("  ✅ [6] CMAudioFormatDescription built  elapsed=\(String(format: "%.3f", t6elapsed))s  \(at.sampleCount) samples")
+                if t6elapsed > 5 { record("[StartupHang] phase=6 (AudioFormatFactory) exceeded 5s") }
             } else {
-                record("  ⚠️ Audio format description failed — video only")
+                record("  ⚠️ [6] AudioFormatFactory.make returned nil — video only  elapsed=\(String(format: "%.3f", t6elapsed))s")
             }
         } else if activeAudioTrack == nil {
             if demuxer?.audioTrack == nil && mkvDemuxer?.audioTrack == nil {
-                record("  ℹ️ No audio track in this file")
+                record("[6] ℹ️ No audio track in this file")
             } else {
-                record("  ⚠️ Audio track found but codec unsupported — video only")
+                record("[6] ⚠️ Audio track present but codec unsupported — video only")
             }
         }
 
@@ -361,26 +467,184 @@ final class PlayerLabPlaybackController: ObservableObject {
         if hasAudio { activateAudioSession() }
 
         let initVideoCount = feeder.videoSamplesFor(seconds: policy.initialWindowSeconds)
-        record("[7] Loading initial window (\(Int(policy.initialWindowSeconds))s "
-             + "≈ \(initVideoCount) video "
-             + "/ \(feeder.audioSamplesFor(seconds: policy.initialWindowSeconds)) audio samples)…")
+        let initAudioCount = feeder.audioSamplesFor(seconds: policy.initialWindowSeconds)
+        record("[7] Loading initial window  "
+             + "target=\(String(format: "%.1f", policy.initialWindowSeconds))s  "
+             + "≈\(initVideoCount) video / \(initAudioCount) audio  "
+             + "videoTotal=\(feeder.videoSamplesTotal)  "
+             + "audioTotal=\(feeder.audioSamplesTotal)")
 
+        let tFeedStart = Date()
         let loaded = await feeder.feedWindow(videoCount:   initVideoCount,
                                              audioSeconds: policy.initialWindowSeconds,
                                              label:        "initial",
                                              log:          record(_:))
+
+        let tFeedElapsed = Date().timeIntervalSince(tFeedStart)
+        record("[7] feedWindow returned  "
+             + "loaded=\(loaded)  "
+             + "nextV=\(feeder.nextVideoSampleIdx)  nextA=\(feeder.nextAudioSampleIdx)  "
+             + "tailV=\(String(format: "%.3f", feeder.lastEnqueuedVideoPTS))s  "
+             + "tailA=\(String(format: "%.3f", feeder.lastEnqueuedAudioPTS))s  "
+             + "elapsed=\(String(format: "%.3f", tFeedElapsed))s")
+        if tFeedElapsed > 5 { record("[StartupHang] phase=7 (feedWindow) exceeded 5s: \(String(format: "%.1f", tFeedElapsed))s") }
+
         guard loaded > 0 else {
+            record("  ❌ [7] No video packets loaded — videoTotal=\(feeder.videoSamplesTotal)  "
+                 + "videoFormatDesc=\(feeder.videoFormatDesc != nil ? "present" : "nil")  "
+                 + "mkvDemuxer=\(mkvDemuxer != nil ? "present" : "nil")")
             fail("No video packets in initial window"); return
         }
         framesLoaded = feeder.nextVideoSampleIdx
 
         startPTS = renderer.firstFramePTS.isValid ? renderer.firstFramePTS : .zero
-        record("  startPTS=\(String(format: "%.4f", startPTS.seconds))s  "
+
+        // ── Renderer / enqueue diagnostics ────────────────────────────────────
+        let videoLayer = renderer.layer   // AVSampleBufferDisplayLayer
+        record("[7] Renderer state after enqueue:  "
+             + "startPTS=\(String(format: "%.4f", startPTS.seconds))s  "
+             + "firstFramePTS=\(renderer.firstFramePTS.isValid ? String(format: "%.4f", renderer.firstFramePTS.seconds) + "s" : "invalid")  "
              + "buffered≈\(String(format: "%.1f", feeder.lastEnqueuedVideoPTS - startPTS.seconds))s  "
-             + "v_idx=\(feeder.nextVideoSampleIdx)/\(feeder.videoSamplesTotal)")
+             + "v_idx=\(feeder.nextVideoSampleIdx)/\(feeder.videoSamplesTotal)  "
+             + "a_idx=\(feeder.nextAudioSampleIdx)/\(feeder.audioSamplesTotal)")
+        record("[7] layer.status=\(videoLayer.status.rawValue)  "
+             + "isReadyForMoreMediaData=\(videoLayer.isReadyForMoreMediaData)  "
+             + "synchronizer.rate=\(renderer.synchronizer.rate)")
+        if let err = videoLayer.error {
+            record("  ❌ layer.error=\(err.localizedDescription)")
+        }
+        if videoLayer.status == .failed {
+            record("  ❌ [StartupHang] layer is in .failed state — video will not render")
+        }
+
+        // Sprint 43: full startup timing summary.
+        let tTotal    = Date().timeIntervalSince(t0)
+        let tFeed     = Date().timeIntervalSince(tFeedStart)
+        let tOpen     = tTotal - tParse - tFeed   // approximate: time before parse started
+        record("""
+[StartupTiming] ── Startup timing summary ──────────────────────────────
+  open:       \(String(format: "%.3f", tOpen))s
+  parse+index:\(String(format: "%.3f", tParse))s
+  feedWindow: \(String(format: "%.3f", tFeed))s
+  total:      \(String(format: "%.3f", tTotal))s
+  indexed:    \(mkvDemuxer.map { String(format: "%.1f", $0.indexedDurationSeconds) } ?? "N/A")s of \(String(format: "%.1f", duration))s file
+  frames:     \(feeder.nextVideoSampleIdx)v / \(feeder.nextAudioSampleIdx)a enqueued
+""")
 
         transition(to: .ready, "initial window loaded")
         record("✅ Ready — initial window loaded, feed loop will handle the rest")
+    }
+
+    // MARK: - Sprint 44: First Frame Mode helpers
+
+    /// Probes the first keyframe without advancing any cursors.
+    /// Safe to call at any point after `feeder.videoFormatDesc` is set.
+    /// Logs everything under the `[FirstFrame]` prefix.
+    private func diagnoseAndProbeFirstFrame(mkv: MKVDemuxer) async {
+        let kfIdx = mkv.firstVideoKeyframeIndex
+        let kfPTS = mkv.videoPTS(forSample: kfIdx)
+        record("[FirstFrame] Keyframe probe  "
+             + "idx=\(kfIdx)  "
+             + "pts=\(String(format: "%.4f", kfPTS.seconds))s  "
+             + "totalIndexed=\(mkv.indexedVideoFrameCount)")
+
+        guard feeder.videoFormatDesc != nil else {
+            record("[FirstFrame] ⚠️ No video format desc — skipping sample buffer probe")
+            return
+        }
+
+        // fetchPackets has no cursor side effects — safe as a pure diagnostic.
+        let result = await feeder.fetchPackets(
+            videoCount:   1,
+            audioSeconds: 0,
+            fromVideoIdx: kfIdx,
+            fromAudioIdx: 0,
+            label:        "kf-probe",
+            log:          { _ in }   // silence sub-logs during probe
+        )
+
+        if let (buf, pts) = result.videoBuffers.first {
+            record("[FirstFrame] ✅ probe: sample buffer created  "
+                 + "pts=\(String(format: "%.4f", pts))s  "
+                 + "dataLen=\(CMSampleBufferGetTotalSampleSize(buf))B")
+        } else {
+            record("[FirstFrame] ❌ probe: fetchPackets returned 0 video buffers  "
+                 + "videoFormatDesc=\(feeder.videoFormatDesc != nil ? "present" : "nil")  "
+                 + "videoSamplesTotal=\(feeder.videoSamplesTotal)")
+        }
+    }
+
+    /// Runs the full first-frame pipeline: probe → fetch → enqueue → log layer state.
+    /// Called from prepare() when firstFrameMode = true.
+    private func runFirstFrameMode(mkv: MKVDemuxer, t0: Date) async {
+        record("[FirstFrame] ── First Frame Mode ─────────────────────────────────")
+        record("[FirstFrame] indexedFrames=\(mkv.indexedVideoFrameCount)  "
+             + "indexedDur=\(String(format: "%.2f", mkv.indexedDurationSeconds))s")
+
+        // Step A: diagnostic probe (no cursor side effects).
+        await diagnoseAndProbeFirstFrame(mkv: mkv)
+
+        // Step B: locate the actual first keyframe index.
+        let kfIdx = mkv.firstVideoKeyframeIndex
+        guard feeder.videoFormatDesc != nil else {
+            fail("[FirstFrame] videoFormatDesc is nil — cannot build sample buffer")
+            return
+        }
+
+        // Step C: fetch exactly one video frame (no audio).
+        record("[FirstFrame] Fetching keyframe idx=\(kfIdx)…")
+        let fetchResult = await feeder.fetchPackets(
+            videoCount:   1,
+            audioSeconds: 0,
+            fromVideoIdx: kfIdx,
+            fromAudioIdx: 0,
+            label:        "first-frame",
+            log:          record(_:)
+        )
+
+        guard !fetchResult.videoBuffers.isEmpty else {
+            record("[FirstFrame] ❌ No video buffers returned by fetchPackets")
+            fail("[FirstFrame] fetchPackets returned 0 video buffers")
+            return
+        }
+        record("[FirstFrame] fetchPackets returned \(fetchResult.videoBuffers.count) video buffer(s)")
+
+        // Step D: enqueue and advance cursors.
+        let loaded = feeder.enqueueAndAdvance(fetchResult, log: record(_:))
+
+        // Step E: log layer state immediately after enqueue.
+        let videoLayer = renderer.layer
+        record("[FirstFrame] After enqueue —  "
+             + "loaded=\(loaded)  "
+             + "layer.status=\(videoLayer.status.rawValue)  "
+             + "isReadyForMoreMediaData=\(videoLayer.isReadyForMoreMediaData)  "
+             + "framesEnqueued=\(renderer.framesEnqueued)  "
+             + "firstFramePTS=\(renderer.firstFramePTS.isValid ? String(format: "%.4f", renderer.firstFramePTS.seconds) + "s" : "invalid")")
+        if let err = videoLayer.error {
+            record("[FirstFrame] ❌ layer.error=\(err.localizedDescription)")
+        }
+        if videoLayer.status == .failed {
+            record("[FirstFrame] ❌ layer in .failed state — video will not render")
+        }
+
+        guard loaded > 0 else {
+            fail("[FirstFrame] enqueueAndAdvance returned 0 — buffer not accepted by layer")
+            return
+        }
+
+        // Step F: set startPTS and transition to ready.
+        framesLoaded = feeder.nextVideoSampleIdx
+        startPTS = fetchResult.videoBuffers.first.map {
+            CMTime(seconds: $0.pts, preferredTimescale: 1000)
+        } ?? .zero
+
+        let tTotal = Date().timeIntervalSince(t0)
+        record("[FirstFrame] ✅ First frame enqueued  "
+             + "startPTS=\(String(format: "%.4f", startPTS.seconds))s")
+        record("[StartupTiming] first-frame mode  total=\(String(format: "%.3f", tTotal))s")
+
+        transition(to: .ready, "first-frame mode")
+        record("✅ [FirstFrame] Ready — call play() to display the frame")
     }
 
     // MARK: - Transport
@@ -567,6 +831,33 @@ final class PlayerLabPlaybackController: ObservableObject {
                  + "v=\(feeder.nextVideoSampleIdx)/\(feeder.videoSamplesTotal)  "
                  + "a=\(feeder.nextAudioSampleIdx)/\(feeder.audioSamplesTotal)  "
                  + "[\(state.statusLabel)]")
+        }
+
+        // ── Sprint 43: Background indexing — extend the window on-demand ────────
+        // If we've consumed all indexed video frames but the demuxer has more of
+        // the file left to scan, continue indexing synchronously before the EOS
+        // check.  The feed loop is suspended during this await; no concurrent
+        // access to frameIndex occurs.
+        if feeder.nextVideoSampleIdx >= feeder.videoSamplesTotal,
+           let mkv = mkvDemuxer, !mkv.isFullyIndexed {
+            let scanTarget = feeder.lastEnqueuedVideoPTS + 60.0  // index 60 s ahead of current tail
+            record("[feed] Approaching end of indexed window — extending index to \(String(format: "%.0f", scanTarget))s…")
+            do {
+                let (videoAdded, audioAdded) = try await mkv.continueIndexing(untilSeconds: scanTarget)
+                if videoAdded > 0 || audioAdded > 0 {
+                    feeder.videoSamplesTotal = mkv.indexedVideoFrameCount
+                    feeder.audioSamplesTotal = mkv.indexedAudioFrameCount
+                    feeder.duration          = mkv.indexedDurationSeconds
+                    record("[feed] Background indexed to \(String(format: "%.0f", mkv.indexedDurationSeconds))s  "
+                         + "+\(videoAdded)v/+\(audioAdded)a  "
+                         + "total=\(feeder.videoSamplesTotal)v/\(feeder.audioSamplesTotal)a")
+                } else if mkv.isFullyIndexed {
+                    record("[feed] ✅ Background indexing complete — \(feeder.videoSamplesTotal) total video frames")
+                }
+            } catch {
+                record("[feed] ⚠️ Background indexing error: \(error.localizedDescription)")
+            }
+            return  // Re-enter feed loop next cycle with updated totals
         }
 
         // End-of-stream: all samples fed, wait for buffer to drain.

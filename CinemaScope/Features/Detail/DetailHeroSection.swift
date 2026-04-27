@@ -14,6 +14,8 @@ struct DetailHeroSection: View {
     let cta:              PlaybackCTA
     @Binding var isFavorited: Bool
     let hasTrailer:       Bool
+    /// Sprint 7: show a subtle provenance badge when this item was selected in PINEcue.
+    var isPINEcueSelected: Bool = false
     let scopeMode:        Bool
     let colorMode:        ColorMode
     let onPlay:           (EmbyItem) -> Void
@@ -120,6 +122,20 @@ struct DetailHeroSection: View {
                 .font(.system(size: scopeMode ? 28 : 46, weight: .bold))
                 .foregroundStyle(CinemaTheme.primary(colorMode))
                 .lineLimit(2)
+
+            // PINEcue provenance — understated, only shown when active
+            if isPINEcueSelected {
+                HStack(spacing: 6) {
+                    Image(systemName: "iphone.radiowaves.left.and.right")
+                        .font(.system(size: scopeMode ? 11 : 13, weight: .medium))
+                    Text("Selected in PINEcue")
+                        .font(.system(size: scopeMode ? 12 : 14, weight: .medium))
+                        .tracking(0.2)
+                }
+                .foregroundStyle(CinemaTheme.peacockLight.opacity(0.80))
+                .transition(.opacity)
+            }
+
             if let tagline = displayItem.taglines?.first, !tagline.isEmpty {
                 Text(tagline)
                     .font(.system(size: scopeMode ? 14 : 18))

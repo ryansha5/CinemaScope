@@ -34,6 +34,7 @@ private struct PendingLabPlay: Identifiable {
 
 struct HomeView: View {
 
+    @EnvironmentObject var env:      PINEAEnvironment
     @EnvironmentObject var session:  EmbySession
     @EnvironmentObject var settings: AppSettings
     @StateObject private var store   = EmbyLibraryStore()
@@ -47,6 +48,34 @@ struct HomeView: View {
     @State private var destination:    AppDestination? = nil
     /// Sprint 43: non-nil when a PlayerLab session is being presented.
     @State private var pendingLabPlay: PendingLabPlay? = nil
+
+    // MARK: PINEcue selected item loading state
+    /// True while fetching the EmbyItem for the PINEcue-selected movie.
+    /// Prevents double-taps and drives the banner's loading indicator.
+    @State private var isLoadingSelectedItem: Bool = false
+
+    // MARK: Play in-flight guard
+    /// Holds the most recent play() task.
+    /// Cancelled before a new play() call starts — prevents concurrent prepares
+    /// when the tvOS focus engine fires multiple select events in rapid succession.
+    @State private var playTask: Task<Void, Never>? = nil
+
+    // MARK: Standard nav rail collapse state
+    /// True when any button inside the standard nav rail has focus — rail expands to show labels.
+    @State private var railExpanded:  Bool                  = false
+    /// Debounce task for collapsing the rail; cancelled if another button gains focus quickly.
+    @State private var railExitTask:  Task<Void, Never>?    = nil
+
+    // MARK: HyperView state
+    /// The item currently focused inside a "hyper" ribbon (everything below Recommendations).
+    @State private var hyperFocusedItem:   EmbyItem?    = nil
+    /// The ribbon that contains the focused item.
+    @State private var hyperFocusedRibbon: HomeRibbon?  = nil
+    /// Debounce task — cleared if focus moves to another hyper card quickly.
+    @State private var hyperExitTask: Task<Void, Never>? = nil
+    /// ScrollViewReader target: ID of the anchor view placed after the focused ribbon.
+    /// Setting this triggers a scrollTo(.bottom) to push the ribbon into the lower third.
+    @State private var hyperScrollTarget: String? = nil
 
     var body: some View {
         ZStack {
@@ -151,6 +180,7 @@ struct HomeView: View {
                     availableGenres: store.availableGenres,
                     onDismiss: { withAnimation { destination = nil } }
                 )
+                .environmentObject(env)
                 .transition(.opacity)
 
             case nil:
@@ -175,7 +205,18 @@ struct HomeView: View {
                     pendingLabPlay = nil
                 },
                 onFallback: { reason in
-                    print("[HomeView] PlayerLab fallback — \(reason) — switching to AVPlayer")
+                    // PlayerLab could not play the content.  Dismiss the cover and
+                    // hand off to AVPlayer using the Emby-provided result captured in
+                    // PendingLabPlay.  This result contains the TranscodingUrl /
+                    // DirectStreamUrl from Emby — NOT the raw stream URL that PlayerLab
+                    // was using.  AVPlayer can play this without any PlayerLab involvement.
+                    //
+                    // Note: if mode == .playerLabOnlyDebug we still fall back so the
+                    // app doesn't hang, but we log it loudly.
+                    print("[Route] PlayerLab fallback — reason='\(reason)' — switching to AVPlayer")
+                    if settings.playbackEngineMode == .playerLabOnlyDebug {
+                        print("[Route] ⚠️  mode=playerLabOnlyDebug but falling back anyway — AVPlayer takes over")
+                    }
                     let cap = pending
                     pendingLabPlay = nil
                     // Brief async hop lets the fullScreenCover begin dismissal before
@@ -190,6 +231,33 @@ struct HomeView: View {
                             user:   cap.user,
                             token:  cap.token
                         )
+                    }
+                },
+                // Sprint 44 — Auto-play next: resolve the next item in parallel with
+                // the 5-second countdown, then dismiss the cover and play it.
+                fetchNextCandidate: {
+                    guard let nextItem = await AutoPlayNextResolver.resolve(
+                        for:    pending.item,
+                        server: pending.server,
+                        userId: pending.user.id,
+                        token:  pending.token
+                    ) else { return nil }
+                    // Build backdrop URL for the countdown overlay preview
+                    let backdropTag = nextItem.backdropImageTags?.first
+                    let nextBackdrop: URL? = backdropTag.flatMap {
+                        URL(string: "\(pending.server.url)/Items/\(nextItem.id)/Images/Backdrop/0"
+                          + "?api_key=\(pending.token)&tag=\($0)")
+                    }
+                    return AutoPlayCandidate(item: nextItem, backdropURL: nextBackdrop)
+                },
+                onPlayNext: { nextItem in
+                    // Dismiss the current cover, then play the next item.
+                    // The 150 ms pause matches the onFallback pattern to let
+                    // SwiftUI begin the cover dismissal animation first.
+                    pendingLabPlay = nil
+                    Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 150_000_000)
+                        play(nextItem)
                     }
                 }
             )
@@ -209,18 +277,55 @@ struct HomeView: View {
                 await store.loadRibbons(newRibbons, server: server, userId: user.id, token: token)
             }
         }
+        // MARK: Top Shelf deep link — pinea://detail/{itemId}
+        .onOpenURL { url in
+            guard
+                url.scheme == "pinea",
+                url.host   == "detail",
+                let itemId  = url.pathComponents.dropFirst().first,
+                let server  = session.server,
+                let user    = session.user,
+                let token   = session.token
+            else { return }
+
+            Task {
+                guard let item = try? await EmbyAPI.fetchItem(
+                    server: server, userId: user.id, token: token, itemId: itemId
+                ) else { return }
+                await MainActor.run {
+                    withAnimation { destination = .detail(item) }
+                }
+            }
+        }
     }
 
     // MARK: - Standard Shell
 
     private var standardShell: some View {
-        ZStack(alignment: .top) {
+        ZStack(alignment: .topLeading) {
             CinemaBackground()
-            VStack(spacing: 0) {
-                standardNavBar.zIndex(10)
+            HStack(spacing: 0) {
+                standardNavRail
+                    .zIndex(10)
                 contentArea(scopeMode: false)
+                    .focusSection()
+            }
+            // HyperView: full-screen backdrop, floats above the nav rail (experimental, opt-in)
+            if settings.hyperViewEnabled, let item = hyperFocusedItem, let ribbon = hyperFocusedRibbon {
+                HyperBackdropPanel(
+                    item:      item,
+                    ribbon:    ribbon,
+                    session:   session,
+                    colorMode: settings.colorMode
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .ignoresSafeArea()
+                .zIndex(20)
+                .transition(.opacity)
+                .animation(.easeInOut(duration: 0.4), value: hyperFocusedItem?.id)
             }
         }
+        .animation(.easeInOut(duration: 0.35), value: hyperFocusedItem == nil)
     }
 
     // MARK: - Scope Shell
@@ -250,45 +355,138 @@ struct HomeView: View {
                         .prefersDefaultFocus(true, in: mainNamespace)
                 }
                 .frame(width: canvas.width, height: canvas.height)
-                .clipped()   // hard-clip to canvas — prevents home ribbons bleeding into letterbox bars
+                .clipped()
                 .offset(x: canvas.minX, y: canvas.minY)
+
+                // HyperView: full-screen backdrop above nav rail + letterbox (experimental, opt-in)
+                if settings.hyperViewEnabled, let item = hyperFocusedItem, let ribbon = hyperFocusedRibbon {
+                    HyperBackdropPanel(
+                        item:      item,
+                        ribbon:    ribbon,
+                        session:   session,
+                        colorMode: settings.colorMode
+                    )
+                    .frame(width: canvas.width, height: canvas.height)
+                    .offset(x: canvas.minX, y: canvas.minY)
+                    .zIndex(20)
+                    .transition(.opacity)
+                    .animation(.easeInOut(duration: 0.4), value: hyperFocusedItem?.id)
+                }
             }
         }
         .ignoresSafeArea()
+        .animation(.easeInOut(duration: 0.35), value: hyperFocusedItem == nil)
     }
 
-    // MARK: - Standard Nav Bar
+    // MARK: - Standard Nav Rail (collapsing left sidebar)
+    //
+    // Collapsed (default): icon-only, navRailCollapsedWidth wide. All nav/action
+    // buttons are DISABLED so the tvOS focus engine cannot land on them while the
+    // user browses content. The ONLY focusable element when collapsed is the
+    // pinecone logo button — it serves as the deliberate entry point.
+    //
+    // Expanded: labels visible, navRailWidth wide, all buttons enabled.
+    // Rail expands immediately when any item gains focus; collapses 200 ms after
+    // all focus leaves (debounced so moving between rail items never flickers).
 
-    private var standardNavBar: some View {
-        HStack(spacing: 0) {
-            PinneaWordmark(colorMode: settings.colorMode, fontSize: 22)
-                .padding(.trailing, 40)
+    private var standardNavRail: some View {
+        VStack(alignment: .leading, spacing: 4) {
 
-            HStack(spacing: 8) {
-                ForEach(NavTab.allCases) { tab in
-                    NavTabButton(tab: tab, isActive: activeTab == tab, compact: false) {
-                        withAnimation(.easeInOut(duration: 0.2)) { activeTab = tab }
-                    }
+            // Logo — decorative only, never focusable
+            Image("pinea_pinecone")
+                .resizable()
+                .scaledToFit()
+                .frame(height: railExpanded ? 59 : 36)
+                .frame(maxWidth: .infinity, alignment: railExpanded ? .leading : .center)
+                .padding(.bottom, 12)
+                .allowsHitTesting(false)
+                .animation(.spring(response: 0.3, dampingFraction: 0.75), value: railExpanded)
+
+            // All nav buttons — always enabled so focus works reliably.
+            // The rail expands when any button gains focus and collapses 200 ms
+            // after all focus leaves. The content area's .focusSection() keeps
+            // focus naturally in the content while browsing.
+            ForEach(NavTab.allCases) { tab in
+                NavTabButton(
+                    tab:            tab,
+                    isActive:       activeTab == tab,
+                    compact:        true,
+                    showLabel:      railExpanded,
+                    onFocusChanged: { handleRailFocus(gained: $0) }
+                ) {
+                    withAnimation(.easeInOut(duration: 0.2)) { activeTab = tab }
                 }
             }
 
             Spacer()
 
-            ScopeToggleButton(enabled: $settings.scopeUIEnabled, compact: false)
-                .accessibilityLabel(settings.scopeUIEnabled ? "Disable Scope UI" : "Enable Scope UI")
-                .accessibilityHint("Toggles the ultra-wide cinematic layout")
-            NavActionButton(icon: "magnifyingglass", label: "Search", compact: false) { withAnimation { destination = .search } }
-            NavActionButton(icon: "gearshape.fill", label: "Settings", compact: false) { withAnimation { destination = .settings } }
-            NavActionButton(icon: "rectangle.portrait.and.arrow.right", label: "Sign Out", compact: false) { session.logout() }
-                .padding(.leading, 16)
+            ScopeToggleButton(
+                enabled:        $settings.scopeUIEnabled,
+                compact:        true,
+                showLabel:      railExpanded,
+                onFocusChanged: { handleRailFocus(gained: $0) }
+            )
+            .accessibilityLabel(settings.scopeUIEnabled ? "Disable Scope UI" : "Enable Scope UI")
+
+            NavActionButton(
+                icon:           "magnifyingglass",
+                label:          "Search",
+                compact:        true,
+                showLabel:      railExpanded,
+                onFocusChanged: { handleRailFocus(gained: $0) }
+            ) { withAnimation { destination = .search } }
+
+            NavActionButton(
+                icon:           "gearshape.fill",
+                label:          "Settings",
+                compact:        true,
+                showLabel:      railExpanded,
+                onFocusChanged: { handleRailFocus(gained: $0) }
+            ) { withAnimation { destination = .settings } }
+
+            NavActionButton(
+                icon:           "rectangle.portrait.and.arrow.right",
+                label:          "Sign Out",
+                compact:        true,
+                showLabel:      railExpanded,
+                onFocusChanged: { handleRailFocus(gained: $0) }
+            ) { env.signOut() }
         }
-        .padding(.horizontal, CinemaTheme.pagePadding)
-        .padding(.vertical, 20)
-        .background(.ultraThinMaterial.opacity(settings.colorMode == .light ? 0.85 : 0.5))
-        .overlay(alignment: .bottom) {
+        .padding(.horizontal, 12)
+        .padding(.vertical, 24)
+        .frame(width: railExpanded ? CinemaTheme.navRailWidth : CinemaTheme.navRailCollapsedWidth)
+        .frame(maxHeight: .infinity)
+        .background(CinemaTheme.surfaceNav(settings.colorMode))
+        .overlay(alignment: .trailing) {
             Rectangle()
                 .fill(CinemaTheme.border(settings.colorMode))
-                .frame(height: 1)
+                .frame(width: 1)
+        }
+        .animation(.spring(response: 0.30, dampingFraction: 0.75), value: railExpanded)
+    }
+
+    /// Expands the standard nav rail on focus gain; collapses it 200 ms after
+    /// all focus leaves (debounced so transitions between adjacent buttons don't flicker).
+    private func handleRailFocus(gained: Bool) {
+        if gained {
+            railExitTask?.cancel()
+            railExitTask = nil
+            // Always set, even if already true — if the collapse animation started
+            // before this cancel arrived, this reverses it immediately.
+            withAnimation(.spring(response: 0.30, dampingFraction: 0.75)) {
+                railExpanded = true
+            }
+        } else {
+            railExitTask?.cancel()
+            railExitTask = Task {
+                try? await Task.sleep(nanoseconds: 800_000_000) // 800 ms — wide enough to outlast any focus transition between adjacent rail buttons
+                guard !Task.isCancelled else { return }
+                await MainActor.run {
+                    withAnimation(.spring(response: 0.30, dampingFraction: 0.75)) {
+                        railExpanded = false
+                    }
+                }
+            }
         }
     }
 
@@ -296,7 +494,10 @@ struct HomeView: View {
 
     private var scopeNavRail: some View {
         VStack(alignment: .leading, spacing: 4) {
-            PinneaWordmark(colorMode: settings.colorMode, fontSize: 18)
+            Image("pinea_pinecone")
+                .resizable()
+                .scaledToFit()
+                .frame(height: 59)
                 .padding(.bottom, 16)
 
             ForEach(NavTab.allCases) { tab in
@@ -313,7 +514,7 @@ struct HomeView: View {
             NavActionButton(icon: "gearshape.fill", label: "Settings", compact: true) {
                 withAnimation { destination = .settings }
             }
-            NavActionButton(icon: "rectangle.portrait.and.arrow.right", label: "Sign Out", compact: true) { session.logout() }
+            NavActionButton(icon: "rectangle.portrait.and.arrow.right", label: "Sign Out", compact: true) { env.signOut() }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 24)
@@ -346,21 +547,25 @@ struct HomeView: View {
 
     // MARK: - Home Screen
 
+    /// Ribbon types that are always "pinned" at the top and never enter hyper mode.
+    private let pinnedRibbonIDs: Set<String> = [
+        RibbonType.continueWatching.id,
+        RibbonType.recommended.id,
+    ]
+
     @ViewBuilder
     private func homeScreen(scopeMode: Bool) -> some View {
         if store.isLoading {
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(alignment: .leading, spacing: CinemaTheme.rowSpacing) {
-                    // Greeting skeleton
                     VStack(alignment: .leading, spacing: 8) {
                         SkeletonBox(width: 340, height: scopeMode ? 24 : 32, cornerRadius: 6, colorMode: settings.colorMode)
                         SkeletonBox(width: 220, height: scopeMode ? 14 : 18, cornerRadius: 4, colorMode: settings.colorMode)
                     }
-                    // Skeleton ribbons for default row labels
-                    SkeletonRow(title: "Continue Watching",    cardSize: .wide,   count: 6, scopeMode: scopeMode, colorMode: settings.colorMode)
-                    SkeletonRow(title: "Recently Added Movies",cardSize: .poster,  count: 8, scopeMode: scopeMode, colorMode: settings.colorMode)
-                    SkeletonRow(title: "Up Next",              cardSize: .wide,   count: 6, scopeMode: scopeMode, colorMode: settings.colorMode)
-                    SkeletonRow(title: "Recently Added TV",    cardSize: .thumb,  count: 7, scopeMode: scopeMode, colorMode: settings.colorMode)
+                    SkeletonRow(title: "Continue Watching",     cardSize: .wide,  count: 6, scopeMode: scopeMode, colorMode: settings.colorMode)
+                    SkeletonRow(title: "Recently Added Movies", cardSize: .poster, count: 8, scopeMode: scopeMode, colorMode: settings.colorMode)
+                    SkeletonRow(title: "Up Next",               cardSize: .wide,  count: 6, scopeMode: scopeMode, colorMode: settings.colorMode)
+                    SkeletonRow(title: "Recently Added TV",     cardSize: .thumb,  count: 7, scopeMode: scopeMode, colorMode: settings.colorMode)
                 }
                 .padding(.horizontal, scopeMode ? 24 : CinemaTheme.pagePadding)
                 .padding(.top, 32)
@@ -368,6 +573,7 @@ struct HomeView: View {
             }
             .scrollClipDisabled()
             .allowsHitTesting(false)
+
         } else if let error = store.error {
             VStack(spacing: 20) {
                 Spacer()
@@ -376,53 +582,138 @@ struct HomeView: View {
                 Spacer()
             }
             .frame(maxWidth: .infinity).padding(60)
-        } else {
-            ScrollView(.vertical, showsIndicators: false) {
-                VStack(alignment: .leading, spacing: CinemaTheme.rowSpacing) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Good \(timeOfDay), \(session.user?.name ?? "")")
-                            .font(.system(size: scopeMode ? 28 : 36, weight: .bold))
-                            .foregroundStyle(CinemaTheme.primary(settings.colorMode))
-                        Text("What are we watching tonight?")
-                            .font(.system(size: scopeMode ? 16 : 20))
-                            .foregroundStyle(CinemaTheme.secondary(settings.colorMode))
-                    }
 
-                    ForEach(settings.homeRibbons.filter(\.enabled)) { ribbon in
-                        if ribbon.type == .recommended {
-                            // Personalized recommendations use their own large-card row
-                            if !store.recommendationItems.isEmpty {
-                                RecommendationRow(
-                                    title:     ribbon.type.displayName,
-                                    items:     store.recommendationItems,
-                                    session:   session,
-                                    scopeMode: scopeMode,
-                                    colorMode: settings.colorMode,
-                                    onSelect:  { showDetail($0) }
-                                )
-                            }
-                        } else {
-                            let items = store.ribbonItems[ribbon.type.id] ?? []
-                            if !items.isEmpty {
-                                MediaRow(
-                                    title:     ribbon.type.displayName,
-                                    items:     items,
-                                    session:   session,
-                                    cardSize:  ribbon.type.preferredCardSize,
-                                    scopeMode: scopeMode,
-                                    onSelect:  { showDetail($0) },
-                                    onViewAll: viewAllAction(for: ribbon)
-                                )
+        } else {
+            // ── Normal content ────────────────────────────────────────────────
+            // ScrollViewReader lets us push the focused hyper ribbon into the
+            // lower third of the screen whenever hyper mode activates.
+            ScrollViewReader { proxy in
+                ScrollView(.vertical, showsIndicators: false) {
+                    VStack(alignment: .leading, spacing: CinemaTheme.rowSpacing) {
+                        // Greeting — softens out when hyper mode is active
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Good \(timeOfDay), \(session.user?.name ?? "")")
+                                .font(.system(size: scopeMode ? 28 : 36, weight: .bold))
+                                .foregroundStyle(CinemaTheme.primary(settings.colorMode))
+                            Text("What are we watching tonight?")
+                                .font(.system(size: scopeMode ? 16 : 20))
+                                .foregroundStyle(CinemaTheme.secondary(settings.colorMode))
+                        }
+                        .opacity(hyperFocusedItem == nil ? 1 : 0)
+                        .animation(.easeInOut(duration: 0.3), value: hyperFocusedItem == nil)
+
+                        // PINEcue selected movie — only shown when a backend session exists.
+                        // Fades with the greeting in hyper mode; does not affect ribbons.
+                        if let summary = env.selectedMovieSummary {
+                            PINEcueSessionBanner(
+                                summary:   summary,
+                                isPlaying: env.isSessionPlaying,
+                                isLoading: isLoadingSelectedItem,
+                                scopeMode: scopeMode,
+                                onTap:     { showSelectedSessionItem() }
+                            )
+                            .transition(.opacity.combined(with: .move(edge: .top)))
+                            .opacity(hyperFocusedItem == nil ? 1 : 0)
+                            .animation(.easeInOut(duration: 0.3), value: hyperFocusedItem == nil)
+                        }
+
+                        ForEach(settings.homeRibbons.filter(\.enabled)) { ribbon in
+                            let isPinned = pinnedRibbonIDs.contains(ribbon.type.id)
+
+                            if ribbon.type == .recommended {
+                                if !store.recommendationItems.isEmpty {
+                                    RecommendationRow(
+                                        title:     ribbon.type.displayName,
+                                        items:     store.recommendationItems,
+                                        session:   session,
+                                        scopeMode: scopeMode,
+                                        colorMode: settings.colorMode,
+                                        onSelect:  { showDetail($0) },
+                                        onPlay:    { play($0) }
+                                    )
+                                }
+                            } else {
+                                let items = store.ribbonItems[ribbon.type.id] ?? []
+                                if !items.isEmpty {
+                                    MediaRow(
+                                        title:     ribbon.type.displayName,
+                                        items:     items,
+                                        session:   session,
+                                        cardSize:  ribbon.type.preferredCardSize,
+                                        scopeMode: scopeMode,
+                                        onSelect:  { showDetail($0) },
+                                        onViewAll: viewAllAction(for: ribbon),
+                                        onItemFocusChanged: (isPinned || !settings.hyperViewEnabled) ? nil : { item, focused in
+                                            handleHyperFocus(item: item, ribbon: ribbon, gained: focused)
+                                        }
+                                    )
+                                    // Scroll anchor: placed immediately after the row.
+                                    // scrollTo(.bottom) on this anchor aligns the row's
+                                    // bottom edge with the viewport bottom — keeping the
+                                    // ribbon in the lower third below the backdrop panel.
+                                    if !isPinned {
+                                        Color.clear
+                                            .frame(height: 0)
+                                            .id("hyper_anchor_\(ribbon.id)")
+                                    }
+                                }
                             }
                         }
                     }
+                    .padding(.horizontal, scopeMode ? 24 : CinemaTheme.pagePadding)
+                    .padding(.top, 32)
+                    .padding(.bottom, 60)
                 }
-                // Extra vertical padding so cards don't clip when scaled up
-                .padding(.horizontal, scopeMode ? 24 : CinemaTheme.pagePadding)
-                .padding(.top, 32)
-                .padding(.bottom, 60)
+                .scrollClipDisabled()
+                // When hyper mode enters a ribbon, scroll so that ribbon sits
+                // in the lower third (below the backdrop panel).
+                .onChange(of: hyperScrollTarget) { _, target in
+                    guard let target else { return }
+                    // Small delay lets tvOS's own focus-scroll settle first,
+                    // then our animation re-positions to the bottom.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+                        withAnimation(.easeInOut(duration: 0.45)) {
+                            proxy.scrollTo(target, anchor: .bottom)
+                        }
+                    }
+                }
             }
-            .scrollClipDisabled()
+        }
+    }
+
+    /// Called by every card (and the ViewAllCard) in a hyper ribbon whenever focus changes.
+    /// Entering: immediately shows the backdrop for that item.
+    /// Leaving:  starts a 600 ms debounce window — if another hyper card
+    ///           claims focus before the window expires, the exit is cancelled.
+    ///           The longer window means focus crossing the ViewAllCard or briefly
+    ///           leaving the row won't flash/collapse the backdrop.
+    private func handleHyperFocus(item: EmbyItem, ribbon: HomeRibbon, gained: Bool) {
+        if gained {
+            hyperExitTask?.cancel()
+            hyperExitTask = nil
+            let isNewRibbon = hyperFocusedRibbon?.id != ribbon.id
+            withAnimation(.easeInOut(duration: 0.35)) {
+                hyperFocusedItem   = item
+                hyperFocusedRibbon = ribbon
+            }
+            // Trigger scroll-to-bottom only when entering a different ribbon
+            // (moving left/right within the same ribbon keeps position stable).
+            if isNewRibbon {
+                hyperScrollTarget = "hyper_anchor_\(ribbon.id)"
+            }
+        } else {
+            hyperExitTask?.cancel()
+            hyperExitTask = Task {
+                try? await Task.sleep(nanoseconds: 600_000_000) // 600 ms
+                guard !Task.isCancelled else { return }
+                await MainActor.run {
+                    withAnimation(.easeInOut(duration: 0.35)) {
+                        hyperFocusedItem   = nil
+                        hyperFocusedRibbon = nil
+                        hyperScrollTarget  = nil
+                    }
+                }
+            }
         }
     }
 
@@ -451,6 +742,39 @@ struct HomeView: View {
         }
     }
 
+    /// Sprint 6/7: Fetch the full EmbyItem for the PINEcue-selected movie and
+    /// route into the normal PINEA detail flow.
+    /// Guarded against double-tap and missing credentials.
+    /// On fetch failure, clears stale session movie state without breaking the home screen.
+    private func showSelectedSessionItem() {
+        guard !isLoadingSelectedItem,
+              let itemId = env.selectedMovieId,
+              let server = session.server,
+              let user   = session.user,
+              let token  = session.token
+        else { return }
+
+        isLoadingSelectedItem = true
+
+        Task {
+            if let item = try? await EmbyAPI.fetchItem(
+                server: server, userId: user.id, token: token, itemId: itemId
+            ) {
+                await MainActor.run {
+                    isLoadingSelectedItem = false
+                    showDetail(item)
+                }
+            } else {
+                // Item unavailable — selection is stale or Emby item was removed.
+                // Clear only the movie pointers; leave session + library state intact.
+                await MainActor.run {
+                    isLoadingSelectedItem = false
+                    env.clearStaleSessionMovie()
+                }
+            }
+        }
+    }
+
     private func viewAllAction(for ribbon: HomeRibbon) -> (() -> Void)? {
         switch ribbon.type {
         case .movies, .recentMovies:      return { activeTab = .movies }
@@ -469,35 +793,118 @@ struct HomeView: View {
         guard let server = session.server,
               let user   = session.user,
               let token  = session.token else { return }
-        Task {
+
+        // Cancel any concurrent play() call before starting this one.
+        // The tvOS focus engine can fire multiple select events in < 100ms;
+        // without this guard each call races to fetch PlaybackInfo and call
+        // controller.prepare(), causing URLSession cancellations and
+        // duplicate demuxer scans.
+        playTask?.cancel()
+
+        let task = Task {
             do {
+                let mode = settings.playbackEngineMode
+                print("[Route] Mode=\(mode.rawValue) item='\(item.name)'")
+
                 let result = try await EmbyAPI.playbackURL(
                     server: server, userId: user.id, token: token,
                     itemId: item.id, itemName: item.name
                 )
+
                 // Use PlaybackCTA to decide where to resume. If startTicks is
                 // explicitly supplied (e.g. restart) that takes precedence;
                 // otherwise use the shared CTA logic so threshold rules apply.
                 let ticks = startTicks ?? PlaybackCTA.state(for: item).primaryStartTicks
 
-                // ── Sprint 43: Routing decision ───────────────────────────────
-                let route = PlaybackRouter.decide(
+                // ── AVPlayerOnly — skip PlayerLab entirely ────────────────────
+                //
+                // In this mode we never run PlayerLab route logic, never build raw
+                // stream URLs, and never touch PlayerLab state.  AVPlayer receives a
+                // fresh PlaybackResult straight from Emby with no PlayerLab involvement.
+                if mode == .avPlayerOnly {
+                    print("[Route] PlayerLab skipped because mode=AVPlayerOnly")
+                    print("[Route] → AVPlayer — url=\(result.url.absoluteString.prefix(80))")
+                    await MainActor.run {
+                        launchAVPlayer(item: item, result: result,
+                                       ticks: ticks, server: server, user: user, token: token)
+                    }
+                    return
+                }
+
+                // ── PlayerLab routing (playerLabPreferred / playerLabOnlyDebug) ──
+                //
+                // Two-stage evaluation:
+                //
+                // Stage A — PlayerLab raw stream (metadata-based, ignores playMethod):
+                //   For MKV/HEVC/TrueHD/PGS files Emby says "Transcode" because AVPlayer
+                //   can't handle them natively. PlayerLab reads the original file via
+                //   HTTP byte-range IO and demuxes locally — Emby's transcoding is never
+                //   needed. We evaluate compatibility from the MediaSource metadata and,
+                //   if compatible, hand PlayerLab the raw static-stream URL.
+                //
+                // Stage B — Standard route (Emby's DirectPlay, or AVPlayer transcode):
+                //   If Stage A doesn't fire (incompatible codec/container, or raw URL
+                //   couldn't be built), fall back to the Emby-driven route.
+                //   DirectPlay→PlayerLab, DirectStream/Transcode→AVPlayer.
+
+                // Stage A: can PlayerLab play the raw stream?
+                let rawRoute = PlaybackRouter.evaluateForPlayerLab(
+                    source:           result.selectedSource,
+                    playerLabEnabled: true   // already gated by mode != .avPlayerOnly above
+                )
+                print("[Route] [Raw]      \(rawRoute.logLine)")
+
+                let rawURL: URL? = rawRoute.isPlayerLab
+                    ? EmbyAPI.rawStreamURL(
+                        server:        server,
+                        token:         token,
+                        itemId:        item.id,
+                        mediaSourceId: result.mediaSourceId,
+                        container:     result.selectedSource?.container ?? "")
+                    : nil
+
+                // Stage B: standard Emby-driven route (DirectPlay or AVPlayer)
+                let standardRoute = PlaybackRouter.decide(
                     source:           result.selectedSource,
                     playMethod:       result.playMethod,
                     url:              result.url,
-                    playerLabEnabled: settings.playerLabEnabled
+                    playerLabEnabled: true   // already gated above
                 )
-                print("[HomeView] \(route.logLine)")
+                print("[Route] [Standard] \(standardRoute.logLine)")
+
+                // Shared backdrop URL for the PlayerLab loading screen
+                let backdropTag = item.backdropImageTags?.first
+                let backdropURL: URL? = backdropTag.flatMap {
+                    URL(string: "\(server.url)/Items/\(item.id)/Images/Backdrop/0"
+                      + "?api_key=\(token)&tag=\($0)")
+                }
+
+                // In playerLabOnlyDebug, always route to PlayerLab regardless of
+                // confidence.  In playerLabPreferred, use the confidence threshold.
+                let confidenceThreshold = (mode == .playerLabOnlyDebug)
+                    ? PlaybackConfidence.low     // accept any confidence in debug mode
+                    : settings.playerLabMinConfidence
 
                 await MainActor.run {
-                    if route.meetsThreshold(settings.playerLabMinConfidence) {
-                        // ── PlayerLab path ───────────────────────────────────
-                        // Compute backdrop URL for the loading screen.
-                        let backdropTag = item.backdropImageTags?.first
-                        let backdropURL: URL? = backdropTag.flatMap {
-                            URL(string: "\(server.url)/Items/\(item.id)/Images/Backdrop/0"
-                              + "?api_key=\(token)&tag=\($0)")
-                        }
+                    if let rawURL, rawRoute.meetsThreshold(confidenceThreshold) {
+                        // ── PlayerLab raw stream (bypasses Emby transcode) ────
+                        // `result` is preserved in PendingLabPlay so the onFallback
+                        // handler can pass the Emby URL to AVPlayer cleanly if
+                        // PlayerLab cannot open the raw stream.
+                        print("[Route] → PlayerLab raw stream: \(rawURL.absoluteString.prefix(80))")
+                        pendingLabPlay = PendingLabPlay(
+                            item:     item,
+                            url:      rawURL,
+                            ticks:    ticks,
+                            backdrop: backdropURL,
+                            result:   result,
+                            server:   server,
+                            user:     user,
+                            token:    token
+                        )
+                    } else if standardRoute.meetsThreshold(confidenceThreshold) {
+                        // ── PlayerLab direct-play (Emby says DirectPlay) ──────
+                        print("[Route] → PlayerLab direct-play: \(result.url.absoluteString.prefix(80))")
                         pendingLabPlay = PendingLabPlay(
                             item:     item,
                             url:      result.url,
@@ -509,7 +916,8 @@ struct HomeView: View {
                             token:    token
                         )
                     } else {
-                        // ── AVPlayer path (existing behaviour) ───────────────
+                        // ── AVPlayer (transcode, unsupported format, below threshold) ──
+                        print("[Route] → AVPlayer (PlayerLab confidence below threshold or codec unsupported)")
                         launchAVPlayer(
                             item:   item,
                             result: result,
@@ -520,13 +928,52 @@ struct HomeView: View {
                         )
                     }
                 }
-            } catch { print("[HomeView] Playback error: \(error)") }
+            } catch { print("[Route] ❌ Playback error: \(error)") }
+        }
+        playTask = task
+    }
+
+    /// Direct AVPlayer-only path — fetches fresh PlaybackInfo and plays without
+    /// any PlayerLab involvement.  Use for testing AVPlayer baseline or as a
+    /// manual override when PlayerLab is misbehaving.
+    ///
+    /// Never touches PlayerLab state, pending session, or raw stream URLs.
+    func playWithAVPlayerOnly(_ item: EmbyItem, startTicks: Int64? = nil) {
+        guard let server = session.server,
+              let user   = session.user,
+              let token  = session.token else { return }
+        Task {
+            do {
+                print("[Route] playWithAVPlayerOnly — fetching fresh PlaybackInfo for '\(item.name)'")
+                let result = try await EmbyAPI.playbackURL(
+                    server: server, userId: user.id, token: token,
+                    itemId: item.id, itemName: item.name
+                )
+                let ticks = startTicks ?? PlaybackCTA.state(for: item).primaryStartTicks
+                print("[Route] playWithAVPlayerOnly → AVPlayer url=\(result.url.absoluteString.prefix(80))")
+                await MainActor.run {
+                    // Ensure any in-flight PlayerLab session is dismissed first.
+                    pendingLabPlay = nil
+                    launchAVPlayer(item: item, result: result,
+                                   ticks: ticks, server: server, user: user, token: token)
+                }
+            } catch {
+                print("[Route] ❌ playWithAVPlayerOnly fetch error: \(error)")
+            }
         }
     }
 
     /// Configures and starts AVPlayer for the given item + already-resolved result.
-    /// Called both from play() when the router selects AVPlayer, and from the
-    /// PlayerLabHostView onFallback callback when PlayerLab cannot play the content.
+    ///
+    /// Clean-state guarantee: this method is self-contained.  It does not read
+    /// PlayerLab state, raw stream URLs, or pending session data.  It receives
+    /// only the PlaybackResult from Emby (TranscodingUrl / DirectStreamUrl / url)
+    /// and applies it to a freshly-configured PlaybackEngine.
+    ///
+    /// Called from:
+    ///   • play() when mode=avPlayerOnly or confidence below threshold
+    ///   • playWithAVPlayerOnly() for explicit testing / override
+    ///   • PlayerLabHostView.onFallback when PlayerLab cannot play the content
     private func launchAVPlayer(
         item:   EmbyItem,
         result: PlaybackResult,
@@ -535,6 +982,14 @@ struct HomeView: View {
         user:   EmbyUser,
         token:  String
     ) {
+        print("[Route] launchAVPlayer — '\(item.name)'  method=\(result.playMethod)  url=\(result.url.absoluteString.prefix(80))")
+
+        // Stop any currently-playing session cleanly before reconfiguring.
+        // This clears the progress timer, sends a Stopped report to Emby, and
+        // resets the AVPlayer item — preventing state from one session leaking
+        // into the next (e.g. after a PlayerLab fallback or retry).
+        engine.stop()
+
         // Tell the engine about the UI mode and item identity BEFORE load.
         // This sets the correct default viewport and restores any stored AR override.
         engine.setPlaybackContext(
@@ -547,17 +1002,46 @@ struct HomeView: View {
             mediaSourceId: result.mediaSourceId,
             playSessionId: result.playSessionId,
             playMethod:    result.playMethod)
-        // Retry handler: if primary URL fails, force HLS transcode
+        engine.setDiagnosticInfo(itemName: item.name, isRetry: false)
+
+        // Populate the available audio track list so the OSD picker has data to show.
+        // `selectedSource` carries the MediaStreams from PlaybackInfo; this is nil only
+        // on forced-transcode fallback paths, in which case we clear the track list to
+        // avoid showing stale data from a previous item.
+        if let source = result.selectedSource {
+            let tracks = source.audioStreams.compactMap { AvailableAudioTrack.from($0) }
+            engine.setAvailableAudioTracks(tracks, selectedIndex: result.selectedAudioStreamIndex)
+        } else {
+            engine.setAvailableAudioTracks([], selectedIndex: nil)
+        }
+
+        // Retry handler: if primary URL fails, request FRESH PlaybackInfo and
+        // force H.264 HLS transcode — completely independent of PlayerLab state.
+        // Passes the preferred audio stream index from the difficult-file analysis
+        // so Emby picks the same compatible track on the retry session.
+        let preferredAudioIdx = result.selectedAudioStreamIndex
         engine.setRetryHandler {
-            print("[HomeView] 🔄 Primary failed — forcing transcode for \(item.name)")
+            print("[Route] 🔄 AVPlayer primary failed — forcing transcode for '\(item.name)' "
+                + "(preferredAudioStreamIndex=\(preferredAudioIdx.map { "\($0)" } ?? "nil"))")
             guard let fallback = try? await EmbyAPI.forcedTranscodeURL(
-                server: server, userId: user.id, token: token, itemId: item.id) else { return }
+                server:                    server,
+                userId:                    user.id,
+                token:                     token,
+                itemId:                    item.id,
+                preferredAudioStreamIndex: preferredAudioIdx,
+                itemName:                  item.name
+            ) else {
+                print("[Route] ❌ forcedTranscodeURL threw — cannot recover")
+                return
+            }
+            print("[Route] 🔄 Retry URL: \(fallback.url.absoluteString.prefix(80))")
             await MainActor.run {
                 engine.setReportingContext(
                     server: server, userId: user.id, token: token, itemId: item.id,
                     mediaSourceId: fallback.mediaSourceId,
                     playSessionId: fallback.playSessionId,
                     playMethod:    fallback.playMethod)
+                engine.setDiagnosticInfo(itemName: item.name, isRetry: true)
                 engine.load(url: fallback.url, startTicks: ticks)
             }
         }

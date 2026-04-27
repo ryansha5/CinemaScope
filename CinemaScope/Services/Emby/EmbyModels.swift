@@ -286,6 +286,10 @@ struct PlaybackResult {
     /// codec/container facts that PlaybackRouter needs to decide between
     /// PlayerLab and AVPlayer. Nil on forced-transcode fallback paths.
     let selectedSource: EmbyMediaSource?
+    /// The Emby MediaStream.Index of the audio track selected for difficult-file
+    /// transcodes (TrueHD/PGS files). Nil for direct-play and normal transcodes.
+    /// Passed to forcedTranscodeURL on retry so the same track is preserved.
+    let selectedAudioStreamIndex: Int?
 }
 
 // MARK: - Playback Info

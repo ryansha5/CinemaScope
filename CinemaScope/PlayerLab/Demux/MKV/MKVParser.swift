@@ -116,18 +116,22 @@ struct EBMLElement {
 
 // MARK: - MKVParser
 
-/// Low-level EBML parser that wraps a MediaReader.
+/// Low-level EBML parser that wraps an EBMLBufferedReader.
 /// Provides two main operations:
 ///   • readVINT(at:)          — decode one variable-length integer
 ///   • nextElement(at:limit:) — decode the element at `at`, return header+payload info
 ///
 /// Thread safety: not thread-safe; all calls must be from the same async context.
+///
+/// Sprint 43: reader is now EBMLBufferedReader (512 KB window) rather than
+/// MediaReader.  All small VINT / element-header reads are served from the
+/// in-memory window; HTTP Range requests are issued only on window misses.
 
 final class MKVParser {
 
-    let reader: MediaReader
+    let reader: EBMLBufferedReader
 
-    init(reader: MediaReader) {
+    init(reader: EBMLBufferedReader) {
         self.reader = reader
     }
 
@@ -139,8 +143,13 @@ final class MKVParser {
     func readVINT(at offset: Int64) async throws -> (value: UInt64, width: Int) {
         let first: UInt8
         do {
-            let d = try await reader.read(offset: offset, length: 1)
-            first = d[d.startIndex]
+            // Sprint 43: readBytes(at:length:) is served from the 512 KB window —
+            // no HTTP round-trip unless the window needs refilling.
+            let d = try await reader.readBytes(at: offset, length: 1)
+            guard let byte = d.first else { throw MKVParseError.unexpectedEOF }
+            first = byte
+        } catch let e as MKVParseError {
+            throw e
         } catch {
             throw MKVParseError.readFailed(underlying: error)
         }
@@ -158,9 +167,9 @@ final class MKVParser {
             return (UInt64(first & ~mask), 1)
         }
 
-        // Read remaining bytes
+        // Read remaining bytes — almost always within the existing window.
         do {
-            let rest = try await reader.read(offset: offset + 1, length: width - 1)
+            let rest = try await reader.readBytes(at: offset + 1, length: width - 1)
             var value = UInt64(first & ~mask)
             for i in 0..<(width - 1) {
                 value = (value << 8) | UInt64(rest[rest.index(rest.startIndex, offsetBy: i)])
@@ -180,10 +189,12 @@ final class MKVParser {
         guard offset < limit else { return nil }
 
         // 1. Read ID (VINT, marker bit retained)
+        // Sprint 43: served from 512 KB window — no HTTP unless window misses.
         let first: UInt8
         do {
-            let d = try await reader.read(offset: offset, length: 1)
-            first = d[d.startIndex]
+            let d = try await reader.readBytes(at: offset, length: 1)
+            guard let byte = d.first else { return nil }
+            first = byte
         } catch { return nil }
 
         var idWidth = 0
@@ -197,7 +208,7 @@ final class MKVParser {
 
         var rawID = UInt64(first)
         if idWidth > 1 {
-            guard let rest = try? await reader.read(offset: offset + 1, length: idWidth - 1) else { return nil }
+            guard let rest = try? await reader.readBytes(at: offset + 1, length: idWidth - 1) else { return nil }
             for i in 0..<(idWidth - 1) {
                 rawID = (rawID << 8) | UInt64(rest[rest.index(rest.startIndex, offsetBy: i)])
             }
@@ -236,7 +247,8 @@ final class MKVParser {
         guard element.payloadSize > 0 else { return Data() }
         let len = Int(min(Int64(maxBytes), element.payloadSize))
         do {
-            return try await reader.read(offset: element.payloadOffset, length: len)
+            // Sprint 43: served from 512 KB window for small payloads.
+            return try await reader.readBytes(at: element.payloadOffset, length: len)
         } catch {
             throw MKVParseError.readFailed(underlying: error)
         }

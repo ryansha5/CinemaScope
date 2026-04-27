@@ -6,16 +6,16 @@ import SwiftUI
 // Total duration ≈ 6 seconds (caller fades it out after 5.6 s).
 //
 // Animation:
-//   • Always uses the dark peacock background, regardless of user colour mode.
-//   • "PINEA" in Apple's New York serif (Font.system design: .serif).
-//   • Letters pop in one at a time with a spring bounce that overshoots and settles.
-//   • After all letters land, a gold highlight sweeps the word continuously.
+//   • Pinecone image fades in first (easeIn, 0.8 s)
+//   • "PINEA" letters pop in one at a time with a spring bounce (original)
+//   • After all letters land, a gold highlight sweeps the word continuously
 //
 // Timing:
-//   • First letter appears at t ≈ 0.35 s
-//   • Last  letter appears at t ≈ 1.75 s  (4 × 0.35 s gap, 5 letters)
-//   • Shimmer starts         at t ≈ 2.40 s (letters fully at rest)
-//   • Caller fades view out  at t ≈ 5.60 s → invisible by t ≈ 6.20 s
+//   • Pinecone appears  at t ≈ 0.00 s (fades in over 0.8 s)
+//   • First letter      at t ≈ 0.35 s
+//   • Last  letter      at t ≈ 1.75 s  (4 × 0.35 s gap, 5 letters)
+//   • Shimmer starts    at t ≈ 2.40 s (letters fully at rest)
+//   • Caller fades out  at t ≈ 5.60 s → invisible by t ≈ 6.20 s
 
 struct SplashView: View {
 
@@ -23,6 +23,8 @@ struct SplashView: View {
     @State private var visible: [Bool] = Array(repeating: false, count: 5)
     // Shimmer band x-position expressed as a multiplier of the wordmark width
     @State private var shimmerX: CGFloat = -0.30
+    // Pinecone fade-in
+    @State private var imageVisible: Bool = false
 
     private let letters:  [String]  = Array("PINEA").map(String.init)
     private let stagger:  Double    = 0.35   // seconds between letters
@@ -39,25 +41,51 @@ struct SplashView: View {
     var body: some View {
         ZStack {
             background
-            wordmarkStack
+
+            VStack(spacing: 36) {
+                Spacer()
+
+                // ── Pinecone image ───────────────────────────────────────────
+                Image("pinea_pinecone")
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 356)  // 187.5 % of original 190
+                    .shadow(
+                        color: Color(red: 1.0, green: 0.78, blue: 0.35).opacity(0.40),
+                        radius: 24, x: 0, y: 6
+                    )
+                    .shadow(
+                        color: Color(red: 1.0, green: 0.65, blue: 0.20).opacity(0.18),
+                        radius: 64, x: 0, y: 0
+                    )
+                    .opacity(imageVisible ? 1 : 0)
+                    .animation(.easeIn(duration: 0.8), value: imageVisible)
+
+                // ── Original wordmark stack ──────────────────────────────────
+                // .fixedSize() stops the inner GeometryReader (shimmer band) from
+                // inflating the ZStack to full screen height, which was pushing the
+                // pinecone to the top and creating the large gap.
+                wordmarkStack
+                    .fixedSize()
+
+                Spacer()
+            }
         }
         .ignoresSafeArea()
         .onAppear { startSequence() }
     }
 
-    // MARK: - Background
+    // MARK: - Background (original, unchanged)
 
     private var background: some View {
         ZStack {
-            // Core dark peacock gradient — same as dark UI background
             CinemaTheme.backgroundGradient(.dark)
-            // Radial teal bloom centred slightly right — gives depth
             CinemaTheme.radialOverlay(.dark)
         }
         .ignoresSafeArea()
     }
 
-    // MARK: - Wordmark stack
+    // MARK: - Wordmark stack (original, unchanged)
 
     private var wordmarkStack: some View {
         ZStack(alignment: .center) {
@@ -74,16 +102,12 @@ struct SplashView: View {
                 }
             }
 
-            // ── Shimmer band (added once all letters are visible) ────────────
-            // The band sweeps once every ~2.4 s, looping continuously.
+            // ── Shimmer band ─────────────────────────────────────────────────
             shimmerBand
         }
     }
 
-    // MARK: - Shimmer band
-    //
-    // A bright highlight strip that travels across the gold text, masked
-    // to the letter silhouettes so it only glints inside the characters.
+    // MARK: - Shimmer band (original, unchanged)
 
     private var shimmerBand: some View {
         GeometryReader { geo in
@@ -98,12 +122,9 @@ struct SplashView: View {
                 endPoint:   .trailing
             )
             .frame(width: bandW, height: geo.size.height)
-            // shimmerX = -0.30 → band starts 30 % off left edge
-            // shimmerX =  1.30 → band finishes 30 % past right edge
             .offset(x: shimmerX * geo.size.width)
-            .blendMode(.screen)   // adds brightness to gold without washing it out
+            .blendMode(.screen)
         }
-        // Clip the shimmer so it only shows through the letter shapes
         .mask(alignment: .center) {
             HStack(spacing: 18) {
                 ForEach(letters, id: \.self) { letter in
@@ -116,7 +137,10 @@ struct SplashView: View {
     // MARK: - Animation sequence
 
     private func startSequence() {
-        // 1. Stagger each letter's spring entrance
+        // 0. Pinecone fades in immediately
+        imageVisible = true
+
+        // 1. Stagger each letter's spring entrance (original timing)
         for i in letters.indices {
             let delay = 0.30 + Double(i) * stagger
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
@@ -127,7 +151,6 @@ struct SplashView: View {
         }
 
         // 2. Start the shimmer sweep after all letters have fully settled
-        //    Last letter fires at 0.30 + 4*0.35 = 1.70 s; add 0.55 s for spring to finish
         let shimmerStart = 0.30 + Double(letters.count - 1) * stagger + 0.55
         DispatchQueue.main.asyncAfter(deadline: .now() + shimmerStart) {
             withAnimation(

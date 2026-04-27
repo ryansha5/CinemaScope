@@ -104,7 +104,10 @@ final class EmbyLibraryStore: ObservableObject {
         do {
             switch ribbon.type {
             case .continueWatching:
-                return try await EmbyAPI.fetchContinueWatching(server: server, userId: userId, token: token, limit: 25)
+                let cwItems = try await EmbyAPI.fetchContinueWatching(server: server, userId: userId, token: token, limit: 25)
+                // Push snapshot to Top Shelf extension via shared App Group
+                TopShelfStore.write(items: cwItems, serverURL: server.url, token: token)
+                return cwItems
             case .nextUp:
                 return try await EmbyAPI.fetchNextUp(server: server, userId: userId, token: token)
             case .recentMovies:

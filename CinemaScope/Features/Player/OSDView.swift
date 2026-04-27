@@ -1,6 +1,12 @@
 import SwiftUI
 
 // MARK: - OSDView
+//
+// Floating playback controls overlay.
+// No panel background — a gradient vignette anchors the controls to the bottom
+// of the viewport so they read clearly over any content without feeling harsh.
+// All interactive rows are wrapped in .focusSection() so the tvOS focus engine
+// can reach every button.
 
 struct OSDView: View {
 
@@ -18,46 +24,36 @@ struct OSDView: View {
     let onSeek:              (Double) -> Void
     let onDismiss:           () -> Void
     let onExit:              () -> Void
-    /// Called whenever the AR pop-up opens or closes so the UIKit container
-    /// can suppress its "down arrow → hide OSD" shortcut while the menu is up.
     var onARMenuStateChange: ((Bool) -> Void)? = nil
 
-    // AR menu state
-    @State private var showARMenu = false
-    /// Tracks which AR option has focus inside the popup so we can jump to the
-    /// currently-selected item when the menu first opens.
+    @State  private var showARMenu  = false
     @FocusState private var arMenuFocus: String?
 
     var body: some View {
         GeometryReader { geo in
             let vp = viewportRect(in: geo.size)
 
-            ZStack(alignment: .bottomLeading) {
-                // ── Main layout — pinned to the bottom of the viewport ─────────
-                VStack(spacing: 0) {
-                    Spacer()
-
-                    // AR popup floats directly above the panel
-                    if showARMenu {
-                        arMenuCard
-                            .padding(.horizontal, 80)
-                            .padding(.bottom, 10)
-                            .transition(.opacity.combined(with: .move(edge: .bottom)))
-                    }
-
-                    osdPanel
+            ZStack(alignment: .bottom) {
+                // AR popup floats above the control strip
+                if showARMenu {
+                    arMenuCard
+                        .padding(.trailing, 80)
+                        .padding(.bottom, controlStripHeight + 16)
+                        .transition(.opacity.combined(with: .move(edge: .bottom)))
+                        .frame(maxWidth: .infinity, alignment: .trailing)
                 }
-                // Constrain to scope canvas when in scope mode so the OSD never
-                // bleeds into the letterbox bars.
-                .frame(width: vp.width, height: vp.height)
-                .offset(x: vp.minX, y: vp.minY)
+
+                osdPanel
             }
+            .frame(width: vp.width, height: vp.height)
+            .offset(x: vp.minX, y: vp.minY)
         }
         .ignoresSafeArea()
-        .onChange(of: showARMenu) { _, newValue in
-            onARMenuStateChange?(newValue)
-        }
+        .onChange(of: showARMenu) { _, v in onARMenuStateChange?(v) }
     }
+
+    // Height of the visible control strip — used to position the AR popup.
+    private var controlStripHeight: CGFloat { 220 }
 
     // MARK: - Viewport rect
 
@@ -67,27 +63,36 @@ struct OSDView: View {
             : CGRect(origin: .zero, size: size)
     }
 
-    // MARK: - Panel
+    // MARK: - OSD panel (gradient vignette + floating controls)
 
     private var osdPanel: some View {
         VStack(spacing: 0) {
-            // Top separator
-            Rectangle()
-                .fill(.white.opacity(0.12))
-                .frame(height: 1)
+            // Gradient vignette — fades from clear at top to dark at bottom
+            // so controls are legible without a harsh panel edge.
+            LinearGradient(
+                stops: [
+                    .init(color: .clear,                   location: 0.00),
+                    .init(color: .black.opacity(0.45),     location: 0.45),
+                    .init(color: .black.opacity(0.78),     location: 1.00),
+                ],
+                startPoint: .top, endPoint: .bottom
+            )
+            .frame(height: 120)
 
-            VStack(spacing: 22) {
-                // Row 1 — title + badges + exit
+            // Control strip — sits at the bottom, no background of its own
+            VStack(spacing: 20) {
+                // Row A — title + badges (left) · exit (right)
                 HStack(alignment: .center) {
                     metadataBlock
                     Spacer()
                     exitButton
                 }
+                .focusSection()
 
-                // Row 2 — scrubber
+                // Row B — scrubber
                 scrubberRow
 
-                // Row 3 — play/pause · viewport mode · aspect ratio trigger
+                // Row C — play/pause · viewport toggle · AR trigger
                 HStack(spacing: 0) {
                     playPauseButton
                     Spacer()
@@ -95,11 +100,13 @@ struct OSDView: View {
                     Spacer()
                     arTriggerButton
                 }
+                .focusSection()
             }
             .padding(.horizontal, 80)
-            .padding(.vertical, 28)
+            .padding(.bottom, 52)
+            .background(.black.opacity(0.78))
         }
-        .background(.ultraThinMaterial)
+        .focusSection()
         .transition(.move(edge: .bottom).combined(with: .opacity))
     }
 
@@ -108,96 +115,96 @@ struct OSDView: View {
     private var metadataBlock: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text(title)
-                .font(.system(size: 28, weight: .semibold))
+                .font(.system(size: 26, weight: .semibold))
                 .foregroundStyle(.white)
-            HStack(spacing: 10) {
-                badge(bucket.label, color: .white.opacity(0.15))
-                badge(mode.label,   color: .blue.opacity(0.40))
-                if let overrideLabel = aspectRatioOverride.badgeLabel {
-                    badge(overrideLabel, color: CinemaTheme.accentGold.opacity(0.45))
+                .shadow(color: .black.opacity(0.6), radius: 4, x: 0, y: 2)
+            HStack(spacing: 8) {
+                badge(bucket.label)
+                badge(mode.label, accent: .blue.opacity(0.7))
+                if let lbl = aspectRatioOverride.badgeLabel {
+                    badge(lbl, accent: CinemaTheme.accentGold.opacity(0.6))
                 }
             }
         }
     }
 
-    private func badge(_ text: String, color: Color) -> some View {
+    private func badge(_ text: String, accent: Color = .white.opacity(0.18)) -> some View {
         Text(text)
-            .font(.system(size: 15, weight: .medium))
-            .foregroundStyle(.white.opacity(0.85))
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .background(color, in: RoundedRectangle(cornerRadius: 6))
+            .font(.system(size: 14, weight: .medium))
+            .foregroundStyle(.white.opacity(0.80))
+            .padding(.horizontal, 10).padding(.vertical, 5)
+            .background(accent, in: RoundedRectangle(cornerRadius: 6))
     }
 
     // MARK: - Scrubber
 
     private var scrubberRow: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: 6) {
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
-                    RoundedRectangle(cornerRadius: 3).fill(.white.opacity(0.2)).frame(height: 6)
-                    RoundedRectangle(cornerRadius: 3).fill(.white).frame(width: geo.size.width * progress, height: 6)
-                    Circle().fill(.white).frame(width: 18, height: 18).offset(x: geo.size.width * progress - 9)
+                    // Track
+                    Capsule()
+                        .fill(.white.opacity(0.22))
+                        .frame(height: 4)
+                    // Fill
+                    Capsule()
+                        .fill(.white.opacity(0.90))
+                        .frame(width: geo.size.width * progress, height: 4)
+                    // Thumb
+                    Circle()
+                        .fill(.white)
+                        .frame(width: 14, height: 14)
+                        .shadow(color: .black.opacity(0.4), radius: 4)
+                        .offset(x: geo.size.width * progress - 7)
                 }
             }
-            .frame(height: 18)
+            .frame(height: 14)
+
             HStack {
-                Text(formatTime(currentTime)).font(.system(size: 16, design: .monospaced)).foregroundStyle(.white.opacity(0.6))
+                Text(formatTime(currentTime))
+                    .font(.system(size: 14, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.55))
                 Spacer()
-                Text(formatTime(duration)).font(.system(size: 16, design: .monospaced)).foregroundStyle(.white.opacity(0.6))
+                Text(formatTime(duration))
+                    .font(.system(size: 14, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.55))
             }
         }
     }
 
-    // MARK: - Play/Pause
+    // MARK: - Play / Pause
 
     private var playPauseButton: some View {
-        Button(action: onPlayPause) {
-            Image(systemName: playbackState == .playing ? "pause.fill" : "play.fill")
-                .font(.system(size: 28))
-                .foregroundStyle(.white)
-                .frame(width: 64, height: 64)
-                .background {
-                    ZStack {
-                        Circle().fill(Color.white.opacity(0.15))
-                        LinearGradient(
-                            stops: [
-                                .init(color: .white.opacity(0.40), location: 0.0),
-                                .init(color: .white.opacity(0.08), location: 0.5),
-                                .init(color: .clear,               location: 0.8),
-                            ],
-                            startPoint: .top, endPoint: .bottom
-                        ).clipShape(Circle())
-                    }
-                }
-                .overlay { Circle().strokeBorder(.white.opacity(0.30), lineWidth: 1) }
-        }
-        .focusRingFree()
-        .accessibilityLabel(playbackState == .playing ? "Pause" : "Play")
+        OSDIconButton(
+            systemName: playbackState == .playing ? "pause.fill" : "play.fill",
+            accessibilityLabel: playbackState == .playing ? "Pause" : "Play",
+            action: onPlayPause
+        )
     }
 
-    // MARK: - Viewport mode toggle (Scope Safe / Full Screen)
+    // MARK: - Viewport mode toggle
 
     private var modeToggle: some View {
         HStack(spacing: 0) {
-            Text("Viewport:")
-                .font(.system(size: 14, weight: .medium))
-                .foregroundStyle(.white.opacity(0.40))
+            Text("Viewport")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(.white.opacity(0.38))
                 .padding(.trailing, 12)
 
-            HStack(spacing: 8) {
+            HStack(spacing: 6) {
                 ForEach(PresentationMode.allCases.filter(\.isImplemented)) { m in
                     OSDPillButton(
-                        label: m.label,
-                        isActive: mode == m,
+                        label:       m.label,
+                        isActive:    mode == m,
                         accentColor: .blue
                     ) { onModeChange(m) }
                 }
             }
+            .focusSection()
         }
     }
 
-    // MARK: - Aspect ratio trigger button
+    // MARK: - Aspect ratio trigger
 
     private var arTriggerButton: some View {
         ARTriggerButton(
@@ -207,7 +214,6 @@ struct OSDView: View {
             withAnimation(.spring(response: 0.28, dampingFraction: 0.78)) {
                 showARMenu.toggle()
             }
-            // Give focus to the currently-selected item in the popup
             if showARMenu {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
                     arMenuFocus = aspectRatioOverride.rawValue
@@ -216,90 +222,68 @@ struct OSDView: View {
         }
     }
 
-    // MARK: - AR menu card (floats above the panel)
+    // MARK: - AR menu card
 
     private var arMenuCard: some View {
-        HStack {
-            Spacer()
-            VStack(alignment: .leading, spacing: 0) {
-                // Header
-                HStack {
-                    Image(systemName: "aspectratio")
-                        .font(.system(size: 16, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.5))
-                    Text("Aspect Ratio")
-                        .font(.system(size: 16, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.65))
-                }
-                .padding(.horizontal, 20)
-                .padding(.top, 16)
-                .padding(.bottom, 10)
+        VStack(alignment: .leading, spacing: 0) {
+            // Header
+            HStack(spacing: 8) {
+                Image(systemName: "aspectratio")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.45))
+                Text("Aspect Ratio")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.60))
+            }
+            .padding(.horizontal, 20).padding(.top, 16).padding(.bottom, 10)
 
-                Rectangle().fill(.white.opacity(0.12)).frame(height: 1).padding(.horizontal, 14)
+            Rectangle()
+                .fill(.white.opacity(0.10))
+                .frame(height: 1)
+                .padding(.horizontal, 14)
 
-                // Options — .focusSection() keeps directional navigation
-                // contained inside the card so a down-swipe can't escape
-                // the menu and trigger the OSD's hide-on-down-arrow path.
-                VStack(spacing: 0) {
-                    ForEach(AspectRatioOverride.allCases) { ar in
-                        ARMenuRow(
-                            ar: ar,
-                            isSelected: aspectRatioOverride == ar,
-                            externalFocus: $arMenuFocus
-                        ) {
-                            onAspectRatioChange(ar)
-                            withAnimation(.spring(response: 0.25, dampingFraction: 0.8)) {
-                                showARMenu = false
-                            }
+            VStack(spacing: 0) {
+                ForEach(AspectRatioOverride.allCases) { ar in
+                    ARMenuRow(
+                        ar: ar,
+                        isSelected: aspectRatioOverride == ar,
+                        externalFocus: $arMenuFocus
+                    ) {
+                        onAspectRatioChange(ar)
+                        withAnimation(.spring(response: 0.25, dampingFraction: 0.8)) {
+                            showARMenu = false
                         }
                     }
                 }
-                .focusSection()
-                .padding(.bottom, 10)
             }
-            .frame(width: 320)
-            .background {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 16).fill(.black.opacity(0.72))
-                    LinearGradient(
-                        stops: [.init(color: .white.opacity(0.08), location: 0), .init(color: .clear, location: 0.4)],
-                        startPoint: .top, endPoint: .bottom
-                    ).clipShape(RoundedRectangle(cornerRadius: 16))
-                }
+            .focusSection()
+            .padding(.bottom, 10)
+        }
+        .frame(width: 300)
+        .background {
+            ZStack {
+                RoundedRectangle(cornerRadius: 14)
+                    .fill(.black.opacity(0.78))
+                LinearGradient(
+                    stops: [
+                        .init(color: .white.opacity(0.07), location: 0),
+                        .init(color: .clear,               location: 0.4),
+                    ],
+                    startPoint: .top, endPoint: .bottom
+                )
+                .clipShape(RoundedRectangle(cornerRadius: 14))
             }
-            .overlay {
-                RoundedRectangle(cornerRadius: 16)
-                    .strokeBorder(.white.opacity(0.18), lineWidth: 1)
-            }
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: 14)
+                .strokeBorder(.white.opacity(0.14), lineWidth: 1)
         }
     }
 
     // MARK: - Exit
 
     private var exitButton: some View {
-        Button(action: onExit) {
-            HStack(spacing: 8) {
-                Image(systemName: "chevron.left")
-                Text("Library")
-            }
-            .font(.system(size: 18, weight: .medium))
-            .foregroundStyle(.white)
-            .padding(.horizontal, 24)
-            .padding(.vertical, 14)
-            .background {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 24).fill(.white.opacity(0.10))
-                    LinearGradient(
-                        stops: [.init(color: .white.opacity(0.28), location: 0), .init(color: .clear, location: 0.65)],
-                        startPoint: .top, endPoint: .bottom
-                    ).clipShape(RoundedRectangle(cornerRadius: 24))
-                }
-            }
-            .overlay {
-                RoundedRectangle(cornerRadius: 24).strokeBorder(.white.opacity(0.22), lineWidth: 1)
-            }
-        }
-        .focusRingFree()
+        OSDExitButton(action: onExit)
     }
 
     // MARK: - Helpers
@@ -311,15 +295,77 @@ struct OSDView: View {
 
     private func formatTime(_ seconds: Double) -> String {
         guard seconds.isFinite && seconds >= 0 else { return "0:00" }
-        let total = Int(seconds)
-        let h = total / 3600; let m = (total % 3600) / 60; let s = total % 60
+        let t = Int(seconds)
+        let h = t / 3600; let m = (t % 3600) / 60; let s = t % 60
         return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%d:%02d", m, s)
+    }
+}
+
+// MARK: - OSDIconButton
+//
+// Borderless icon button (play/pause). Glows on focus; no ring, no box.
+
+private struct OSDIconButton: View {
+    let systemName:         String
+    let accessibilityLabel: String
+    let action:             () -> Void
+
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.system(size: 30, weight: .medium))
+                .foregroundStyle(.white.opacity(isFocused ? 1.0 : 0.75))
+                .frame(width: 60, height: 60)
+                .background {
+                    Circle()
+                        .fill(.white.opacity(isFocused ? 0.20 : 0.08))
+                }
+                .scaleEffect(isFocused ? 1.12 : 1.0)
+                .shadow(color: .white.opacity(isFocused ? 0.30 : 0), radius: 16)
+                .animation(.spring(response: 0.22, dampingFraction: 0.7), value: isFocused)
+        }
+        .focusRingFree()
+        .focused($isFocused)
+        .accessibilityLabel(accessibilityLabel)
+    }
+}
+
+// MARK: - OSDExitButton
+//
+// "← Library" text button. No background when resting; subtle highlight on focus.
+
+private struct OSDExitButton: View {
+    let action: () -> Void
+
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 7) {
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 15, weight: .semibold))
+                Text("Library")
+                    .font(.system(size: 18, weight: .medium))
+            }
+            .foregroundStyle(.white.opacity(isFocused ? 1.0 : 0.55))
+            .padding(.horizontal, 20).padding(.vertical, 12)
+            .background {
+                RoundedRectangle(cornerRadius: 22)
+                    .fill(.white.opacity(isFocused ? 0.16 : 0.0))
+            }
+            .scaleEffect(isFocused ? 1.04 : 1.0)
+            .animation(.spring(response: 0.22, dampingFraction: 0.7), value: isFocused)
+        }
+        .focusRingFree()
+        .focused($isFocused)
     }
 }
 
 // MARK: - OSDPillButton
 //
-// Glass pill used for the viewport mode toggle (Scope Safe / Full Screen).
+// Glass pill for the viewport mode toggle (Scope Safe / Full Screen).
 
 private struct OSDPillButton: View {
     let label:       String
@@ -332,35 +378,29 @@ private struct OSDPillButton: View {
     var body: some View {
         Button(action: action) {
             Text(label)
-                .font(.system(size: 16, weight: .medium))
+                .font(.system(size: 15, weight: .medium))
                 .foregroundStyle(
                     isActive
-                        ? Color.black
-                        : (isFocused ? Color.black : Color.white)
+                        ? (isFocused ? Color.black : Color.black)
+                        : (isFocused ? Color.white : Color.white.opacity(0.60))
                 )
-                .padding(.horizontal, 20).padding(.vertical, 12)
+                .padding(.horizontal, 18).padding(.vertical, 10)
                 .background {
-                    ZStack {
-                        RoundedRectangle(cornerRadius: 22)
-                            .fill(isActive
-                                ? accentColor.opacity(isFocused ? 1.0 : 0.85)
-                                : (isFocused ? Color.white.opacity(0.28) : Color.white.opacity(0.10)))
-                        if !isActive {
-                            LinearGradient(
-                                stops: [
-                                    .init(color: .white.opacity(isFocused ? 0.35 : 0.18), location: 0),
-                                    .init(color: .clear, location: 0.6),
-                                ],
-                                startPoint: .top, endPoint: .bottom
-                            ).clipShape(RoundedRectangle(cornerRadius: 22))
-                        }
-                    }
+                    RoundedRectangle(cornerRadius: 20)
+                        .fill(isActive
+                              ? accentColor.opacity(isFocused ? 1.0 : 0.80)
+                              : .white.opacity(isFocused ? 0.22 : 0.08))
                 }
                 .overlay {
-                    RoundedRectangle(cornerRadius: 22)
-                        .strokeBorder(.white.opacity(isActive ? 0 : (isFocused ? 0.55 : 0.22)), lineWidth: 1)
+                    RoundedRectangle(cornerRadius: 20)
+                        .strokeBorder(
+                            isActive
+                                ? Color.clear
+                                : Color.white.opacity(isFocused ? 0.40 : 0.18),
+                            lineWidth: 1
+                        )
                 }
-                .scaleEffect(isFocused ? 1.05 : 1.0)
+                .scaleEffect(isFocused ? 1.06 : 1.0)
                 .animation(.spring(response: 0.22, dampingFraction: 0.7), value: isFocused)
         }
         .focusRingFree()
@@ -369,56 +409,47 @@ private struct OSDPillButton: View {
 }
 
 // MARK: - ARTriggerButton
-//
-// Single pill that shows the current AR selection and opens/closes the popup menu.
 
 private struct ARTriggerButton: View {
     let currentOverride: AspectRatioOverride
-    let isMenuOpen: Bool
-    let action: () -> Void
+    let isMenuOpen:      Bool
+    let action:          () -> Void
 
     @FocusState private var isFocused: Bool
 
     private var label: String {
         currentOverride == .auto ? "Aspect Ratio" : currentOverride.label
     }
-
-    private var isHighlighted: Bool { isFocused || isMenuOpen }
+    private var highlighted: Bool { isFocused || isMenuOpen }
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 8) {
+            HStack(spacing: 7) {
                 Image(systemName: "aspectratio")
-                    .font(.system(size: 14, weight: .medium))
+                    .font(.system(size: 13, weight: .medium))
                 Text(label)
-                    .font(.system(size: 16, weight: .medium))
+                    .font(.system(size: 15, weight: .medium))
                 Image(systemName: isMenuOpen ? "chevron.down" : "chevron.up")
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(.system(size: 11, weight: .semibold))
             }
-            .foregroundStyle(isHighlighted ? Color.black : Color.white)
-            .padding(.horizontal, 22).padding(.vertical, 12)
+            .foregroundStyle(highlighted ? Color.black : Color.white.opacity(0.65))
+            .padding(.horizontal, 18).padding(.vertical, 10)
             .background {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 22)
-                        .fill(isMenuOpen
-                            ? CinemaTheme.accentGold.opacity(isHighlighted ? 1.0 : 0.88)
-                            : (isHighlighted ? Color.white.opacity(0.28) : Color.white.opacity(0.10)))
-                    if !isMenuOpen {
-                        LinearGradient(
-                            stops: [
-                                .init(color: .white.opacity(isHighlighted ? 0.35 : 0.18), location: 0),
-                                .init(color: .clear, location: 0.6),
-                            ],
-                            startPoint: .top, endPoint: .bottom
-                        ).clipShape(RoundedRectangle(cornerRadius: 22))
-                    }
-                }
+                RoundedRectangle(cornerRadius: 20)
+                    .fill(isMenuOpen
+                          ? CinemaTheme.accentGold.opacity(highlighted ? 1.0 : 0.85)
+                          : .white.opacity(highlighted ? 0.22 : 0.08))
             }
             .overlay {
-                RoundedRectangle(cornerRadius: 22)
-                    .strokeBorder(.white.opacity(isMenuOpen ? 0 : (isHighlighted ? 0.55 : 0.22)), lineWidth: 1)
+                RoundedRectangle(cornerRadius: 20)
+                    .strokeBorder(
+                        isMenuOpen
+                            ? Color.clear
+                            : Color.white.opacity(highlighted ? 0.40 : 0.18),
+                        lineWidth: 1
+                    )
             }
-            .scaleEffect(isHighlighted ? 1.05 : 1.0)
+            .scaleEffect(highlighted ? 1.06 : 1.0)
             .animation(.spring(response: 0.22, dampingFraction: 0.7), value: isFocused)
             .animation(.spring(response: 0.22, dampingFraction: 0.7), value: isMenuOpen)
         }
@@ -428,8 +459,6 @@ private struct ARTriggerButton: View {
 }
 
 // MARK: - ARMenuRow
-//
-// A single option row inside the AR popup menu.
 
 private struct ARMenuRow: View {
     let ar:            AspectRatioOverride
@@ -442,30 +471,32 @@ private struct ARMenuRow: View {
     var body: some View {
         Button(action: onSelect) {
             HStack(spacing: 14) {
-                // Selection indicator
                 ZStack {
                     Circle()
-                        .strokeBorder(isSelected ? CinemaTheme.accentGold : .white.opacity(0.30), lineWidth: 1.5)
-                        .frame(width: 20, height: 20)
+                        .strokeBorder(
+                            isSelected ? CinemaTheme.accentGold : .white.opacity(0.28),
+                            lineWidth: 1.5
+                        )
+                        .frame(width: 18, height: 18)
                     if isSelected {
                         Circle()
                             .fill(CinemaTheme.accentGold)
-                            .frame(width: 10, height: 10)
+                            .frame(width: 9, height: 9)
                     }
                 }
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text(ar.label)
-                        .font(.system(size: 17, weight: isSelected ? .semibold : .regular))
+                        .font(.system(size: 16, weight: isSelected ? .semibold : .regular))
                         .foregroundStyle(.white)
                     if let ratio = ar.fixedRatio {
                         Text(String(format: "%.2f : 1", ratio))
-                            .font(.system(size: 13))
-                            .foregroundStyle(.white.opacity(0.4))
+                            .font(.system(size: 12))
+                            .foregroundStyle(.white.opacity(0.38))
                     } else {
                         Text("Detected automatically")
-                            .font(.system(size: 13))
-                            .foregroundStyle(.white.opacity(0.4))
+                            .font(.system(size: 12))
+                            .foregroundStyle(.white.opacity(0.38))
                     }
                 }
 
@@ -473,17 +504,16 @@ private struct ARMenuRow: View {
 
                 if isFocused {
                     Image(systemName: "return")
-                        .font(.system(size: 14, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.45))
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.40))
                 }
             }
-            .padding(.horizontal, 20)
-            .padding(.vertical, 12)
+            .padding(.horizontal, 18).padding(.vertical, 11)
             .background {
                 if isFocused {
-                    RoundedRectangle(cornerRadius: 10)
-                        .fill(.white.opacity(0.15))
-                        .padding(.horizontal, 6)
+                    RoundedRectangle(cornerRadius: 9)
+                        .fill(.white.opacity(0.12))
+                        .padding(.horizontal, 5)
                 }
             }
             .contentShape(Rectangle())
@@ -492,7 +522,6 @@ private struct ARMenuRow: View {
         .focused($isFocused)
         .focused(externalFocus, equals: ar.rawValue)
         .onChange(of: isFocused) { _, focused in
-            // Keep external binding in sync so the trigger button can read it
             if focused { externalFocus.wrappedValue = ar.rawValue }
         }
     }
