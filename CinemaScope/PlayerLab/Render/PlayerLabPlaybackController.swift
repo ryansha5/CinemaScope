@@ -248,6 +248,9 @@ final class PlayerLabPlaybackController: ObservableObject {
         stopTimeTracking()
 
         record("[Prepare #\(prepareID)] \(url.lastPathComponent)")
+        // Sprint 46: log DV stripping state so it's visible in every run.
+        // To disable: PacketFeeder.stripDolbyVisionNALsEnabled = false (before prepare).
+        record("[Prepare #\(prepareID)] dvStrip=\(PacketFeeder.stripDolbyVisionNALsEnabled ? "enabled" : "⚠️ DISABLED")")
 
         // Sprint 43: wall-clock timestamps for each startup phase.
         // Filter "[StartupTiming]" in the Xcode console to see the breakdown.
@@ -519,6 +522,17 @@ final class PlayerLabPlaybackController: ObservableObject {
         if videoLayer.status == .failed {
             record("  ❌ [StartupHang] layer is in .failed state — video will not render")
         }
+
+        // Sprint 46: timebase state immediately after initial enqueue.
+        // tbRate should be 0 here (synchronizer not yet started — play() does that).
+        // tbTime should be invalid or 0.  If tbRate is already 1 something reset it.
+        let tbRate = CMTimebaseGetRate(renderer.synchronizer.timebase)
+        let tbTime = CMTimebaseGetTime(renderer.synchronizer.timebase)
+        record("[7] timebase: tbRate=\(tbRate)  "
+             + "tbTime=\(tbTime.isValid ? String(format: "%.4f", tbTime.seconds) + "s" : "invalid")  "
+             + "framesEnqueued=\(renderer.framesEnqueued)  "
+             + "firstFramePTS=\(renderer.firstFramePTS.isValid ? String(format: "%.4f", renderer.firstFramePTS.seconds) + "s" : "invalid")  "
+             + "dvStrip=\(PacketFeeder.stripDolbyVisionNALsEnabled)")
 
         // Sprint 43: full startup timing summary.
         let tTotal    = Date().timeIntervalSince(t0)

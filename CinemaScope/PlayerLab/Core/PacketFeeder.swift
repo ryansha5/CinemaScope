@@ -124,6 +124,15 @@ final class PacketFeeder {
     private var videoSamplesDiagnosed: Int = 0
     private static let kDiagnosticSampleCount = 20
 
+    // MARK: - Sprint 46: DV stripping toggle
+
+    /// Set to false to disable Dolby Vision NAL stripping entirely.
+    /// Use for diagnosing whether the strip path breaks sample delivery or
+    /// decoder initialisation.  When false, all NAL types (including 62/63)
+    /// are passed to VideoToolbox unchanged.
+    /// Default: true (strip DV NALs before handing to VT).
+    static var stripDolbyVisionNALsEnabled: Bool = true
+
     // MARK: - Init
 
     init(renderer: FrameRenderer) {
@@ -210,9 +219,18 @@ final class PacketFeeder {
                 return result
             }
             for pkt in packets {
-                if let sb = try? makeVideoSampleBuffer(packet: pkt, formatDescription: vFmt) {
+                // Sprint 46: replace try? with explicit catch so buffer-construction
+                // failures are visible (try? was silently discarding them, causing
+                // SampleDiag to fire while enqueueAndAdvance received 0 buffers).
+                do {
+                    let sb = try makeVideoSampleBuffer(packet: pkt, formatDescription: vFmt)
                     result.videoBuffers.append((sb, pkt.pts.seconds))
                     result.lastVideoPTS = max(result.lastVideoPTS, pkt.pts.seconds)
+                } catch {
+                    feederLog("  ⚠️ [\(label)] makeVideoSampleBuffer failed  "
+                            + "pkt.index=\(pkt.index)  pts=\(String(format: "%.3f", pkt.pts.seconds))s  "
+                            + "size=\(pkt.data.count)B  keyframe=\(pkt.isKeyframe)  "
+                            + "error=\(error.localizedDescription)")
                 }
             }
         } catch {
@@ -263,12 +281,28 @@ final class PacketFeeder {
         let vCount = result.videoBuffers.count
         let aCount = result.audioBuffers.count
 
+        // Sprint 46: log the call regardless of vCount so we can distinguish
+        // "enqueueAndAdvance never called" from "called but 0 buffers built."
+        feederLog("[enqueue] [\(result.label)] called  videoBuffers=\(vCount)  audioBuffers=\(aCount)")
+        if vCount == 0 {
+            feederLog("[enqueue] [\(result.label)] ⚠️ zero video buffers — "
+                    + "makeVideoSampleBuffer failed for all packets in this batch; "
+                    + "check ⚠️ makeVideoSampleBuffer lines above for the cause")
+            log("  [\(result.label)] ⚠️ enqueueAndAdvance: 0 video buffers built — "
+              + "no frames enqueued this cycle")
+        }
+
         if vCount > 0 {
             let vStart = nextVideoSampleIdx
             feederLog("[enqueue] [\(result.label)] video cursor=\(vStart)  "
                     + "enqueueing \(vCount) buffers  tail=\(String(format: "%.3f", result.lastVideoPTS))s")
             for (i, (sb, _)) in result.videoBuffers.enumerated() {
                 let absIdx = vStart + i
+                if absIdx == 0 {
+                    // Sprint 46: explicit confirmation that enqueueVideo is about
+                    // to be called for the very first sample.
+                    feederLog("[enqueue] → renderer.enqueueVideo called for sample 0")
+                }
                 renderer.enqueueVideo(sb, sampleIndex: absIdx)
             }
             lastEnqueuedVideoPTS = max(lastEnqueuedVideoPTS, result.lastVideoPTS)
@@ -351,8 +385,16 @@ final class PacketFeeder {
         // handing to VideoToolbox.  VT should ignore reserved NAL types, but
         // in practice type 62/63 can corrupt the HEVC decoder state.
         // Stripping them leaves: AUD, VPS/SPS/PPS, SEI, and video slices only.
-        let sampleBytes = PacketFeeder.stripDolbyVisionNALs(normalizedBytes,
+        //
+        // Sprint 46: stripDolbyVisionNALsEnabled toggle — set to false to
+        // diagnose whether the strip path breaks sample delivery.
+        let sampleBytes: Data
+        if PacketFeeder.stripDolbyVisionNALsEnabled {
+            sampleBytes = PacketFeeder.stripDolbyVisionNALs(normalizedBytes,
                                                              nalUnitLength: nalUnitLength)
+        } else {
+            sampleBytes = normalizedBytes
+        }
 
         // ── Diagnostics: log first kDiagnosticSampleCount video samples ───────
         if videoSamplesDiagnosed < PacketFeeder.kDiagnosticSampleCount {
@@ -420,6 +462,17 @@ final class PacketFeeder {
             dict[kCMSampleAttachmentKey_NotSync as NSString] =
                 packet.isKeyframe ? kCFBooleanFalse : kCFBooleanTrue
         }
+
+        // Sprint 46: confirm buffer was actually built (fires AFTER SampleDiag, so
+        // its presence proves the full CMSampleBuffer construction path succeeded).
+        if packet.index < 20 {
+            feederLog("[CMSampleBuffer #\(packet.index)] ✅ built  "
+                    + "dataLen=\(dataLen)B  "
+                    + "pts=\(String(format: "%.3f", packet.pts.seconds))s  "
+                    + "keyframe=\(packet.isKeyframe)  "
+                    + "dvStrip=\(PacketFeeder.stripDolbyVisionNALsEnabled)")
+        }
+
         return sampleBuffer
     }
 

@@ -114,12 +114,18 @@ final class FrameRenderer {
             case .failed:     statusName = "failed"
             @unknown default: statusName = "unknownFuture"
             }
+            // Sprint 46: include timebase rate+time so we can see whether the
+            // synchronizer clock is actually running when frames are enqueued.
+            let tbRate = CMTimebaseGetRate(synchronizer.timebase)
+            let tbTime = CMTimebaseGetTime(synchronizer.timebase)
+            let tbStr  = "tbRate=\(tbRate)  tbTime=\(tbTime.isValid ? String(format: "%.3f", tbTime.seconds) + "s" : "invalid")"
             fputs("[FrameRenderer] enqueue[\(framesEnqueued - 1)] "
                 + "idx=\(sampleIndex)  "
                 + "pts=\(String(format: "%.3f", pts.seconds))s  "
                 + "dts=\(dts.isValid ? String(format: "%.3f", dts.seconds) + "s" : "invalid")  "
                 + "status=\(statusName)  "
                 + "ready=\(readyAfter)  "
+                + tbStr + "  "
                 + "\(errAfter != nil ? "❌ err=\(errAfter!.localizedDescription)" : "✅")\n",
                 stderr)
         }
@@ -155,7 +161,13 @@ final class FrameRenderer {
     /// the synchronizer anchors its clock there so the first frame appears immediately.
     func play(from startPTS: CMTime) {
         synchronizer.setRate(1, time: startPTS)
-        fputs("[FrameRenderer] play(from: \(String(format: "%.4f", startPTS.seconds))s)\n", stderr)
+        // Sprint 46: log timebase immediately after setRate so we can confirm
+        // the clock is running and anchored at the right position.
+        let tbRate = CMTimebaseGetRate(synchronizer.timebase)
+        let tbTime = CMTimebaseGetTime(synchronizer.timebase)
+        fputs("[FrameRenderer] play(from: \(String(format: "%.4f", startPTS.seconds))s)  "
+            + "tbRate=\(tbRate)  tbTime=\(tbTime.isValid ? String(format: "%.3f", tbTime.seconds) + "s" : "invalid")  "
+            + "framesEnqueued=\(framesEnqueued)\n", stderr)
     }
 
     /// Freeze playback at the current position.
