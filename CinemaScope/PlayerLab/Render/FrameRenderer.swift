@@ -160,13 +160,30 @@ final class FrameRenderer {
     /// Start playback.  `startPTS` is the video timeline position to begin from —
     /// the synchronizer anchors its clock there so the first frame appears immediately.
     func play(from startPTS: CMTime) {
-        synchronizer.setRate(1, time: startPTS)
-        // Sprint 46: log timebase immediately after setRate so we can confirm
-        // the clock is running and anchored at the right position.
-        let tbRate = CMTimebaseGetRate(synchronizer.timebase)
-        let tbTime = CMTimebaseGetTime(synchronizer.timebase)
+        // Step 1: anchor the timeline at startPTS with rate=0 (time-only, no start yet).
+        // This is a no-op if seek already anchored the clock here, but is safe to call.
+        synchronizer.setRate(0, time: startPTS)
+
+        // Step 2: start the clock without moving the anchor.
+        // Using setRate(_:time:.invalid) changes rate only, leaving the previously
+        // anchored time intact.  This two-step pattern avoids a known tvOS quirk where
+        // setRate(1, time: X) correctly anchors X but silently leaves rate=0 when the
+        // display layer's isReadyForMoreMediaData is false at the time of the call.
+        synchronizer.setRate(1, time: .invalid)
+
+        // Belt-and-suspenders: set the .rate property directly as well, since
+        // setRate(_:time:) on tvOS sometimes does not update the underlying
+        // CMTimebase rate when the display layer queue is temporarily saturated.
+        synchronizer.rate = 1
+
+        // Diagnostic log — log both synchronizer.rate property and CMTimebaseGetRate
+        // so we can distinguish between "API value" and "timebase value" in the log.
+        let syncRate = synchronizer.rate
+        let tbRate   = CMTimebaseGetRate(synchronizer.timebase)
+        let tbTime   = CMTimebaseGetTime(synchronizer.timebase)
         fputs("[FrameRenderer] play(from: \(String(format: "%.4f", startPTS.seconds))s)  "
-            + "tbRate=\(tbRate)  tbTime=\(tbTime.isValid ? String(format: "%.3f", tbTime.seconds) + "s" : "invalid")  "
+            + "syncRate=\(syncRate)  tbRate=\(tbRate)  "
+            + "tbTime=\(tbTime.isValid ? String(format: "%.3f", tbTime.seconds) + "s" : "invalid")  "
             + "framesEnqueued=\(framesEnqueued)\n", stderr)
     }
 
@@ -225,17 +242,31 @@ final class FrameRenderer {
     ///
     /// This is the correct seek-flush sequence recommended by Apple:
     ///   1. Set synchronizer rate to 0 (pause) so the pipeline is quiescent.
-    ///   2. Call flushAndRemoveImage() (not just flush()) on the display layer —
-    ///      this removes the stale displayed image synchronously, preventing
-    ///      the pipeline from receiving enqueued frames while the old flush
-    ///      is still in progress on background AVFoundation queues.
-    ///   3. Flush the audio renderer.
+    ///   2. Call flushAndRemoveImage() on the display layer to clear the
+    ///      visible image and all pending frames synchronously.
+    ///   3. Call requestMediaDataWhenReady (immediately cancelled) to reset
+    ///      the layer's isReadyForMoreMediaData flag.  flushAndRemoveImage()
+    ///      cancels any outstanding requestMediaDataWhenReady registrations,
+    ///      which leaves isReadyForMoreMediaData=false permanently.  This
+    ///      one-shot call (immediately followed by stopRequestingMediaData)
+    ///      re-arms the flag without setting up a persistent callback.
+    ///   4. Flush the audio renderer.
     ///
     /// The caller is responsible for calling setRate(_:time:) after
     /// re-enqueuing frames to restart the clock at the new position.
     func flushForSeek() {
         synchronizer.rate = 0           // quiesce pipeline before flush
         layer.flushAndRemoveImage()     // clears displayed image + pending frames
+
+        // Re-arm isReadyForMoreMediaData.  flushAndRemoveImage() cancels the
+        // synchronizer's internal requestMediaDataWhenReady registration on the
+        // layer, which leaves isReadyForMoreMediaData stuck at false.  This
+        // no-op request/stop cycle resets that flag immediately on the main queue.
+        layer.requestMediaDataWhenReady(on: .main) { [weak self] in
+            // Immediately cancel — we only want the flag reset side-effect.
+            self?.layer.stopRequestingMediaData()
+        }
+
         audioRenderer.flush()
         framesEnqueued = 0
         firstFramePTS  = .invalid
