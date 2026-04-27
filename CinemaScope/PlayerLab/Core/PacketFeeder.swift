@@ -79,6 +79,11 @@ final class PacketFeeder {
         var lastAudioPTS: Double = 0
         /// Label forwarded to enqueueAndAdvance for consistent log output.
         let label: String
+        /// Total number of video packets fetched from the demuxer, including those
+        /// skipped by the DV BL frame filter and those that failed to build.
+        /// enqueueAndAdvance uses this (not videoBuffers.count) to advance the
+        /// video cursor so that skipped/failed frames don't cause re-fetches.
+        var totalVideoAttempted: Int = 0
     }
 
     // MARK: - Cursor + tail state
@@ -129,7 +134,7 @@ final class PacketFeeder {
     private var videoSamplesDiagnosed: Int = 0
     private static let kDiagnosticSampleCount = 20
 
-    // MARK: - Sprint 46: DV stripping toggle
+    // MARK: - Sprint 46: DV stripping toggle + BL frame filter
 
     /// Set to false to disable Dolby Vision NAL stripping entirely.
     /// Use for diagnosing whether the strip path breaks sample delivery or
@@ -137,6 +142,18 @@ final class PacketFeeder {
     /// are passed to VideoToolbox unchanged.
     /// Default: true (strip DV NALs before handing to VT).
     static var stripDolbyVisionNALsEnabled: Bool = true
+
+    /// Maximum raw byte size of a DV Base Layer frame.
+    /// Any video packet below this threshold is treated as a BL skip/trailing
+    /// frame and silently discarded when DV stripping is enabled.
+    ///
+    /// Empirical threshold for DV Profile 7:
+    ///   BL frames: 114 – 362 B (TRAIL_N / TRAIL_R skip frames)
+    ///   EL frames: ≥ 1002 B (CRA keyframe, then large inter-frames)
+    ///
+    /// 600 B sits safely between the two populations with >3× margin on the
+    /// high end.  Raise only if a legitimate EL frame ever falls below this.
+    static let kDVBLFrameSizeThreshold: Int = 600
 
     // MARK: - Init
 
@@ -223,7 +240,28 @@ final class PacketFeeder {
             } else {
                 return result
             }
+            // Track how many packets were attempted so the cursor advances past
+            // BL-filtered and build-failed frames (see totalVideoAttempted below).
+            result.totalVideoAttempted = packets.count
+
             for pkt in packets {
+                // ── DV BL frame filter ───────────────────────────────────────────
+                // DV Profile 7 MKVs interleave Base Layer (BL) frames with
+                // Enhancement Layer (EL) frames on the same track throughout the
+                // whole file — not just at the initial BL preamble cluster.
+                // BL trailing/skip frames are tiny (~114–360 B); EL frames are
+                // ≥ 1002 B. Feeding BL frames to VideoToolbox corrupts the decode
+                // pipeline because VT is configured for the EL HEVC profile and
+                // cannot interpret context-free BL trailing slices.
+                // Skip any frame below kDVBLFrameSizeThreshold when stripping is on.
+                if PacketFeeder.stripDolbyVisionNALsEnabled
+                    && pkt.data.count < PacketFeeder.kDVBLFrameSizeThreshold {
+                    feederLog("  [\(label)] DV BL skip  pkt=\(pkt.index)"
+                            + "  pts=\(String(format: "%.3f", pkt.pts.seconds))s"
+                            + "  size=\(pkt.data.count)B  keyframe=\(pkt.isKeyframe)")
+                    continue
+                }
+
                 // Sprint 46: replace try? with explicit catch so buffer-construction
                 // failures are visible (try? was silently discarding them, causing
                 // SampleDiag to fire while enqueueAndAdvance received 0 buffers).
@@ -288,19 +326,30 @@ final class PacketFeeder {
 
         // Sprint 46: log the call regardless of vCount so we can distinguish
         // "enqueueAndAdvance never called" from "called but 0 buffers built."
-        feederLog("[enqueue] [\(result.label)] called  videoBuffers=\(vCount)  audioBuffers=\(aCount)")
-        if vCount == 0 {
+        feederLog("[enqueue] [\(result.label)] called  videoBuffers=\(vCount)"
+                + "/\(result.totalVideoAttempted)  audioBuffers=\(aCount)")
+        if vCount == 0 && result.totalVideoAttempted > 0 {
+            // All attempted frames were either BL-filtered or failed to build.
             feederLog("[enqueue] [\(result.label)] ⚠️ zero video buffers — "
-                    + "makeVideoSampleBuffer failed for all packets in this batch; "
-                    + "check ⚠️ makeVideoSampleBuffer lines above for the cause")
+                    + "all \(result.totalVideoAttempted) packets were BL-filtered or "
+                    + "makeVideoSampleBuffer failed; check lines above for detail")
             log("  [\(result.label)] ⚠️ enqueueAndAdvance: 0 video buffers built — "
               + "no frames enqueued this cycle")
         }
 
-        if vCount > 0 {
+        if vCount > 0 || result.totalVideoAttempted > 0 {
             let vStart = nextVideoSampleIdx
+            // Advance the cursor by totalVideoAttempted (the number of frameIndex
+            // slots consumed this batch) rather than vCount (the number actually
+            // enqueued).  This keeps the cursor aligned when BL frames were skipped
+            // by the DV filter or when makeVideoSampleBuffer threw for some frames.
+            // Using vCount alone would leave the cursor short by the number of
+            // skipped/failed packets, causing those frame indices to be re-fetched
+            // on the next call — and EL frames after them to be double-enqueued.
+            let cursorAdvance = max(vCount, result.totalVideoAttempted)
             feederLog("[enqueue] [\(result.label)] video cursor=\(vStart)  "
-                    + "enqueueing \(vCount) buffers  tail=\(String(format: "%.3f", result.lastVideoPTS))s")
+                    + "enqueueing \(vCount)/\(result.totalVideoAttempted) buffers  "
+                    + "tail=\(String(format: "%.3f", result.lastVideoPTS))s")
             for (i, (sb, _)) in result.videoBuffers.enumerated() {
                 let absIdx = vStart + i
                 if absIdx == 0 {
@@ -311,9 +360,11 @@ final class PacketFeeder {
                 renderer.enqueueVideo(sb, sampleIndex: absIdx)
             }
             lastEnqueuedVideoPTS = max(lastEnqueuedVideoPTS, result.lastVideoPTS)
-            nextVideoSampleIdx  += vCount
+            nextVideoSampleIdx  += cursorAdvance
+            let skipped = result.totalVideoAttempted - vCount
+            let skippedStr = skipped > 0 ? "  blSkipped=\(skipped)" : ""
             log("  [\(result.label)] video [\(vStart)…\(nextVideoSampleIdx - 1)]  "
-              + "\(vCount) pkts  tail=\(String(format: "%.2f", lastEnqueuedVideoPTS))s")
+              + "\(vCount) pkts  tail=\(String(format: "%.2f", lastEnqueuedVideoPTS))s\(skippedStr)")
         }
 
         if aCount > 0 {
