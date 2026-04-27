@@ -789,8 +789,16 @@ final class PlayerLabPlaybackController: ObservableObject {
 
         // ── Phase 4: CLOCK — re-anchor synchronizer at keyframe PTS ──────────
         renderer.synchronizer.setRate(wasPlaying ? 1 : 0, time: keyframePTS)
+        // Update startPTS so that a subsequent play() call (from .ready state)
+        // resumes from the seeked position instead of the original prepare() PTS.
+        // Without this, play() calls renderer.play(from: prepareTimePTS) which
+        // overrides the keyframePTS the synchronizer was just anchored to, causing
+        // the clock to run from 0 while enqueued frames start at keyframePTS —
+        // producing a ~keyframePTS-second "frozen" display before the first frame appears.
+        startPTS = keyframePTS
         record("  [seek] clock anchored @ \(String(format: "%.4f", keyframePTS.seconds))s  "
-             + "rate=\(wasPlaying ? 1 : 0)  floor=\(String(format: "%.4f", currentTimeFloor))s")
+             + "rate=\(wasPlaying ? 1 : 0)  floor=\(String(format: "%.4f", currentTimeFloor))s  "
+             + "startPTS updated=\(String(format: "%.4f", keyframePTS.seconds))s")
 
         if wasPlaying {
             startFeedLoop()
