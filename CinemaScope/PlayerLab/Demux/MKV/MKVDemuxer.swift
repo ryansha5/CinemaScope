@@ -346,7 +346,21 @@ final class MKVDemuxer {
         }
 
         // ── Video track selection ─────────────────────────────────────────────
-        guard let videoMKVTrack = mkvTracks.first(where: { $0.isVideo && ($0.isH264 || $0.isHEVC) })
+        let allVideoTracks = mkvTracks.filter { $0.isVideo && ($0.isH264 || $0.isHEVC) }
+        if allVideoTracks.count > 1 {
+            // Multiple video tracks — log all of them.
+            // Common cause: Dolby Vision Profile 7 dual-layer MKV, where track 1 is
+            // the intentionally-low-bitrate Base Layer (BL) and track 2 is the
+            // high-quality Enhancement Layer (EL).  We select the first track; the
+            // EL cannot be decoded independently (it depends on the BL for reference
+            // frames and is processed by the Dolby Vision pipeline, not standard HEVC).
+            log("  ⚠️ \(allVideoTracks.count) video tracks found — selecting track 1 (BL):")
+            for vt in allVideoTracks {
+                log("    track \(vt.trackNumber): \(vt.codecID)  \(vt.pixelWidth)×\(vt.pixelHeight)  "
+                  + "hvcC=\(vt.codecPrivate.map { "\($0.count)B" } ?? "nil")")
+            }
+        }
+        guard let videoMKVTrack = allVideoTracks.first
         else { throw MKVDemuxError.noVideoTrack }
         log("  ✅ Video: track \(videoMKVTrack.trackNumber) \(videoMKVTrack.codecID) "
           + "\(videoMKVTrack.pixelWidth)×\(videoMKVTrack.pixelHeight)")
@@ -1132,12 +1146,36 @@ final class MKVDemuxer {
 
             if let raw = rawOpt {
                 if raw.trackNum == videoTrackNum {
+
+                    // Sprint 46 block-level diagnostics — first kBlockDiagMax video blocks.
+                    // Logs the EBML-level payload size (what the container reports) alongside
+                    // the derived dataSize (payload minus block header).  If dataSize is tiny
+                    // while elemPayload looks correct the bug is in header-byte accounting;
+                    // if both are tiny the EBML parser itself is mis-reading element boundaries.
+                    if blockDiagCount < Self.kBlockDiagMax {
+                        blockDiagCount += 1
+                        let blockType = elem.knownID == .simpleBlock ? "SimpleBlock" : "BlockGroup"
+                        log("[BlockDiag #\(blockDiagCount)] \(blockType)  "
+                          + "track=\(raw.trackNum)  elemPayload=\(elem.payloadSize)B  "
+                          + "dataSize=\(raw.dataSize)B  lacing=\(raw.lacingType)  "
+                          + "keyframe=\(raw.isKeyframe)  relTC=\(raw.relTC)")
+                    }
+
                     if raw.lacingType == 0, raw.dataSize > 0 {
                         frameIndex.append(makeMKVFrameInfo(fileOffset: raw.dataOffset,
                                                             size:       raw.dataSize,
                                                             clusterTC:  clusterTimecode,
                                                             relTC:      raw.relTC,
                                                             isKeyframe: raw.isKeyframe))
+                    } else if raw.lacingType != 0 {
+                        // Video lacing is extremely rare in real files and not yet handled.
+                        // Log and drop so the caller at least sees it in diagnostics.
+                        lacedVideoBlocksDropped += 1
+                        if lacedVideoBlocksDropped <= 5 {
+                            log("[BlockDiag] ⚠️ VIDEO block with lacingType=\(raw.lacingType) "
+                              + "— DROPPED (video lacing not yet supported)  "
+                              + "dataSize=\(raw.dataSize)B  relTC=\(raw.relTC)")
+                        }
                     }
                 } else if let atn = audioTrackNum, raw.trackNum == atn {
                     let audioFrames = await makeAudioFrames(from: raw, clusterTC: clusterTimecode)
@@ -1179,15 +1217,26 @@ final class MKVDemuxer {
         return RawBlockInfo(trackNum: trackNum, relTC: relTC,
                             isKeyframe: (flags & 0x80) != 0,
                             dataOffset: dataOffset, dataSize: dataSize,
-                            lacingType: (flags >> 1) & 0x03,
+                            lacingType: (flags >> 2) & 0x03,   // bits 3:2 per Matroska spec
                             durationTicks: nil)   // SimpleBlock has no BlockDuration
     }
+
+    /// One-time flag: log EL sizes for the first few BlockGroups with BlockAdditions only.
+    private var blockAdditionsLogCount = 0
+    private static let kBlockAdditionsLogMax = 5
+
+    /// Block-level diagnostic counters (Sprint 46).
+    /// kBlockDiagMax: number of video blocks to log in full before silencing per-block output.
+    private var blockDiagCount         = 0
+    private static let kBlockDiagMax   = 50
+    private var lacedVideoBlocksDropped = 0
 
     private func decodeBlockGroup(_ elem: EBMLElement) async throws -> RawBlockInfo? {
         guard elem.payloadSize > 0 else { return nil }
         var blockElem:      EBMLElement? = nil
         var hasRefBlock:    Bool         = false
         var blockDurTicks:  Int64?       = nil   // Sprint 26
+        var elPayloadSize:  Int64?       = nil   // Dolby Vision EL size (in BlockAdditions)
 
         var cursor = elem.payloadOffset
         let limit  = elem.payloadOffset + elem.payloadSize
@@ -1199,7 +1248,40 @@ final class MKVDemuxer {
             if child.knownID == .blockDuration  {             // Sprint 26
                 blockDurTicks = Int64(try await parser.readUInt(child))
             }
+            if child.knownID == .blockAdditions, child.payloadSize > 0 {
+                // Dolby Vision Profile 7: EL is stored in BlockAdditions/BlockMore/BlockAdditional
+                // with BlockAddID = 1.  Scan for the BlockAdditional payload to get the EL size.
+                var aCursor = child.payloadOffset
+                let aLimit  = child.payloadOffset + child.payloadSize
+                while aCursor < aLimit {
+                    guard let (addChild, addBytes) = try? await parser.nextElement(at: aCursor, limit: aLimit)
+                    else { break }
+                    if addChild.knownID == .blockMore, addChild.payloadSize > 0 {
+                        var mCursor = addChild.payloadOffset
+                        let mLimit  = addChild.payloadOffset + addChild.payloadSize
+                        while mCursor < mLimit {
+                            guard let (mChild, mBytes) = try? await parser.nextElement(at: mCursor, limit: mLimit)
+                            else { break }
+                            if mChild.knownID == .blockAdditional {
+                                elPayloadSize = mChild.payloadSize
+                            }
+                            mCursor += max(1, Int64(mBytes) + (mChild.payloadSize >= 0 ? mChild.payloadSize : 0))
+                        }
+                    }
+                    aCursor += max(1, Int64(addBytes) + (addChild.payloadSize >= 0 ? addChild.payloadSize : 0))
+                }
+            }
             cursor += max(1, Int64(chBytes) + (child.payloadSize >= 0 ? child.payloadSize : 0))
+        }
+
+        // Log the first few DV EL sizes so we can confirm the structure.
+        if let elSize = elPayloadSize, blockAdditionsLogCount < Self.kBlockAdditionsLogMax {
+            blockAdditionsLogCount += 1
+            let blSize = blockElem.map { Int($0.payloadSize) } ?? 0
+            log("[DV-EL] BlockGroup #\(blockAdditionsLogCount): "
+              + "BL=\(blSize)B  EL(BlockAdditional)=\(elSize)B  "
+              + "combined=\(blSize + Int(elSize))B  "
+              + "(VideoToolbox decodes BL only — EL requires Dolby Vision pipeline)")
         }
 
         guard let blk = blockElem, blk.payloadSize > 4 else { return nil }
@@ -1220,7 +1302,7 @@ final class MKVDemuxer {
         return RawBlockInfo(trackNum: trackNum, relTC: relTC,
                             isKeyframe: !hasRefBlock,
                             dataOffset: dataOffset, dataSize: dataSize,
-                            lacingType: (flags >> 1) & 0x03,
+                            lacingType: (flags >> 2) & 0x03,   // bits 3:2 per Matroska spec
                             durationTicks: blockDurTicks)   // Sprint 26
     }
 
@@ -1516,9 +1598,71 @@ final class MKVDemuxer {
 
     // MARK: - Public: extractVideoPackets
 
+    /// One-time flag: log index sizes for the very first extraction call only.
+    private var didLogIndexSizes = false
+
     func extractVideoPackets(from startIndex: Int, count: Int) async throws -> [DemuxPacket] {
         guard videoTrack != nil   else { throw MKVDemuxError.notParsed }
         guard !frameIndex.isEmpty else { throw MKVDemuxError.noVideoTrack }
+
+        // Log raw MKV-declared frame sizes from the index for the first call.
+        // These are the sizes AS REPORTED by the MKV container (SimpleBlock/Block payload),
+        // before any extraction.  If they match the SampleDiag rawSize values, the
+        // demuxer is reading correct boundaries.  Very small sizes suggest DV Profile 7 BL.
+        if !didLogIndexSizes {
+            didLogIndexSizes = true
+
+            // Per-frame log: first 10 entries
+            let sampleCount = min(10, frameIndex.count)
+            log("[FrameIndex] First \(sampleCount) frame sizes from MKV index:")
+            for i in 0..<sampleCount {
+                let fi = frameIndex[i]
+                log("  [\(i)] size=\(fi.size)B  pts=\(String(format: "%.3f", fi.pts.seconds))s  "
+                  + "keyframe=\(fi.isKeyframe)  offset=\(fi.fileOffset)")
+            }
+
+            // Sprint 46: aggregate statistics over first 250 index entries.
+            // These are the sizes the container reports — before any normalization.
+            // Tiny sizes here confirm the demuxer is extracting wrong boundaries.
+            let statCount = min(250, frameIndex.count)
+            if statCount > 1 {
+                let slice      = frameIndex.prefix(statCount)
+                let interSlice = slice.filter { !$0.isKeyframe }
+                let keySlice   = slice.filter {  $0.isKeyframe }
+
+                func stats(_ frames: [MKVFrameInfo]) -> (avg: Int, min: Int, max: Int) {
+                    let s = frames.map { $0.size }
+                    let total = s.reduce(0, +)
+                    return (avg: total / max(1, s.count),
+                            min: s.min() ?? 0,
+                            max: s.max() ?? 0)
+                }
+
+                if !keySlice.isEmpty {
+                    let (a, mn, mx) = stats(Array(keySlice))
+                    log("[FrameIndex] Keyframe stats (\(keySlice.count) keyframes in first \(statCount)):"
+                      + "  avg=\(a)B  min=\(mn)B  max=\(mx)B")
+                }
+
+                if !interSlice.isEmpty {
+                    let (a, mn, mx) = stats(Array(interSlice))
+                    log("[FrameIndex] Inter-frame stats (\(interSlice.count) inter-frames in first \(statCount)):"
+                      + "  avg=\(a)B  min=\(mn)B  max=\(mx)B")
+                    if a < 500 {
+                        log("[FrameIndex] ⚠️  avg inter-frame=\(a)B — suspiciously small.  "
+                          + "Expected >10 KB for 1080p HEVC, >50 KB for 4K.  "
+                          + "Root cause is likely wrong EBML element boundaries or "
+                          + "incorrect headerBytes accounting in decodeSimpleBlock/decodeBlockGroup.")
+                    }
+                }
+
+                if lacedVideoBlocksDropped > 0 {
+                    log("[FrameIndex] ⚠️  \(lacedVideoBlocksDropped) laced VIDEO blocks were dropped "
+                      + "(video lacing not yet supported)")
+                }
+            }
+        }
+
         return try await extractPackets(from: frameIndex.map { ($0.fileOffset, $0.size, $0.pts, $0.isKeyframe) },
                                          startIndex: startIndex, count: count,
                                          streamType: .video,

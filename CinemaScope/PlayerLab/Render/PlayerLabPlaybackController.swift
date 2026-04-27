@@ -841,21 +841,29 @@ final class PlayerLabPlaybackController: ObservableObject {
         if feeder.nextVideoSampleIdx >= feeder.videoSamplesTotal,
            let mkv = mkvDemuxer, !mkv.isFullyIndexed {
             let scanTarget = feeder.lastEnqueuedVideoPTS + 60.0  // index 60 s ahead of current tail
-            record("[feed] Approaching end of indexed window — extending index to \(String(format: "%.0f", scanTarget))s…")
+            record("[feed] ── index window exhausted ─────────────────────────────────────")
+            record("[feed] nextV=\(feeder.nextVideoSampleIdx)  videoTotal=\(feeder.videoSamplesTotal)  "
+                 + "tail=\(String(format: "%.2f", feeder.lastEnqueuedVideoPTS))s  "
+                 + "now=\(String(format: "%.2f", nowSec))s  buf=\(String(format: "%.2f", buffered))s  "
+                 + "layer=\(renderer.layerStatusDescription)")
+            record("[feed] Extending index to \(String(format: "%.0f", scanTarget))s…")
             do {
                 let (videoAdded, audioAdded) = try await mkv.continueIndexing(untilSeconds: scanTarget)
                 if videoAdded > 0 || audioAdded > 0 {
                     feeder.videoSamplesTotal = mkv.indexedVideoFrameCount
                     feeder.audioSamplesTotal = mkv.indexedAudioFrameCount
                     feeder.duration          = mkv.indexedDurationSeconds
-                    record("[feed] Background indexed to \(String(format: "%.0f", mkv.indexedDurationSeconds))s  "
+                    record("[feed] ✅ Index extended to \(String(format: "%.0f", mkv.indexedDurationSeconds))s  "
                          + "+\(videoAdded)v/+\(audioAdded)a  "
                          + "total=\(feeder.videoSamplesTotal)v/\(feeder.audioSamplesTotal)a")
                 } else if mkv.isFullyIndexed {
-                    record("[feed] ✅ Background indexing complete — \(feeder.videoSamplesTotal) total video frames")
+                    record("[feed] ✅ Fully indexed — \(feeder.videoSamplesTotal) total video frames")
+                } else {
+                    record("[feed] ⚠️ continueIndexing returned 0 new frames — "
+                         + "isFullyIndexed=\(mkv.isFullyIndexed)")
                 }
             } catch {
-                record("[feed] ⚠️ Background indexing error: \(error.localizedDescription)")
+                record("[feed] ❌ Background indexing error: \(error.localizedDescription)")
             }
             return  // Re-enter feed loop next cycle with updated totals
         }
@@ -863,6 +871,11 @@ final class PlayerLabPlaybackController: ObservableObject {
         // End-of-stream: all samples fed, wait for buffer to drain.
         let atEOS = feeder.nextVideoSampleIdx >= feeder.videoSamplesTotal
         if atEOS {
+            if logCycle % policy.periodicLogInterval == 0 {
+                record("[feed] EOS: nextV=\(feeder.nextVideoSampleIdx)  total=\(feeder.videoSamplesTotal)  "
+                     + "buf=\(String(format: "%.2f", buffered))s  "
+                     + "layer=\(renderer.layerStatusDescription)")
+            }
             if policy.isEndOfStream(isAtEOS: atEOS, bufferedSeconds: buffered) { onPlaybackEnded() }
             return
         }
@@ -871,8 +884,10 @@ final class PlayerLabPlaybackController: ObservableObject {
         if state == .playing && policy.isUnderrun(bufferedSeconds: buffered) {
             transition(to: .buffering, "underrun \(String(format: "%.2f", buffered))s")
             renderer.synchronizer.rate = 0
-            record("[Buffer] video=\(String(format: "%.2f", buffered))s  "
-                 + "audio=\(String(format: "%.2f", audioBuffered))s → ENTER BUFFERING")
+            record("[Buffer] UNDERRUN  video=\(String(format: "%.2f", buffered))s  "
+                 + "audio=\(String(format: "%.2f", audioBuffered))s  "
+                 + "nextV=\(feeder.nextVideoSampleIdx)/\(feeder.videoSamplesTotal)  "
+                 + "layer=\(renderer.layerStatusDescription)")
         }
 
         if state == .buffering {
@@ -880,8 +895,11 @@ final class PlayerLabPlaybackController: ObservableObject {
             let videoCount = feeder.videoSamplesFor(seconds: toFill)
             if logCycle % policy.bufferingLogInterval == 0 {
                 record("[Buffer] refilling \(String(format: "%.1f", toFill))s "
-                     + "≈ \(videoCount) samples…")
+                     + "≈ \(videoCount) samples  "
+                     + "cursor=\(feeder.nextVideoSampleIdx)/\(feeder.videoSamplesTotal)  "
+                     + "tail=\(String(format: "%.2f", feeder.lastEnqueuedVideoPTS))s")
             }
+            let cursorBefore = feeder.nextVideoSampleIdx
             await feeder.feedWindow(videoCount:   videoCount,
                                     audioSeconds: toFill,
                                     label:        "buf-refill",
@@ -892,11 +910,14 @@ final class PlayerLabPlaybackController: ObservableObject {
             let nowSec2   = rawTime2.isNaN ? currentTimeFloor : max(rawTime2, currentTimeFloor)
             let newBuf    = max(0, feeder.lastEnqueuedVideoPTS - nowSec2)
             videoBuffered = newBuf
+            record("[Buffer] after refill: cursor \(cursorBefore)→\(feeder.nextVideoSampleIdx)  "
+                 + "buf \(String(format: "%.2f", buffered))s→\(String(format: "%.2f", newBuf))s  "
+                 + "layer=\(renderer.layerStatusDescription)")
 
             if policy.isRecovered(bufferedSeconds: newBuf) {
                 transition(to: .playing, "buffer recovered \(String(format: "%.2f", newBuf))s")
                 renderer.synchronizer.setRate(1, time: renderer.currentTime)
-                record("[Buffer] video=\(String(format: "%.2f", newBuf))s → RESUME PLAYBACK")
+                record("[Buffer] RESUME  video=\(String(format: "%.2f", newBuf))s")
             }
             return
         }
@@ -906,15 +927,23 @@ final class PlayerLabPlaybackController: ObservableObject {
 
         let toFill     = policy.refillSeconds(currentlyBuffered: buffered)
         let videoCount = feeder.videoSamplesFor(seconds: toFill)
-        record("[feed] ⚠️ low watermark (\(String(format: "%.1f", buffered))s "
-             + "< \(policy.lowWatermarkSeconds)s) "
-             + "— refilling \(String(format: "%.1f", toFill))s ≈\(videoCount) samples")
+        record("[feed] ⚠️ LOW WATERMARK  buf=\(String(format: "%.2f", buffered))s "
+             + "< \(policy.lowWatermarkSeconds)s  "
+             + "cursor=\(feeder.nextVideoSampleIdx)/\(feeder.videoSamplesTotal)  "
+             + "tail=\(String(format: "%.2f", feeder.lastEnqueuedVideoPTS))s  "
+             + "layer=\(renderer.layerStatusDescription)  "
+             + "refilling \(String(format: "%.1f", toFill))s ≈\(videoCount) samples")
 
+        let cursorBeforeRefill = feeder.nextVideoSampleIdx
+        let tailBeforeRefill   = feeder.lastEnqueuedVideoPTS
         await feeder.feedWindow(videoCount:   videoCount,
                                 audioSeconds: toFill,
                                 label:        "refill",
                                 log:          record(_:))
         framesLoaded = feeder.nextVideoSampleIdx
+        record("[feed] ✅ refill done  cursor \(cursorBeforeRefill)→\(feeder.nextVideoSampleIdx)  "
+             + "tail \(String(format: "%.2f", tailBeforeRefill))s→\(String(format: "%.2f", feeder.lastEnqueuedVideoPTS))s  "
+             + "layer=\(renderer.layerStatusDescription)")
     }
 
     // MARK: - Audio Session

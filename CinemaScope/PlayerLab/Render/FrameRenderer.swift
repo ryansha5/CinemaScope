@@ -50,6 +50,11 @@ final class FrameRenderer {
     /// Called on main thread when the very first video frame is enqueued.
     var onFirstFrame: ((CGSize) -> Void)?
 
+    // MARK: - Diagnostic constants
+
+    /// Log per-frame layer status for this many frames, then go quiet.
+    private static let kPerFrameStatusCount = 20
+
     // MARK: - Init
 
     init() {
@@ -67,21 +72,72 @@ final class FrameRenderer {
     // MARK: - Enqueue
 
     /// Enqueue one compressed video CMSampleBuffer.
-    func enqueueVideo(_ sampleBuffer: CMSampleBuffer) {
-        if layer.status == .failed {
-            fputs("[FrameRenderer] layer.status == .failed; flushing before enqueue\n", stderr)
+    ///
+    /// - Parameter sampleIndex: Absolute 0-based index of this sample in the
+    ///   video track.  Used for per-frame diagnostic logging.
+    func enqueueVideo(_ sampleBuffer: CMSampleBuffer, sampleIndex: Int = -1) {
+
+        // ── Layer status before enqueue ───────────────────────────────────────
+        let statusBefore = layer.status
+        let readyBefore  = layer.isReadyForMoreMediaData
+
+        if statusBefore == .failed {
+            let errDesc = layer.error?.localizedDescription ?? "?"
+            fputs("[FrameRenderer] ⚠️ layer.status=.failed before enqueue  "
+                + "idx=\(sampleIndex)  err=\(errDesc) — flushing\n", stderr)
             layer.flush()
         }
+
+        if !readyBefore {
+            fputs("[FrameRenderer] ⚠️ isReadyForMoreMediaData=false  "
+                + "idx=\(sampleIndex) — layer queue may be full\n", stderr)
+        }
+
+        // ── Enqueue ───────────────────────────────────────────────────────────
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        let dts = CMSampleBufferGetDecodeTimeStamp(sampleBuffer)
         layer.enqueue(sampleBuffer)
         let isFirst = (framesEnqueued == 0)
         framesEnqueued += 1
 
+        // ── Status after enqueue ──────────────────────────────────────────────
+        let statusAfter = layer.status
+        let readyAfter  = layer.isReadyForMoreMediaData
+        let errAfter    = layer.error
+
+        // Per-frame log for first kPerFrameStatusCount samples (always on stderr)
+        if framesEnqueued <= FrameRenderer.kPerFrameStatusCount {
+            let statusName: String
+            switch statusAfter {
+            case .unknown:    statusName = "unknown"
+            case .rendering:  statusName = "rendering"
+            case .failed:     statusName = "failed"
+            @unknown default: statusName = "unknownFuture"
+            }
+            fputs("[FrameRenderer] enqueue[\(framesEnqueued - 1)] "
+                + "idx=\(sampleIndex)  "
+                + "pts=\(String(format: "%.3f", pts.seconds))s  "
+                + "dts=\(dts.isValid ? String(format: "%.3f", dts.seconds) + "s" : "invalid")  "
+                + "status=\(statusName)  "
+                + "ready=\(readyAfter)  "
+                + "\(errAfter != nil ? "❌ err=\(errAfter!.localizedDescription)" : "✅")\n",
+                stderr)
+        }
+
+        if statusAfter == .failed {
+            let errDesc = errAfter?.localizedDescription ?? "?"
+            fputs("[FrameRenderer] ❌ layer.status=.failed after enqueue  "
+                + "idx=\(sampleIndex)  err=\(errDesc)\n", stderr)
+        }
+
+        // ── First-frame callback ──────────────────────────────────────────────
         if isFirst {
-            firstFramePTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+            firstFramePTS = pts
             if let fmt = CMSampleBufferGetFormatDescription(sampleBuffer) {
                 let dims = CMVideoFormatDescriptionGetDimensions(fmt)
                 let size = CGSize(width: CGFloat(dims.width), height: CGFloat(dims.height))
-                fputs("[FrameRenderer] First frame enqueued — PTS=\(firstFramePTS.seconds)s  "
+                fputs("[FrameRenderer] ✅ First frame enqueued — "
+                    + "PTS=\(String(format: "%.4f", firstFramePTS.seconds))s  "
                     + "dims=\(Int(size.width))×\(Int(size.height))\n", stderr)
                 onFirstFrame?(size)
             }

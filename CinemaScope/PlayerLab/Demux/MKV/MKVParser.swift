@@ -76,6 +76,12 @@ enum EBMLID: UInt64 {
     case blockGroup          = 0xA0
     case block               = 0xA1
     case referenceBlock      = 0xFB          // presence = non-keyframe
+    // BlockAdditions — used by Dolby Vision Profile 7 to carry the Enhancement Layer (EL)
+    // alongside the Base Layer (BL) in the same BlockGroup.
+    case blockAdditions      = 0x75A1        // container
+    case blockMore           = 0xA6          // one addition entry
+    case blockAddID          = 0xEE          // addition type ID (1 = DV EL)
+    case blockAdditional     = 0xA5          // raw EL bytes
     // Track entry flags / metadata (Sprint 23 / 26)
     case flagDefault         = 0x88          // 1 = default track
     case flagForced          = 0x55AA        // Sprint 26: 1 = forced subtitle

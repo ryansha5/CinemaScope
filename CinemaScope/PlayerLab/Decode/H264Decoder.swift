@@ -82,46 +82,51 @@ final class H264Decoder {
             throw H264DecoderError.invalidAvcC("payload too short (\(avcCData.count) bytes)")
         }
 
+        // Flatten to a plain Array so subscript always starts at 0,
+        // regardless of whether avcCData is a slice with a non-zero startIndex
+        // (e.g. Data returned by parser.readPayload from an MKV codecPrivate range).
+        let b = Array(avcCData)
+
         var idx = 0
-        guard avcCData[idx] == 1 else {
-            throw H264DecoderError.invalidAvcC("configurationVersion is \(avcCData[0]), expected 1")
+        guard b[idx] == 1 else {
+            throw H264DecoderError.invalidAvcC("configurationVersion is \(b[0]), expected 1")
         }
         idx += 1    // configurationVersion
         idx += 3    // AVCProfileIndication, profile_compatibility, AVCLevelIndication
 
-        let nalUnitLength = Int(avcCData[idx] & 0x03) + 1
+        let nalUnitLength = Int(b[idx] & 0x03) + 1
         idx += 1
 
         // SPS
         var spsSet: [Data] = []
-        let numSPS = Int(avcCData[idx] & 0x1F); idx += 1
+        let numSPS = Int(b[idx] & 0x1F); idx += 1
         for _ in 0..<numSPS {
-            guard idx + 2 <= avcCData.count else {
+            guard idx + 2 <= b.count else {
                 throw H264DecoderError.invalidAvcC("SPS length field truncated")
             }
-            let len = Int(avcCData[idx]) << 8 | Int(avcCData[idx + 1]); idx += 2
-            guard idx + len <= avcCData.count else {
+            let len = Int(b[idx]) << 8 | Int(b[idx + 1]); idx += 2
+            guard idx + len <= b.count else {
                 throw H264DecoderError.invalidAvcC("SPS data truncated")
             }
-            spsSet.append(avcCData.subdata(in: idx..<(idx + len))); idx += len
+            spsSet.append(Data(b[idx..<(idx + len)])); idx += len
         }
         guard !spsSet.isEmpty else { throw H264DecoderError.noSPSFound }
 
         // PPS
         var ppsSet: [Data] = []
-        guard idx < avcCData.count else {
+        guard idx < b.count else {
             throw H264DecoderError.invalidAvcC("PPS count missing")
         }
-        let numPPS = Int(avcCData[idx]); idx += 1
+        let numPPS = Int(b[idx]); idx += 1
         for _ in 0..<numPPS {
-            guard idx + 2 <= avcCData.count else {
+            guard idx + 2 <= b.count else {
                 throw H264DecoderError.invalidAvcC("PPS length field truncated")
             }
-            let len = Int(avcCData[idx]) << 8 | Int(avcCData[idx + 1]); idx += 2
-            guard idx + len <= avcCData.count else {
+            let len = Int(b[idx]) << 8 | Int(b[idx + 1]); idx += 2
+            guard idx + len <= b.count else {
                 throw H264DecoderError.invalidAvcC("PPS data truncated")
             }
-            ppsSet.append(avcCData.subdata(in: idx..<(idx + len))); idx += len
+            ppsSet.append(Data(b[idx..<(idx + len)])); idx += len
         }
         guard !ppsSet.isEmpty else { throw H264DecoderError.noPPSFound }
 
@@ -167,48 +172,51 @@ final class H264Decoder {
             throw H264DecoderError.invalidAvcC("payload too short (\(avcCData.count) bytes)")
         }
 
+        // Flatten to avoid Data slice index trap (startIndex may be non-zero
+        // when avcCData is a subrange from MKV codecPrivate parsing).
+        let b = Array(avcCData)
         var idx = 0
 
-        guard avcCData[idx] == 1 else {
-            throw H264DecoderError.invalidAvcC("configurationVersion is \(avcCData[0]), expected 1")
+        guard b[idx] == 1 else {
+            throw H264DecoderError.invalidAvcC("configurationVersion is \(b[0]), expected 1")
         }
         idx += 1                    // skip configurationVersion
 
         idx += 3                    // skip profile, compat, level
 
-        nalUnitLength = Int(avcCData[idx] & 0x03) + 1
+        nalUnitLength = Int(b[idx] & 0x03) + 1
         idx += 1
 
         // SPS
         var spsSet: [Data] = []
-        let numSPS = Int(avcCData[idx] & 0x1F);   idx += 1
+        let numSPS = Int(b[idx] & 0x1F);   idx += 1
         for _ in 0..<numSPS {
-            guard idx + 2 <= avcCData.count else {
+            guard idx + 2 <= b.count else {
                 throw H264DecoderError.invalidAvcC("SPS length field truncated")
             }
-            let len = Int(avcCData[idx]) << 8 | Int(avcCData[idx + 1]);   idx += 2
-            guard idx + len <= avcCData.count else {
+            let len = Int(b[idx]) << 8 | Int(b[idx + 1]);   idx += 2
+            guard idx + len <= b.count else {
                 throw H264DecoderError.invalidAvcC("SPS data truncated")
             }
-            spsSet.append(avcCData.subdata(in: idx..<(idx + len)));   idx += len
+            spsSet.append(Data(b[idx..<(idx + len)]));   idx += len
         }
         guard !spsSet.isEmpty else { throw H264DecoderError.noSPSFound }
 
         // PPS
         var ppsSet: [Data] = []
-        guard idx < avcCData.count else {
+        guard idx < b.count else {
             throw H264DecoderError.invalidAvcC("PPS count missing")
         }
-        let numPPS = Int(avcCData[idx]);   idx += 1
+        let numPPS = Int(b[idx]);   idx += 1
         for _ in 0..<numPPS {
-            guard idx + 2 <= avcCData.count else {
+            guard idx + 2 <= b.count else {
                 throw H264DecoderError.invalidAvcC("PPS length field truncated")
             }
-            let len = Int(avcCData[idx]) << 8 | Int(avcCData[idx + 1]);   idx += 2
-            guard idx + len <= avcCData.count else {
+            let len = Int(b[idx]) << 8 | Int(b[idx + 1]);   idx += 2
+            guard idx + len <= b.count else {
                 throw H264DecoderError.invalidAvcC("PPS data truncated")
             }
-            ppsSet.append(avcCData.subdata(in: idx..<(idx + len)));   idx += len
+            ppsSet.append(Data(b[idx..<(idx + len)]));   idx += len
         }
         guard !ppsSet.isEmpty else { throw H264DecoderError.noPPSFound }
 
