@@ -264,11 +264,40 @@ final class MKVDemuxer {
     /// Number of audio frames in the index (grows with background indexing).
     var indexedAudioFrameCount: Int { audioFrameIndex.count }
 
-    /// Index of the first keyframe in the video frame index.
-    /// Returns 0 when the index is empty (safe default — caller should check
-    /// `indexedVideoFrameCount > 0` before using the result).
+    /// Index of the first *usable* video keyframe for playback.
+    ///
+    /// For standard HEVC content this is always the first keyframe (index 0).
+    ///
+    /// For Dolby Vision Profile 7 dual-layer MKV files the stream opens with a
+    /// "base layer only" cluster: one BL IDR followed by a run of tiny BL
+    /// inter-frames (~110–130 B each, TRAIL_N/TRAIL_R) that a standard HEVC
+    /// decoder cannot decode.  The second cluster starts with the real EL IDR
+    /// and must be used as the playback entry point.
+    ///
+    /// Detection heuristic: if every inter-frame between the first and second
+    /// keyframe is smaller than 200 bytes (BL skip frames are ~110–130 B;
+    /// any legitimate HEVC P-frame for 1080p is several hundred bytes minimum),
+    /// treat the first cluster as a BL-only preamble and return the second
+    /// keyframe index instead.
     var firstVideoKeyframeIndex: Int {
-        frameIndex.firstIndex(where: { $0.isKeyframe }) ?? 0
+        // Locate the first two keyframe indices.
+        let kfIndices = frameIndex.indices.filter { frameIndex[$0].isKeyframe }
+        guard let firstKF = kfIndices.first else { return 0 }
+        guard kfIndices.count >= 2 else { return firstKF }
+        let secondKF = kfIndices[1]
+
+        // Check whether ALL inter-frames between the two keyframes are tiny.
+        // An empty range (back-to-back keyframes) falls through to firstKF.
+        let interRange = (firstKF + 1)..<secondKF
+        if !interRange.isEmpty {
+            let allTinyBL = interRange.allSatisfy { frameIndex[$0].size < 200 }
+            if allTinyBL {
+                // First cluster is DV BL-only preamble — start from EL IDR.
+                return secondKF
+            }
+        }
+
+        return firstKF
     }
 
     private var frameIndex:      [MKVFrameInfo]      = []

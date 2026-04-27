@@ -472,6 +472,25 @@ final class PlayerLabPlaybackController: ObservableObject {
         // Activate AVAudioSession before the first audio buffer is enqueued.
         if hasAudio { activateAudioSession() }
 
+        // For Dolby Vision Profile 7 dual-layer MKV, the first MKV cluster
+        // contains BL-only skip frames (~110 B each) that a standard HEVC
+        // decoder cannot decode.  firstVideoKeyframeIndex detects this pattern
+        // and returns the second keyframe (the EL IDR) as the usable start.
+        // Advance the feeder cursor past the BL preamble before filling the
+        // initial window so VT never receives undecodeble BL frames.
+        if let mkv = mkvDemuxer {
+            let startIdx = mkv.firstVideoKeyframeIndex
+            if startIdx > 0 {
+                let startPTSsec = mkv.videoPTS(forSample: startIdx).seconds
+                feeder.setCursors(videoIdx: startIdx,
+                                  audioIdx: 0,
+                                  videoPTS: startPTSsec,
+                                  audioPTS: 0)
+                record("[7] DV BL preamble detected — advancing video cursor to EL IDR  "
+                     + "idx=\(startIdx)  pts=\(String(format: "%.4f", startPTSsec))s")
+            }
+        }
+
         let initVideoCount = feeder.videoSamplesFor(seconds: policy.initialWindowSeconds)
         let initAudioCount = feeder.audioSamplesFor(seconds: policy.initialWindowSeconds)
         record("[7] Loading initial window  "

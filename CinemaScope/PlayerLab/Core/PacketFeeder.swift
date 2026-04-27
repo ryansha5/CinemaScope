@@ -592,6 +592,24 @@ final class PacketFeeder {
         var i = 0
         var hadDV = false
 
+        // Returns true if the NAL unit starting at `naluStart` in `b` should
+        // be stripped as Dolby Vision–specific data.
+        //
+        // Two detection criteria:
+        //   1. NAL type 62 (RPU) or 63 (EL wrapper) — explicit DV types.
+        //   2. nuh_temporal_id_plus1 == 0 — illegal in HEVC (spec §7.4.2.2
+        //      requires this field to be > 0), but DV encoders set it to 0
+        //      on EL-wrapper and RPU NALs that use non-standard type IDs.
+        //      VideoToolbox emits "nuh_temporal_id_plus1 == 0" and
+        //      "PullNALU failed to get a valid NALU" for these.
+        @inline(__always)
+        func isDVNAL(_ naluStart: Int) -> Bool {
+            guard naluStart + 1 < b.count else { return false }
+            let nalType          = Int((b[naluStart] >> 1) & 0x3F)
+            let temporalIdPlus1  = Int(b[naluStart + 1] & 0x07)
+            return nalType == 62 || nalType == 63 || temporalIdPlus1 == 0
+        }
+
         // First pass: check if there are any DV NALs at all (cheap early exit)
         var probe = 0
         while probe + nalUnitLength <= n {
@@ -600,8 +618,7 @@ final class PacketFeeder {
             guard len > 0 else { break }
             let naluStart = probe + nalUnitLength
             guard naluStart < n else { break }
-            let nalType = Int((b[naluStart] >> 1) & 0x3F)
-            if nalType == 62 || nalType == 63 { hadDV = true; break }
+            if isDVNAL(naluStart) { hadDV = true; break }
             probe = naluStart + len
         }
         guard hadDV else { return data }    // nothing to strip — return original
@@ -615,8 +632,7 @@ final class PacketFeeder {
             guard len > 0 else { break }
             let naluStart = i + nalUnitLength
             guard naluStart + len <= n else { break }
-            let nalType = Int((b[naluStart] >> 1) & 0x3F)
-            if nalType != 62 && nalType != 63 {
+            if !isDVNAL(naluStart) {
                 // Keep this NAL — copy length prefix + payload
                 for k in 0..<nalUnitLength { out.append(b[i + k]) }
                 out.append(contentsOf: b[naluStart..<(naluStart + len)])
