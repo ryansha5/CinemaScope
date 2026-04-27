@@ -8,6 +8,12 @@ struct CinemaScopeApp: App {
     @StateObject private var env      = PINEAEnvironment()
     @StateObject private var settings = AppSettings.shared
 
+    init() {
+        // Redirect all PlayerLab stderr output to a file we can read directly.
+        // The log path is printed to stdout so it's visible in the Xcode console.
+        PlayerLabLog.setup()
+    }
+
     @State private var showSplash = true
     // Sprint 8: track scene phase for device heartbeat on foreground return.
     @Environment(\.scenePhase) private var scenePhase
