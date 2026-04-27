@@ -41,12 +41,17 @@ enum PlayerLabRenderError: Error, LocalizedError {
     case blockBufferAllocFailed
     case blockBufferFailed(OSStatus)
     case sampleBufferFailed(OSStatus)
+    /// Thrown when the sample payload is 0 bytes after all processing steps
+    /// (e.g. DV stripping removed every NAL unit from a frame that contained
+    /// ONLY type 62/63 NALs and the unstripped fallback was also empty).
+    case emptyPayload
 
     var errorDescription: String? {
         switch self {
         case .blockBufferAllocFailed:    return "malloc() returned nil for block buffer"
         case .blockBufferFailed(let s):  return "CMBlockBufferCreateWithMemoryBlock: \(s)"
         case .sampleBufferFailed(let s): return "CMSampleBufferCreateReady: \(s)"
+        case .emptyPayload:              return "CMSampleBuffer: sample payload is 0 bytes after processing"
         }
     }
 }
@@ -388,12 +393,39 @@ final class PacketFeeder {
         //
         // Sprint 46: stripDolbyVisionNALsEnabled toggle — set to false to
         // diagnose whether the strip path breaks sample delivery.
+        //
+        // Sprint 46 fix: guard against frames whose entire payload is DV NALs
+        // (types 62/63 only).  Stripping them produces 0 bytes, which causes
+        // CMBlockBufferCreateWithMemoryBlock to return -12704
+        // (kCMBlockBufferBadLengthParameterErr).  When this happens we fall back
+        // to the unstripped normalizedBytes so VideoToolbox can attempt to decode
+        // (or gracefully skip) the frame rather than crashing the pipeline.
         let sampleBytes: Data
         if PacketFeeder.stripDolbyVisionNALsEnabled {
-            sampleBytes = PacketFeeder.stripDolbyVisionNALs(normalizedBytes,
-                                                             nalUnitLength: nalUnitLength)
+            let stripped = PacketFeeder.stripDolbyVisionNALs(normalizedBytes,
+                                                              nalUnitLength: nalUnitLength)
+            if stripped.isEmpty && !normalizedBytes.isEmpty {
+                // All NALs were DV types — fall back to unstripped so we don't
+                // pass blockLength=0 to CMBlockBufferCreateWithMemoryBlock.
+                feederLog("[makeVideoSampleBuffer] ⚠️ DV strip emptied frame — using unstripped fallback  "
+                        + "pkt=\(packet.index)  pts=\(String(format: "%.3f", packet.pts.seconds))s  "
+                        + "original=\(normalizedBytes.count)B  keyframe=\(packet.isKeyframe)")
+                sampleBytes = normalizedBytes
+            } else {
+                sampleBytes = stripped
+            }
         } else {
             sampleBytes = normalizedBytes
+        }
+
+        // Final safety net: if sampleBytes is somehow still empty (shouldn't
+        // happen with the fallback above, but guard defensively to prevent the
+        // -12704 crash in any future code path).
+        guard !sampleBytes.isEmpty else {
+            feederLog("[makeVideoSampleBuffer] ❌ sampleBytes=0 after all processing — throwing emptyPayload  "
+                    + "pkt=\(packet.index)  pts=\(String(format: "%.3f", packet.pts.seconds))s  "
+                    + "normalizedBytes=\(normalizedBytes.count)B")
+            throw PlayerLabRenderError.emptyPayload
         }
 
         // ── Diagnostics: log first kDiagnosticSampleCount video samples ───────
