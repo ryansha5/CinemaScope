@@ -183,8 +183,11 @@ final class PlayerLabPlaybackController: ObservableObject {
 
     // MARK: - Background tasks
 
-    private var feedTask: Task<Void, Never>?
-    private var timeTask: Task<Void, Never>?
+    private var feedTask:            Task<Void, Never>?
+    private var timeTask:            Task<Void, Never>?
+    /// Sprint 46: non-blocking MKV index-extension task.
+    /// Nil when idle; non-nil while a continueIndexing() call is in flight.
+    private var backgroundIndexTask: Task<Void, Never>? = nil
 
     // MARK: - Init
 
@@ -814,6 +817,42 @@ final class PlayerLabPlaybackController: ObservableObject {
     private func stopFeedLoop() {
         feedTask?.cancel()
         feedTask = nil
+        // Sprint 46: cancel any in-flight index scan so it doesn't mutate
+        // frameIndex while a seek is resetting cursors or a stop() clears state.
+        backgroundIndexTask?.cancel()
+        backgroundIndexTask = nil
+    }
+
+    // MARK: - Sprint 46: Non-blocking background index extension
+
+    /// Extend the MKV index asynchronously to `targetSeconds`.
+    ///
+    /// Called from `feedIfNeeded` when the feed cursor approaches the end of
+    /// the currently indexed window.  Runs as a concurrent Task on the main
+    /// actor so the feed loop continues feeding already-indexed frames without
+    /// waiting.  Safe to call from multiple feed cycles — the guard ensures
+    /// only one scan runs at a time.
+    private func triggerBackgroundIndex(mkv: MKVDemuxer, to targetSeconds: Double) {
+        guard backgroundIndexTask == nil else { return }   // scan already in flight
+        guard !mkv.isFullyIndexed           else { return }
+
+        backgroundIndexTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let (vAdded, aAdded) = try await mkv.continueIndexing(untilSeconds: targetSeconds)
+                // Update feeder totals — Task inherits @MainActor so this is safe.
+                feeder.videoSamplesTotal = mkv.indexedVideoFrameCount
+                feeder.audioSamplesTotal = mkv.indexedAudioFrameCount
+                feeder.duration          = mkv.indexedDurationSeconds
+                record("[IndexTask] ✅ \(String(format: "%.1f", mkv.indexedDurationSeconds))s  "
+                     + "+\(vAdded)v/+\(aAdded)a  "
+                     + "total=\(feeder.videoSamplesTotal)v/\(feeder.audioSamplesTotal)a  "
+                     + (mkv.isFullyIndexed ? "✅ fully indexed" : "more to scan"))
+            } catch {
+                record("[IndexTask] ❌ scan error: \(error.localizedDescription)")
+            }
+            backgroundIndexTask = nil
+        }
     }
 
     private func feedIfNeeded(logCycle: Int) async {
@@ -825,68 +864,87 @@ final class PlayerLabPlaybackController: ObservableObject {
         videoBuffered = buffered
         audioBuffered = max(0, feeder.lastEnqueuedAudioPTS - nowSec)
 
+        // ── Sprint 46: enhanced periodic log ─────────────────────────────────────
         if logCycle % policy.periodicLogInterval == 0 {
+            let idxDur    = mkvDemuxer.map { String(format: "%.1f", $0.indexedDurationSeconds) } ?? "—"
+            let idxTask   = backgroundIndexTask != nil ? "🔄" : "idle"
+            let fullyIdx  = mkvDemuxer?.isFullyIndexed ?? true
             record("[feed] t=\(String(format: "%.1f", nowSec))s  "
                  + "buf=\(String(format: "%.1f", buffered))s  "
                  + "v=\(feeder.nextVideoSampleIdx)/\(feeder.videoSamplesTotal)  "
                  + "a=\(feeder.nextAudioSampleIdx)/\(feeder.audioSamplesTotal)  "
-                 + "[\(state.statusLabel)]")
+                 + "indexedDur=\(idxDur)s  indexTask=\(idxTask)  "
+                 + "fullyIndexed=\(fullyIdx)  [\(state.statusLabel)]")
         }
 
-        // ── Sprint 43: Background indexing — extend the window on-demand ────────
-        // If we've consumed all indexed video frames but the demuxer has more of
-        // the file left to scan, continue indexing synchronously before the EOS
-        // check.  The feed loop is suspended during this await; no concurrent
-        // access to frameIndex occurs.
-        if feeder.nextVideoSampleIdx >= feeder.videoSamplesTotal,
-           let mkv = mkvDemuxer, !mkv.isFullyIndexed {
-            let scanTarget = feeder.lastEnqueuedVideoPTS + 60.0  // index 60 s ahead of current tail
-            record("[feed] ── index window exhausted ─────────────────────────────────────")
-            record("[feed] nextV=\(feeder.nextVideoSampleIdx)  videoTotal=\(feeder.videoSamplesTotal)  "
-                 + "tail=\(String(format: "%.2f", feeder.lastEnqueuedVideoPTS))s  "
-                 + "now=\(String(format: "%.2f", nowSec))s  buf=\(String(format: "%.2f", buffered))s  "
-                 + "layer=\(renderer.layerStatusDescription)")
-            record("[feed] Extending index to \(String(format: "%.0f", scanTarget))s…")
-            do {
-                let (videoAdded, audioAdded) = try await mkv.continueIndexing(untilSeconds: scanTarget)
-                if videoAdded > 0 || audioAdded > 0 {
-                    feeder.videoSamplesTotal = mkv.indexedVideoFrameCount
-                    feeder.audioSamplesTotal = mkv.indexedAudioFrameCount
-                    feeder.duration          = mkv.indexedDurationSeconds
-                    record("[feed] ✅ Index extended to \(String(format: "%.0f", mkv.indexedDurationSeconds))s  "
-                         + "+\(videoAdded)v/+\(audioAdded)a  "
-                         + "total=\(feeder.videoSamplesTotal)v/\(feeder.audioSamplesTotal)a")
-                } else if mkv.isFullyIndexed {
-                    record("[feed] ✅ Fully indexed — \(feeder.videoSamplesTotal) total video frames")
-                } else {
-                    record("[feed] ⚠️ continueIndexing returned 0 new frames — "
-                         + "isFullyIndexed=\(mkv.isFullyIndexed)")
+        // ── Sprint 46: Proactive non-blocking background index extension ──────────
+        //
+        // Trigger a background scan when the feed cursor is within 30 s of the
+        // index tail.  The scan runs in a separate Task so the feed loop
+        // continues enqueuing already-indexed frames without waiting.
+        //
+        // Replaces the Sprint 43 synchronous approach (which blocked the feed loop
+        // for the full duration of the HTTP scan and caused the buffering freeze).
+        if let mkv = mkvDemuxer, !mkv.isFullyIndexed {
+            let lookahead   = feeder.videoSamplesFor(seconds: 30.0)
+            let nearingTail = feeder.nextVideoSampleIdx + lookahead >= feeder.videoSamplesTotal
+            if nearingTail {
+                let scanTarget = mkv.indexedDurationSeconds + 60.0
+                if backgroundIndexTask == nil {
+                    record("[IndexTask] ⚡ proactive trigger  "
+                         + "cursor=\(feeder.nextVideoSampleIdx)/\(feeder.videoSamplesTotal)  "
+                         + "indexedDur=\(String(format: "%.1f", mkv.indexedDurationSeconds))s  "
+                         + "→ scan to \(String(format: "%.0f", scanTarget))s  "
+                         + "fullyIndexed=\(mkv.isFullyIndexed)")
                 }
-            } catch {
-                record("[feed] ❌ Background indexing error: \(error.localizedDescription)")
+                triggerBackgroundIndex(mkv: mkv, to: scanTarget)
             }
-            return  // Re-enter feed loop next cycle with updated totals
         }
 
-        // End-of-stream: all samples fed, wait for buffer to drain.
-        let atEOS = feeder.nextVideoSampleIdx >= feeder.videoSamplesTotal
+        // ── End-of-stream ─────────────────────────────────────────────────────────
+        //
+        // For MKV: only declare EOS once the demuxer confirms no clusters remain.
+        // Without this gate, the feed loop would call onPlaybackEnded() as soon as
+        // the 8-second startup index was consumed — long before the file actually ends.
+        let fullyIndexed = mkvDemuxer?.isFullyIndexed ?? true
+        let atEOS = feeder.nextVideoSampleIdx >= feeder.videoSamplesTotal && fullyIndexed
         if atEOS {
             if logCycle % policy.periodicLogInterval == 0 {
-                record("[feed] EOS: nextV=\(feeder.nextVideoSampleIdx)  total=\(feeder.videoSamplesTotal)  "
+                record("[feed] EOS  nextV=\(feeder.nextVideoSampleIdx)/\(feeder.videoSamplesTotal)  "
                      + "buf=\(String(format: "%.2f", buffered))s  "
+                     + "fullyIndexed=\(fullyIndexed)  "
                      + "layer=\(renderer.layerStatusDescription)")
             }
             if policy.isEndOfStream(isAtEOS: atEOS, bufferedSeconds: buffered) { onPlaybackEnded() }
             return
         }
 
+        // Edge case: cursor exhausted but indexing not confirmed done.
+        // Background task should already be in flight from the proactive trigger above.
+        // Log clearly if it isn't — that indicates a gap in the trigger logic.
+        if feeder.nextVideoSampleIdx >= feeder.videoSamplesTotal,
+           let mkv = mkvDemuxer, !mkv.isFullyIndexed {
+            let taskState = backgroundIndexTask != nil ? "running ✅" : "NOT running ⚠️ — re-triggering"
+            record("[IndexTask] cursor exhausted but not fully indexed  "
+                 + "cursor=\(feeder.nextVideoSampleIdx)=total  "
+                 + "indexedDur=\(String(format: "%.1f", mkv.indexedDurationSeconds))s  "
+                 + "indexTask=\(taskState)")
+            triggerBackgroundIndex(mkv: mkv, to: mkv.indexedDurationSeconds + 60.0)
+            // Fall through — feedWindow will return 0 frames this cycle, which is fine.
+            // Next cycle: totals updated by indexTask → normal refill resumes.
+        }
+
         // ── Underrun detection (Sprint 19) ────────────────────────────────────
         if state == .playing && policy.isUnderrun(bufferedSeconds: buffered) {
+            let idxDur   = mkvDemuxer.map { String(format: "%.1f", $0.indexedDurationSeconds) } ?? "—"
+            let taskState = backgroundIndexTask != nil ? "🔄 scanning" : "idle — waiting for network?"
             transition(to: .buffering, "underrun \(String(format: "%.2f", buffered))s")
             renderer.synchronizer.rate = 0
             record("[Buffer] UNDERRUN  video=\(String(format: "%.2f", buffered))s  "
                  + "audio=\(String(format: "%.2f", audioBuffered))s  "
                  + "nextV=\(feeder.nextVideoSampleIdx)/\(feeder.videoSamplesTotal)  "
+                 + "indexedDur=\(idxDur)s  indexTask=\(taskState)  "
+                 + "fullyIndexed=\(mkvDemuxer?.isFullyIndexed ?? true)  "
                  + "layer=\(renderer.layerStatusDescription)")
         }
 
@@ -894,10 +952,13 @@ final class PlayerLabPlaybackController: ObservableObject {
             let toFill     = policy.refillSeconds(currentlyBuffered: buffered)
             let videoCount = feeder.videoSamplesFor(seconds: toFill)
             if logCycle % policy.bufferingLogInterval == 0 {
+                let idxDur    = mkvDemuxer.map { String(format: "%.1f", $0.indexedDurationSeconds) } ?? "—"
+                let taskState = backgroundIndexTask != nil ? "🔄 scanning" : "idle"
                 record("[Buffer] refilling \(String(format: "%.1f", toFill))s "
                      + "≈ \(videoCount) samples  "
                      + "cursor=\(feeder.nextVideoSampleIdx)/\(feeder.videoSamplesTotal)  "
-                     + "tail=\(String(format: "%.2f", feeder.lastEnqueuedVideoPTS))s")
+                     + "tail=\(String(format: "%.2f", feeder.lastEnqueuedVideoPTS))s  "
+                     + "indexedDur=\(idxDur)s  indexTask=\(taskState)")
             }
             let cursorBefore = feeder.nextVideoSampleIdx
             await feeder.feedWindow(videoCount:   videoCount,
