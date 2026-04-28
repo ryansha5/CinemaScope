@@ -61,34 +61,54 @@ final class FrameRenderer {
     // samples are silently dropped in enqueueAudio().  This completely
     // decouples audio from the shared AVSampleBufferRenderSynchronizer clock.
     //
-    // PURPOSE: isolate whether a failing audio renderer (ParseAC3Header /
-    // AudioQueueObject Prime errors) is preventing the synchronizer timebase
-    // from running.  In a shared synchronizer, a renderer that fails to prime
-    // can block the clock for all attached renderers.
-    //
-    // Set to false to re-enable audio once video-only playback is confirmed.
-    static var videoOnlyDiagnostic: Bool = true
+    // This is an INSTANCE property (not static) so that the Playback Quarantine
+    // Sprint can create a dedicated renderer with audio enabled (videoOnly: false)
+    // without affecting the shared video-only renderer used by the main pipeline.
+    // Default is true (audio off) — matches the previous static-var behaviour.
+    let videoOnlyDiagnostic: Bool
 
     // MARK: - Init
 
-    init() {
+    /// Whether the audio renderer has been attached to the synchronizer yet.
+    /// Starts false even when videoOnly=false — attachment is deferred until
+    /// attachAudioRenderer() is called (after AVAudioSession is active).
+    private(set) var audioRendererAttached: Bool = false
+
+    /// - Parameter videoOnly: When `true` (default) the audio renderer is NOT
+    ///   attached to the synchronizer and `enqueueAudio()` is a no-op.  Pass
+    ///   `false` only from the Playback Quarantine audio-isolation phase where
+    ///   audio is being tested in a fully separate controller instance.
+    init(videoOnly: Bool = true) {
+        videoOnlyDiagnostic = videoOnly
+
         layer.videoGravity = .resizeAspect
         layer.backgroundColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
 
         synchronizer.addRenderer(layer)
-
-        if FrameRenderer.videoOnlyDiagnostic {
-            // Audio renderer intentionally NOT attached — diagnostic mode.
-            fputs("[FrameRenderer] ⚠️ videoOnlyDiagnostic=true — "
-                + "audioRenderer NOT attached to synchronizer\n", stderr)
-        } else {
-            synchronizer.addRenderer(audioRenderer)
-        }
+        // Audio renderer is NOT added here even when videoOnly=false.
+        // Attaching an un-primed AVSampleBufferAudioRenderer before the
+        // AVAudioSession is active causes the synchronizer to stall its
+        // timebase, making the clock appear to run (rate=1) while frames
+        // are never actually presented.  Call attachAudioRenderer() after
+        // the audio session is active and just before audio samples flow.
 
         synchronizer.rate = 0   // start paused
         fputs("[FrameRenderer] Synchronizer created — "
-            + (FrameRenderer.videoOnlyDiagnostic ? "video-only" : "layer + audioRenderer")
+            + (videoOnly ? "video-only (audio renderer deferred)" : "video layer only (audio deferred — call attachAudioRenderer)")
             + " attached\n", stderr)
+    }
+
+    /// Attach the audio renderer to the synchronizer.
+    ///
+    /// Call this AFTER `AVAudioSession.setActive(true)` and BEFORE enqueuing
+    /// the first audio sample.  Calling more than once is a no-op.
+    ///
+    /// No-op when `videoOnlyDiagnostic == true`.
+    func attachAudioRenderer() {
+        guard !videoOnlyDiagnostic, !audioRendererAttached else { return }
+        synchronizer.addRenderer(audioRenderer)
+        audioRendererAttached = true
+        fputs("[FrameRenderer] ✅ audioRenderer attached to synchronizer\n", stderr)
     }
 
     // MARK: - Enqueue
@@ -136,8 +156,6 @@ final class FrameRenderer {
             case .failed:     statusName = "failed"
             @unknown default: statusName = "unknownFuture"
             }
-            // Sprint 46: include timebase rate+time so we can see whether the
-            // synchronizer clock is actually running when frames are enqueued.
             let tbRate = CMTimebaseGetRate(synchronizer.timebase)
             let tbTime = CMTimebaseGetTime(synchronizer.timebase)
             let tbStr  = "tbRate=\(tbRate)  tbTime=\(tbTime.isValid ? String(format: "%.3f", tbTime.seconds) + "s" : "invalid")"
@@ -175,7 +193,7 @@ final class FrameRenderer {
     /// Enqueue one compressed audio CMSampleBuffer.
     /// No-op when videoOnlyDiagnostic is true.
     func enqueueAudio(_ sampleBuffer: CMSampleBuffer) {
-        guard !FrameRenderer.videoOnlyDiagnostic else { return }
+        guard !videoOnlyDiagnostic, audioRendererAttached else { return }
         audioRenderer.enqueue(sampleBuffer)
     }
 
@@ -185,23 +203,14 @@ final class FrameRenderer {
     /// the synchronizer anchors its clock there so the first frame appears immediately.
     func play(from startPTS: CMTime) {
         // Step 1: anchor the timeline at startPTS with rate=0 (time-only, no start yet).
-        // This is a no-op if seek already anchored the clock here, but is safe to call.
         synchronizer.setRate(0, time: startPTS)
 
         // Step 2: start the clock without moving the anchor.
-        // Using setRate(_:time:.invalid) changes rate only, leaving the previously
-        // anchored time intact.  This two-step pattern avoids a known tvOS quirk where
-        // setRate(1, time: X) correctly anchors X but silently leaves rate=0 when the
-        // display layer's isReadyForMoreMediaData is false at the time of the call.
         synchronizer.setRate(1, time: .invalid)
 
-        // Belt-and-suspenders: set the .rate property directly as well, since
-        // setRate(_:time:) on tvOS sometimes does not update the underlying
-        // CMTimebase rate when the display layer queue is temporarily saturated.
+        // Belt-and-suspenders: set the .rate property directly as well.
         synchronizer.rate = 1
 
-        // Diagnostic log — log both synchronizer.rate property and CMTimebaseGetRate
-        // so we can distinguish between "API value" and "timebase value" in the log.
         let syncRate = synchronizer.rate
         let tbRate   = CMTimebaseGetRate(synchronizer.timebase)
         let tbTime   = CMTimebaseGetTime(synchronizer.timebase)
@@ -219,7 +228,6 @@ final class FrameRenderer {
 
     /// Resume from the current position after pause().
     func resume() {
-        // setRate(_:time:kCMTimeInvalid) = change rate without moving the clock.
         synchronizer.setRate(1, time: .invalid)
         fputs("[FrameRenderer] resume() — synchronizer rate=1\n", stderr)
     }
@@ -246,18 +254,11 @@ final class FrameRenderer {
         layer.flushAndRemoveImage()
 
         // Re-arm isReadyForMoreMediaData.
-        // flushAndRemoveImage() cancels the synchronizer's internal
-        // requestMediaDataWhenReady registration on the layer, leaving
-        // isReadyForMoreMediaData stuck at false permanently.  On the next
-        // prepare() + play() call, setRate(1) will silently refuse to run
-        // because the display layer's queue management is in a broken state.
-        // This one-shot request/stop cycle resets the flag immediately so the
-        // next enqueue + play() sequence works correctly.
         layer.requestMediaDataWhenReady(on: .main) { [weak self] in
             self?.layer.stopRequestingMediaData()
         }
 
-        if !FrameRenderer.videoOnlyDiagnostic { audioRenderer.flush() }
+        if !videoOnlyDiagnostic && audioRendererAttached { audioRenderer.flush() }
         framesEnqueued = 0
         firstFramePTS  = .invalid
         fputs("[FrameRenderer] flushAll() — layer + audio cleared, rate=0\n", stderr)
@@ -272,7 +273,7 @@ final class FrameRenderer {
 
     /// Flush only the audio renderer.
     func flushAudio() {
-        if !FrameRenderer.videoOnlyDiagnostic { audioRenderer.flush() }
+        if !videoOnlyDiagnostic && audioRendererAttached { audioRenderer.flush() }
     }
 
     /// Flush both renderers in preparation for a seek.
@@ -295,16 +296,12 @@ final class FrameRenderer {
         synchronizer.rate = 0           // quiesce pipeline before flush
         layer.flushAndRemoveImage()     // clears displayed image + pending frames
 
-        // Re-arm isReadyForMoreMediaData.  flushAndRemoveImage() cancels the
-        // synchronizer's internal requestMediaDataWhenReady registration on the
-        // layer, which leaves isReadyForMoreMediaData stuck at false.  This
-        // no-op request/stop cycle resets that flag immediately on the main queue.
+        // Re-arm isReadyForMoreMediaData.
         layer.requestMediaDataWhenReady(on: .main) { [weak self] in
-            // Immediately cancel — we only want the flag reset side-effect.
             self?.layer.stopRequestingMediaData()
         }
 
-        if !FrameRenderer.videoOnlyDiagnostic { audioRenderer.flush() }
+        if !videoOnlyDiagnostic && audioRendererAttached { audioRenderer.flush() }
         framesEnqueued = 0
         firstFramePTS  = .invalid
         fputs("[FrameRenderer] flushForSeek() — pipeline quiesced, layer + audio cleared\n", stderr)

@@ -848,7 +848,8 @@ private struct PlayerLabPanel: View {
     @State private var labIsRunning:  Bool   = false
     @State private var labLog:        String = ""
     @State private var labSuccess:    Bool?  = nil
-    @State private var labShowPlayer: Bool   = false
+    @State private var labShowPlayer:     Bool   = false
+    @State private var labShowQuarantine: Bool   = false
 
     var body: some View {
         ScrollView(.vertical, showsIndicators: false) {
@@ -1035,6 +1036,19 @@ private struct PlayerLabPanel: View {
                         labShowPlayer = true
                     }
                     .disabled(labFilePath.trimmingCharacters(in: .whitespaces).isEmpty)
+
+                    // Quarantine Lab — isolated test path (Playback Quarantine Sprint)
+                    SettingsButton(
+                        icon:      "flask.fill",
+                        label:     "Quarantine Lab",
+                        style:     .ghost,
+                        colorMode: colorMode
+                    ) {
+                        labShowQuarantine = true
+                    }
+                    .fullScreenCover(isPresented: $labShowQuarantine) {
+                        PlaybackLabMinimalView(onClose: { labShowQuarantine = false })
+                    }
 
                     if !labLog.isEmpty {
                         SettingsButton(icon: "arrow.counterclockwise", label: "Clear", style: .ghost, colorMode: colorMode) {

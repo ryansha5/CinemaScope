@@ -20,6 +20,12 @@
 // Sprint 28  — PGS subtitle support and PGSSubtitleController integration
 // Sprint 29  — TrueHD/DTS audio classification and logging
 // Sprint 30  — State transition logging, restart() from .ended fix, dts:.invalid for B-frame H.264
+// Sprint 47  — B-frame decode order: video fetch sorted by fileOffset (decode order, not PTS)
+//              Codec-aware branching: H.264 vs HEVC NAL parsing, avcC vs hvcC NAL length
+//              Indexer bandwidth fix (rev 2): hysteresis thresholds (fire≥3s, cancel<1.5s);
+//              cancel only when frame fetch has pending work; cooperative cancellation in
+//              MKVDemuxer.continueIndexing (cluster-boundary checkCancellation + per-cluster
+//              cursor save prevents duplicate frame-index entries on cancel/restart).
 // SC1        — AudioFormatFactory: audio format-description logic extracted to Audio/
 // SC2        — ContainerPreparation: container routing + parsing extracted to Core/
 // SC7        — PacketFeeder: fetch/enqueue pipeline + cursor state extracted to Core/
@@ -191,8 +197,13 @@ final class PlayerLabPlaybackController: ObservableObject {
 
     // MARK: - Init
 
-    init() {
-        let r   = FrameRenderer()
+    /// - Parameter videoOnly: Passed through to `FrameRenderer`.  When `true`
+    ///   (default) the audio renderer is NOT attached to the synchronizer and
+    ///   `enqueueAudio()` is a no-op — matches existing production behaviour.
+    ///   Pass `false` only from the Playback Quarantine audio-isolation phase
+    ///   (Phase 4) where audio is being tested in a dedicated controller instance.
+    init(videoOnly: Bool = true) {
+        let r   = FrameRenderer(videoOnly: videoOnly)
         let srt = PlayerLabSubtitleController()
         let pgs = PGSSubtitleController()
         renderer            = r
@@ -316,7 +327,10 @@ final class PlayerLabPlaybackController: ObservableObject {
         case .mkv(let r):
             mkvDemuxer           = r.demuxer
             feeder.mkvDemuxer    = r.demuxer
+            feeder.isDolbyVisionDualLayer = r.demuxer.isDolbyVisionDualLayer
             detectedContainer    = "MKV"
+            record("[Prepare] isDolbyVisionDualLayer=\(r.demuxer.isDolbyVisionDualLayer)  "
+                 + "firstKF=\(r.demuxer.firstVideoKeyframeIndex)")
 
             availableAudioTracks = r.availableAudioTracks
             selectedAudioTrack   = r.availableAudioTracks
@@ -469,8 +483,14 @@ final class PlayerLabPlaybackController: ObservableObject {
 
         // ── Step 7: Load initial window (SC7 — feeder.feedWindow) ────────────
         //
-        // Activate AVAudioSession before the first audio buffer is enqueued.
-        if hasAudio { activateAudioSession() }
+        // Activate AVAudioSession before the first audio buffer is enqueued,
+        // then attach the audio renderer to the synchronizer.  Order matters:
+        // attaching the renderer before the session is active causes the
+        // synchronizer timebase to stall (rate appears 1 but clock never runs).
+        if hasAudio {
+            activateAudioSession()
+            renderer.attachAudioRenderer()
+        }
 
         // For Dolby Vision Profile 7 dual-layer MKV, the first MKV cluster
         // contains BL-only skip frames (~110 B each) that a standard HEVC
@@ -918,25 +938,55 @@ final class PlayerLabPlaybackController: ObservableObject {
                  + "fullyIndexed=\(fullyIdx)  [\(state.statusLabel)]")
         }
 
-        // ── Sprint 46: Proactive non-blocking background index extension ──────────
+        // ── Sprint 47 (rev 2): Proactive non-blocking background index extension ────
         //
         // Trigger a background scan when the feed cursor is within 30 s of the
-        // index tail.  The scan runs in a separate Task so the feed loop
-        // continues enqueuing already-indexed frames without waiting.
+        // index tail.  Use hysteresis to avoid bandwidth contention:
         //
-        // Replaces the Sprint 43 synchronous approach (which blocked the feed loop
-        // for the full duration of the HTTP scan and caused the buffering freeze).
+        //   FIRE   when buffer ≥ initialWindowSeconds (3 s) — enough headroom
+        //          that the indexer can run alongside frame fetch without risk.
+        //
+        //   CANCEL when buffer < resumeThreshold (1.5 s) — buffer is getting
+        //          critical; yield ALL bandwidth to the frame-refill pipeline.
+        //          The indexer will be re-triggered once the buffer recovers.
+        //
+        // Why not targetBufferSeconds (8 s)?  The startup index typically covers
+        // only 8–10 s of content, so the buffer can never reach 8 s before the
+        // cursor exhausts — meaning the indexer would never fire proactively at
+        // all, instead relying solely on the reactive trigger below (cursor = total)
+        // which produces a guaranteed freeze while the indexer catches up.
+        //
+        // With the 3 s / 1.5 s hysteresis the indexer fires immediately after the
+        // initial window loads, runs alongside frame fetch while the buffer is
+        // healthy, pauses if the buffer becomes critical, and resumes automatically
+        // once the frame refill restores headroom.  For large-bitrate files where
+        // the indexer takes >10 s, this prevents the cursor from reaching exhaustion
+        // before the index is extended.
         if let mkv = mkvDemuxer, !mkv.isFullyIndexed {
-            let lookahead   = feeder.videoSamplesFor(seconds: 30.0)
-            let nearingTail = feeder.nextVideoSampleIdx + lookahead >= feeder.videoSamplesTotal
-            if nearingTail {
+            let lookahead    = feeder.videoSamplesFor(seconds: 30.0)
+            let nearingTail  = feeder.nextVideoSampleIdx + lookahead >= feeder.videoSamplesTotal
+            let bufferOK     = buffered >= policy.initialWindowSeconds   // fire threshold
+            let bufferCrit   = buffered < policy.resumeThreshold          // cancel threshold
+
+            // Only cancel when there are still frames the fetcher can retrieve.
+            // If cursor = total, frame fetch has nothing left to do; let the
+            // indexer keep running with exclusive bandwidth instead.
+            let hasPendingFrames = feeder.nextVideoSampleIdx < feeder.videoSamplesTotal
+            if nearingTail && bufferCrit && hasPendingFrames && backgroundIndexTask != nil {
+                // Buffer is critical and frame fetch has work to do — cancel
+                // indexer so ALL bandwidth goes to the frame-refill pipeline.
+                record("[IndexTask] ⏸ cancelled — buffer=\(String(format: "%.2f", buffered))s "
+                     + "< resume=\(policy.resumeThreshold)s; yielding bandwidth to frame fetch")
+                backgroundIndexTask?.cancel()
+                backgroundIndexTask = nil
+            } else if nearingTail && bufferOK {
                 let scanTarget = mkv.indexedDurationSeconds + 60.0
                 if backgroundIndexTask == nil {
                     record("[IndexTask] ⚡ proactive trigger  "
                          + "cursor=\(feeder.nextVideoSampleIdx)/\(feeder.videoSamplesTotal)  "
                          + "indexedDur=\(String(format: "%.1f", mkv.indexedDurationSeconds))s  "
-                         + "→ scan to \(String(format: "%.0f", scanTarget))s  "
-                         + "fullyIndexed=\(mkv.isFullyIndexed)")
+                         + "buf=\(String(format: "%.1f", buffered))s  "
+                         + "→ scan to \(String(format: "%.0f", scanTarget))s")
                 }
                 triggerBackgroundIndex(mkv: mkv, to: scanTarget)
             }

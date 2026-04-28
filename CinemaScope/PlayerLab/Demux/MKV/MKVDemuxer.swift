@@ -9,7 +9,8 @@
 // Sprint 27 — Chapter parsing (MKV Chapters / EditionEntry / ChapterAtom)
 // Sprint 28 — PGS subtitle track detection, packet extraction, and cue decoding
 // Sprint 29 — TrueHD/DTS/DTS-HD audio track detection and classification
-// Sprint 30 — DTS fix for B-frame H.264 (dts:.invalid for video packets)
+// Sprint 30 — dts:.invalid for video packets (AVSampleBufferDisplayLayer handles PTS scheduling)
+// Sprint 47 — B-frame decode order fix: re-sort video batch by fileOffset before enqueue
 // Sprint 31 — MKVAudioTrackDescriptor: isDTSCore / isDTSHD; PremiumAudioPolicy-ready
 // Sprint 32 — reselectAudio(): re-scan clusters when policy overrides initial selection
 // Sprint 33 — DTS-Core: "dtsc" fourCC mapping; 512 frames/packet; passthrough path
@@ -279,6 +280,12 @@ final class MKVDemuxer {
     /// any legitimate HEVC P-frame for 1080p is several hundred bytes minimum),
     /// treat the first cluster as a BL-only preamble and return the second
     /// keyframe index instead.
+    /// True when the frameIndex exhibits Dolby Vision Profile 7 dual-layer structure:
+    /// a BL-only preamble cluster whose inter-frames are all tiny (< 200 B) followed
+    /// by interleaved BL+EL frames throughout.  Used to gate the BL size filter in
+    /// PacketFeeder so legitimate small HEVC frames in non-DV content are never dropped.
+    var isDolbyVisionDualLayer: Bool { firstVideoKeyframeIndex > 0 }
+
     var firstVideoKeyframeIndex: Int {
         // Locate the first two keyframe indices.
         let kfIndices = frameIndex.indices.filter { frameIndex[$0].isKeyframe }
@@ -286,15 +293,29 @@ final class MKVDemuxer {
         guard kfIndices.count >= 2 else { return firstKF }
         let secondKF = kfIndices[1]
 
-        // Check whether ALL inter-frames between the two keyframes are tiny.
-        // An empty range (back-to-back keyframes) falls through to firstKF.
+        // DV Profile 7 dual-layer detection — three conditions must all be true:
+        //
+        // 1. The first keyframe is itself tiny (< 2 KB).
+        //    A real HEVC IDR at 1080p+ is always tens of kilobytes minimum.
+        //    A DV BL IDR is ~200–500 B.  This rules out non-DV files whose
+        //    first inter-frames happen to be skip-coded (near-zero bytes),
+        //    which would otherwise trigger condition 3 alone.
+        //
+        // 2. There is at least one inter-frame between the two keyframes.
+        //    Back-to-back IDRs (scene cuts) have no preamble to examine.
+        //
+        // 3. ALL inter-frames in that range are tiny (< 200 B).
+        //    DV BL skip frames are ~110–130 B; a real 1080p P-frame is
+        //    several hundred bytes minimum under normal encoder settings.
+        guard frameIndex[firstKF].size < 2_000 else { return firstKF }  // (1)
+
         let interRange = (firstKF + 1)..<secondKF
-        if !interRange.isEmpty {
-            let allTinyBL = interRange.allSatisfy { frameIndex[$0].size < 200 }
-            if allTinyBL {
-                // First cluster is DV BL-only preamble — start from EL IDR.
-                return secondKF
-            }
+        guard !interRange.isEmpty else { return firstKF }                 // (2)
+
+        let allTinyBL = interRange.allSatisfy { frameIndex[$0].size < 200 }
+        if allTinyBL {
+            // All three conditions met — DV BL-only preamble confirmed.
+            return secondKF
         }
 
         return firstKF
@@ -701,8 +722,19 @@ final class MKVDemuxer {
         let limit  = backgroundScanLimit
 
         while cursor < limit {
+            // Check for cooperative cancellation at each cluster boundary.
+            // This ensures cancellation only interrupts between clusters, not
+            // mid-cluster, so backgroundScanCursor is always at a clean boundary
+            // and frame index entries are never partially duplicated on restart.
+            try Task.checkCancellation()
+
             guard let (elem, hdrBytes) = try await parser.nextElement(at: cursor, limit: limit)
             else { break }
+
+            // Compute element span up-front so we can advance backgroundScanCursor
+            // to cursor+total (start of the NEXT element) after each cluster.
+            let total = Int64(hdrBytes) + (elem.payloadSize >= 0 ? elem.payloadSize : 0)
+            if total <= 0 { break }
 
             if elem.knownID == .cluster {
                 let clusterEnd = elem.payloadSize >= 0
@@ -716,16 +748,20 @@ final class MKVDemuxer {
                                        pgsTrackNum:      nil)
                 clusterCount += 1
 
+                // Persist the start of the NEXT element after each completed
+                // cluster.  If the Task is cancelled at the top of the next
+                // iteration, a restart will begin here rather than re-scanning
+                // the just-completed cluster (which would duplicate index entries).
+                backgroundScanCursor = cursor + total
+
                 let indexedSec = frameIndex.last?.pts.seconds ?? 0
                 if indexedSec >= targetSeconds { break }
             }
 
-            let total = Int64(hdrBytes) + (elem.payloadSize >= 0 ? elem.payloadSize : 0)
-            if total <= 0 { break }
             cursor += total
         }
 
-        // Update cursor and EOF flag.
+        // Final cursor update (advances past any trailing non-cluster elements).
         backgroundScanCursor = cursor
         if cursor >= limit { isFullyIndexed = true }
 
@@ -1747,10 +1783,33 @@ final class MKVDemuxer {
         guard startIndex < endIndex else { return [] }
 
         struct Loc { let idx: Int; let fileOff: Int64; let size: Int }
-        let locs: [Loc] = (startIndex..<endIndex).compactMap { i in
+        let ptsSortedLocs: [Loc] = (startIndex..<endIndex).compactMap { i in
             guard index[i].size > 0 else { return nil }
             return Loc(idx: i, fileOff: index[i].fileOffset, size: index[i].size)
         }
+
+        // For video: re-sort the extracted batch by fileOffset (= decode order).
+        //
+        // AVSampleBufferDisplayLayer / VideoToolbox requires frames in DECODE order:
+        // VT decodes frames in the order they are enqueued, and the display layer
+        // schedules each decoded frame for display at its PTS.  For B-frame content,
+        // decode order ≠ presentation order — the reference P-frame must be decoded
+        // before any B-frame that references it.
+        //
+        // The frameIndex is sorted by PTS (for binary-search seeking), which is
+        // NOT decode order.  MKV clusters store blocks in decode order, so each
+        // block's fileOffset within a cluster naturally reflects its decode position.
+        // Sorting by fileOffset therefore recovers the correct decode order.
+        //
+        // As a bonus, fileOffset-sorted locs are contiguous in the file, which
+        // allows the run-coalescing below to form longer reads → fewer HTTP requests.
+        //
+        // Sprint 47: fixed Sprint 30 incorrect assumption ("AVSampleBufferDisplayLayer
+        // handles B-frame reordering from presentation timestamps") — the layer does
+        // NOT reorder for VT.  Frames must arrive at VT in decode order.
+        let locs: [Loc] = streamType == .video
+            ? ptsSortedLocs.sorted { $0.fileOff < $1.fileOff }
+            : ptsSortedLocs
 
         var packets = [DemuxPacket](); packets.reserveCapacity(locs.count)
         var runStart = 0
@@ -1770,10 +1829,9 @@ final class MKVDemuxer {
                 let sliceOff = Int(loc.fileOff - runOff)
                 guard sliceOff + loc.size <= chunk.count else { continue }
                 let data = chunk.subdata(in: sliceOff..<(sliceOff + loc.size))
-                // Sprint 30: pass dts:.invalid for video so AVSampleBufferDisplayLayer
-                // handles B-frame reordering from the presentation timestamps, rather
-                // than assuming decode_time == presentation_time.
-                // Audio dts == pts is correct (no reordering needed).
+                // DTS: for video, frames are now enqueued in decode order (fileOffset-sorted).
+                // Setting DTS to .invalid tells VT to decode in the order frames arrive,
+                // which is now the correct decode order.  Audio DTS == PTS (no reordering).
                 let dts: CMTime = streamType == .video ? .invalid : frame.pts
                 packets.append(DemuxPacket(
                     streamType: streamType, index: loc.idx,

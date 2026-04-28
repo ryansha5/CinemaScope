@@ -145,7 +145,8 @@ final class PacketFeeder {
 
     /// Maximum raw byte size of a DV Base Layer frame.
     /// Any video packet below this threshold is treated as a BL skip/trailing
-    /// frame and silently discarded when DV stripping is enabled.
+    /// frame and silently discarded when DV stripping is enabled AND the file
+    /// is confirmed to be DV dual-layer (isDolbyVisionDualLayer == true).
     ///
     /// Empirical threshold for DV Profile 7:
     ///   BL frames: 114 – 362 B (TRAIL_N / TRAIL_R skip frames)
@@ -153,7 +154,19 @@ final class PacketFeeder {
     ///
     /// 600 B sits safely between the two populations with >3× margin on the
     /// high end.  Raise only if a legitimate EL frame ever falls below this.
+    ///
+    /// IMPORTANT: this filter must ONLY fire on confirmed DV dual-layer files.
+    /// Non-DV HEVC encodes can produce legitimate frames below 600 B in
+    /// low-motion or static scenes — dropping them causes periodic decode
+    /// corruption as the decoder loses reference frames.
     static let kDVBLFrameSizeThreshold: Int = 600
+
+    /// Set to true when the source file is confirmed to be Dolby Vision Profile 7
+    /// dual-layer (interleaved BL+EL frames on the video track).  Gates the BL
+    /// frame size filter in fetchPackets — the filter must NEVER run on non-DV
+    /// content regardless of stripDolbyVisionNALsEnabled.
+    /// Set by PlayerLabPlaybackController.prepare() from mkvDemuxer.isDolbyVisionDualLayer.
+    var isDolbyVisionDualLayer: Bool = false
 
     // MARK: - Init
 
@@ -244,8 +257,11 @@ final class PacketFeeder {
             // BL-filtered and build-failed frames (see totalVideoAttempted below).
             result.totalVideoAttempted = packets.count
 
+            // Codec type — used for the BL frame filter and makeVideoSampleBuffer branching.
+            let isHEVC = CMFormatDescriptionGetMediaSubType(vFmt) == kCMVideoCodecType_HEVC
+
             for pkt in packets {
-                // ── DV BL frame filter ───────────────────────────────────────────
+                // ── DV BL frame filter (HEVC / Dolby Vision only) ────────────────
                 // DV Profile 7 MKVs interleave Base Layer (BL) frames with
                 // Enhancement Layer (EL) frames on the same track throughout the
                 // whole file — not just at the initial BL preamble cluster.
@@ -254,7 +270,10 @@ final class PacketFeeder {
                 // pipeline because VT is configured for the EL HEVC profile and
                 // cannot interpret context-free BL trailing slices.
                 // Skip any frame below kDVBLFrameSizeThreshold when stripping is on.
-                if PacketFeeder.stripDolbyVisionNALsEnabled
+                // H.264 content never has DV BL frames — filter is HEVC-only.
+                if isHEVC
+                    && PacketFeeder.stripDolbyVisionNALsEnabled
+                    && isDolbyVisionDualLayer
                     && pkt.data.count < PacketFeeder.kDVBLFrameSizeThreshold {
                     feederLog("  [\(label)] DV BL skip  pkt=\(pkt.index)"
                             + "  pts=\(String(format: "%.3f", pkt.pts.seconds))s"
@@ -408,12 +427,24 @@ final class PacketFeeder {
         formatDescription: CMVideoFormatDescription
     ) throws -> CMSampleBuffer {
 
+        // ── Codec detection ───────────────────────────────────────────────────
+        //
+        // H.264 and HEVC share this path but differ in:
+        //   • nalUnitLength extraction API (avcC vs hvcC parameter set query)
+        //   • NAL header width (1 byte vs 2 bytes)
+        //   • DV NAL stripping (HEVC only — H.264 never carries type 62/63)
+        //   • BL frame filter (HEVC-only, handled upstream in fetchPackets)
+        //
+        // Detect codec once here so all downstream steps branch correctly.
+
+        let isHEVC = CMFormatDescriptionGetMediaSubType(formatDescription) == kCMVideoCodecType_HEVC
+
         // ── Sprint 44: Annex B detection + conversion ─────────────────────────
         //
-        // MKV stores HEVC NAL units in Annex B bytestream format (start-code
+        // MKV stores NAL units in Annex B bytestream format (start-code
         // delimited: 00 00 01 or 00 00 00 01 before each NAL unit).  VideoToolbox
         // requires length-prefixed format (big-endian nalUnitLength bytes before
-        // each NAL unit), matching the format description built from hvcC.
+        // each NAL unit), matching the format description built from hvcC/avcC.
         //
         // This conversion must happen for every sample, not just keyframes.
         // Passing Annex B bytes to VT causes it to read start-code bytes as a
@@ -422,12 +453,14 @@ final class PacketFeeder {
         //
         // nalUnitLength is extracted from the format description (usually 4).
 
-        let nalUnitLength = PacketFeeder.hevcNalUnitLength(from: formatDescription)
-        let rawBytes      = Array(packet.data)   // flatten to 0-based [UInt8]
+        let nalUnitLength = isHEVC
+            ? PacketFeeder.hevcNalUnitLength(from: formatDescription)
+            : PacketFeeder.avcNalUnitLength(from: formatDescription)
+        let rawBytes = Array(packet.data)   // flatten to 0-based [UInt8]
 
-        // detectNALFormat now does full LP validation, not just a 4-byte prefix
-        // check. If the buffer isn't a well-formed LP stream it falls back to
-        // Annex B conversion, which is the correct path for MKV HEVC content.
+        // detectNALFormat does full LP validation.  If the buffer isn't a
+        // well-formed LP stream it falls back to Annex B conversion, which is
+        // the correct path for MKV HEVC/AVC content.
         let fmt = PacketFeeder.detectNALFormat(rawBytes, nalUnitLength: nalUnitLength)
         let normalizedBytes: Data
         if fmt == .annexB {
@@ -438,9 +471,7 @@ final class PacketFeeder {
         }
 
         // Strip Dolby Vision NAL types 62 (RPU) and 63 (EL wrapper) before
-        // handing to VideoToolbox.  VT should ignore reserved NAL types, but
-        // in practice type 62/63 can corrupt the HEVC decoder state.
-        // Stripping them leaves: AUD, VPS/SPS/PPS, SEI, and video slices only.
+        // handing to VideoToolbox.  HEVC only — H.264 never contains DV NALs.
         //
         // Sprint 46: stripDolbyVisionNALsEnabled toggle — set to false to
         // diagnose whether the strip path breaks sample delivery.
@@ -452,7 +483,7 @@ final class PacketFeeder {
         // to the unstripped normalizedBytes so VideoToolbox can attempt to decode
         // (or gracefully skip) the frame rather than crashing the pipeline.
         let sampleBytes: Data
-        if PacketFeeder.stripDolbyVisionNALsEnabled {
+        if isHEVC && PacketFeeder.stripDolbyVisionNALsEnabled {
             let stripped = PacketFeeder.stripDolbyVisionNALs(normalizedBytes,
                                                               nalUnitLength: nalUnitLength)
             if stripped.isEmpty && !normalizedBytes.isEmpty {
@@ -466,6 +497,7 @@ final class PacketFeeder {
                 sampleBytes = stripped
             }
         } else {
+            // H.264: never strip.  HEVC with stripping disabled: pass through.
             sampleBytes = normalizedBytes
         }
 
@@ -489,6 +521,7 @@ final class PacketFeeder {
                 packet:        packet,
                 fmt:           fmt,
                 nalUnitLength: nalUnitLength,
+                isHEVC:        isHEVC,
                 diagIdx:       videoSamplesDiagnosed
             )
         }
@@ -767,6 +800,21 @@ final class PacketFeeder {
         return max(1, Int(nal))
     }
 
+    /// Extract the H.264 NAL unit header length from a CMVideoFormatDescription.
+    /// Returns 4 if the query fails (covers virtually all real content).
+    private static func avcNalUnitLength(from desc: CMVideoFormatDescription) -> Int {
+        var nal: Int32 = 4
+        CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+            desc,
+            parameterSetIndex:      0,
+            parameterSetPointerOut: nil,
+            parameterSetSizeOut:    nil,
+            parameterSetCountOut:   nil,
+            nalUnitHeaderLengthOut: &nal
+        )
+        return max(1, Int(nal))
+    }
+
     // MARK: - NAL type parsing helpers
 
     /// Returns the HEVC NAL unit type name for a type number.
@@ -789,10 +837,35 @@ final class PacketFeeder {
         }
     }
 
+    /// Returns the H.264 NAL unit type name for a type number.
+    private static func avcNALTypeName(_ t: Int) -> String {
+        switch t {
+        case  1: return "non-IDR slice"
+        case  2: return "slice DPA"
+        case  3: return "slice DPB"
+        case  4: return "slice DPC"
+        case  5: return "IDR slice ✅"
+        case  6: return "SEI"
+        case  7: return "SPS"
+        case  8: return "PPS"
+        case  9: return "AUD"
+        case 10: return "end of seq"
+        case 11: return "end of stream"
+        case 12: return "filler"
+        case 13: return "SPS_EXT"
+        case 19: return "aux coded slice"
+        default: return "type\(t)"
+        }
+    }
+
     /// Parse NAL unit types from length-prefixed bytes.
     /// Returns array of (nalType, sizeBytes) pairs.
     /// `sizeBytes` is the NAL payload size (NOT including the length prefix field).
-    private static func nalTypesFromLengthPrefixed(_ b: [UInt8], nalUnitLength: Int) -> [(type: Int, size: Int)] {
+    ///
+    /// - Parameter isHEVC: When true, NAL type is extracted from the HEVC 2-byte
+    ///   header `(byte0 >> 1) & 0x3F`.  When false (H.264), uses the 1-byte
+    ///   header `byte0 & 0x1F`.
+    private static func nalTypesFromLengthPrefixed(_ b: [UInt8], nalUnitLength: Int, isHEVC: Bool = true) -> [(type: Int, size: Int)] {
         var result: [(Int, Int)] = []
         var i = 0
         let n = b.count
@@ -802,7 +875,9 @@ final class PacketFeeder {
             for k in 0..<nalUnitLength { len = (len << 8) | Int(b[i + k]) }
             i += nalUnitLength
             guard len > 0, i + len <= n else { break }
-            let nalType = Int((b[i] >> 1) & 0x3F)
+            let nalType = isHEVC
+                ? Int((b[i] >> 1) & 0x3F)   // HEVC: 6-bit type in bits [14:9] of 2-byte header
+                : Int(b[i] & 0x1F)           // H.264: 5-bit type in bits [4:0] of 1-byte header
             result.append((nalType, len))
             i += len
         }
@@ -818,15 +893,17 @@ final class PacketFeeder {
         packet:        DemuxPacket,
         fmt:           NALFormat,
         nalUnitLength: Int,
+        isHEVC:        Bool,
         diagIdx:       Int
     ) {
-        let tag = "[SampleDiag #\(diagIdx)]"
+        let codecTag = isHEVC ? "HEVC" : "H.264"
+        let tag = "[SampleDiag #\(diagIdx) \(codecTag)]"
 
         // Basic info
         let dtsStr = packet.dts.isValid
             ? String(format: "%.3f", packet.dts.seconds) + "s"
             : "invalid"
-        let dvStripped = normalized.count - stripped.count
+        let dvStripped = isHEVC ? (normalized.count - stripped.count) : 0
         feederLog("\(tag) sample idx=\(packet.index)  "
                 + "rawSize=\(raw.count)B  normalizedSize=\(normalized.count)B  "
                 + "strippedSize=\(stripped.count)B  dvRemoved=\(dvStripped)B  "
@@ -849,8 +926,9 @@ final class PacketFeeder {
         feederLog("\(tag) lpValid=\(lpValid)  nalUnitLength=\(nalUnitLength)  "
                 + "format=\(fmt == .annexB ? "AnnexB→converted" : "lengthPrefixed")")
 
-        // Parse NAL types from the normalized (length-prefixed) data
-        let nalList = nalTypesFromLengthPrefixed(normalized, nalUnitLength: nalUnitLength)
+        // Parse NAL types from the normalized (length-prefixed) data.
+        // isHEVC controls whether the HEVC 2-byte or H.264 1-byte header is used.
+        let nalList = nalTypesFromLengthPrefixed(normalized, nalUnitLength: nalUnitLength, isHEVC: isHEVC)
         feederLog("\(tag) NAL units found: \(nalList.count)")
         if nalList.isEmpty && normalized.count > nalUnitLength {
             // If the parse finds nothing in a non-empty buffer, the length field is probably
@@ -859,65 +937,62 @@ final class PacketFeeder {
             feederLog("\(tag) ⚠️  nalList empty — first8 of normalized: \(prefix8)  "
                     + "(if first 4 bytes look like a start code, Annex B detection missed)")
         }
-        // Log each NAL: type, size, and first 8 bytes of NAL payload (after
-        // the 2-byte HEVC NAL header) — this lets us see if VPS/SPS/PPS are
-        // plausible and slice data isn't garbled at the boundary.
+        // Log each NAL: type, size, and first 8 bytes of NAL payload.
+        // HEVC NAL header is 2 bytes; H.264 NAL header is 1 byte.
+        let nalHeaderSize = isHEVC ? 2 : 1
         var nalCursor = nalUnitLength   // skip first length prefix to get to byte 0 of first NAL
         for (i, (t, sz)) in nalList.enumerated() {
-            let naluStart = nalCursor   // first byte of HEVC NAL header
-            // Payload starts after 2-byte HEVC NAL header
-            let payloadStart = naluStart + 2
+            let naluStart    = nalCursor
+            let payloadStart = naluStart + nalHeaderSize
             let payloadBytes = payloadStart < normalized.count
                 ? normalized[payloadStart..<min(payloadStart + 8, normalized.count)]
                     .map { String(format: "%02X", $0) }.joined(separator: " ")
                 : "—"
-            feederLog("\(tag)   [\(i)] type=\(t) (\(hevcNALTypeName(t)))  size=\(sz)B  "
+            let typeName = isHEVC ? hevcNALTypeName(t) : avcNALTypeName(t)
+            feederLog("\(tag)   [\(i)] type=\(t) (\(typeName))  size=\(sz)B  "
                     + "payload[0..7]: \(payloadBytes)")
             nalCursor += sz + nalUnitLength   // advance past this NAL + next length prefix
         }
 
-        // IDR check
-        let isIDR  = nalList.contains { $0.type == 19 || $0.type == 20 }
-        let hasSPS = nalList.contains { $0.type == 33 }
-        let hasVPS = nalList.contains { $0.type == 32 }
-        let hasPPS = nalList.contains { $0.type == 34 }
-        feederLog("\(tag) IDR=\(isIDR ? "✅" : "❌")  "
-                + "VPS=\(hasVPS ? "✅" : "—")  SPS=\(hasSPS ? "✅" : "—")  PPS=\(hasPPS ? "✅" : "—")")
-
-        if packet.isKeyframe && !isIDR {
-            feederLog("\(tag) ⚠️  MKV marks this as keyframe but no IDR NAL found — "
-                    + "CRA or non-IDR keyframe; VT may need prior state")
-        }
-
-        // Dolby Vision detection
-        // Type 62 = Dolby Vision RPU (Reference Processing Unit) — tone-mapping metadata
-        // Type 63 = Dolby Vision EL overlay or proprietary extension
-        // Present in every frame of DV Profile 7 (dual-layer) and Profile 8 (single-layer) content.
-        //
-        // DV Profile 7 dual-layer MKV:
-        //   • This track (BL) is intentionally low-bitrate (~100-300 kbps) — a "compatibility signal".
-        //   • High quality lives in a separate EL track (typically track 2 in the MKV).
-        //   • Standard HEVC decoders (VideoToolbox) can only render the BL → blocky output is expected.
-        //   • Fix: find and decode the HDR10-compatible or non-DV video track, or use a DV-capable pipeline.
-        //
-        // DV Profile 8 single-layer MKV:
-        //   • This track IS the full-quality picture (HDR10-compatible BL).
-        //   • RPU (type 62) carries DV tone-mapping metadata — ignored by standard HEVC decoders.
-        //   • Quality should be full; if blocky, the issue is elsewhere (SPS mismatch, 10-bit display).
-        let hasDVRPU  = nalList.contains { $0.type == 62 }
-        let hasDVExt  = nalList.contains { $0.type == 63 }
-        let rpu62Size = nalList.filter { $0.type == 62 }.reduce(0) { $0 + $1.size }
-        let ext63Size = nalList.filter { $0.type == 63 }.reduce(0) { $0 + $1.size }
-        if hasDVRPU || hasDVExt {
-            let dvOverheadPct = (rpu62Size + ext63Size) * 100 / max(1, normalized.count)
-            feederLog("\(tag) 🎬 Dolby Vision NALs: "
-                    + "RPU(type62)=\(rpu62Size)B  ext(type63)=\(ext63Size)B  "
-                    + "DV-overhead=\(dvOverheadPct)% of frame  "
-                    + "payload(non-DV)=\(normalized.count - rpu62Size - ext63Size)B")
-            if normalized.count < 2000 && !isIDR {
-                feederLog("\(tag) ⚠️  Frame is \(normalized.count)B — likely DV Profile 7 Base Layer "
-                        + "(BL is intentionally low-bitrate; EL track carries full quality). "
-                        + "VideoToolbox renders BL only → expect heavy blocking.")
+        if isHEVC {
+            // HEVC: IDR = type 19 (IDR_W_RADL) or 20 (IDR_N_LP); CRA = 21
+            let isIDR  = nalList.contains { $0.type == 19 || $0.type == 20 }
+            let hasSPS = nalList.contains { $0.type == 33 }
+            let hasVPS = nalList.contains { $0.type == 32 }
+            let hasPPS = nalList.contains { $0.type == 34 }
+            feederLog("\(tag) IDR=\(isIDR ? "✅" : "❌")  "
+                    + "VPS=\(hasVPS ? "✅" : "—")  SPS=\(hasSPS ? "✅" : "—")  PPS=\(hasPPS ? "✅" : "—")")
+            if packet.isKeyframe && !isIDR {
+                feederLog("\(tag) ⚠️  MKV marks this as keyframe but no IDR NAL found — "
+                        + "CRA or non-IDR keyframe; VT may need prior state")
+            }
+            // Dolby Vision detection (HEVC only)
+            let hasDVRPU  = nalList.contains { $0.type == 62 }
+            let hasDVExt  = nalList.contains { $0.type == 63 }
+            let rpu62Size = nalList.filter { $0.type == 62 }.reduce(0) { $0 + $1.size }
+            let ext63Size = nalList.filter { $0.type == 63 }.reduce(0) { $0 + $1.size }
+            if hasDVRPU || hasDVExt {
+                let dvOverheadPct = (rpu62Size + ext63Size) * 100 / max(1, normalized.count)
+                feederLog("\(tag) 🎬 Dolby Vision NALs: "
+                        + "RPU(type62)=\(rpu62Size)B  ext(type63)=\(ext63Size)B  "
+                        + "DV-overhead=\(dvOverheadPct)% of frame  "
+                        + "payload(non-DV)=\(normalized.count - rpu62Size - ext63Size)B")
+                if normalized.count < 2000 && !isIDR {
+                    feederLog("\(tag) ⚠️  Frame is \(normalized.count)B — likely DV Profile 7 Base Layer "
+                            + "(BL is intentionally low-bitrate; EL track carries full quality). "
+                            + "VideoToolbox renders BL only → expect heavy blocking.")
+                }
+            }
+        } else {
+            // H.264: IDR = type 5; SPS = 7; PPS = 8
+            let isIDR  = nalList.contains { $0.type == 5 }
+            let hasSPS = nalList.contains { $0.type == 7 }
+            let hasPPS = nalList.contains { $0.type == 8 }
+            feederLog("\(tag) IDR=\(isIDR ? "✅" : "❌")  "
+                    + "SPS=\(hasSPS ? "✅" : "—")  PPS=\(hasPPS ? "✅" : "—")")
+            if packet.isKeyframe && !isIDR {
+                feederLog("\(tag) ⚠️  MKV marks this as keyframe but no IDR NAL (type 5) found — "
+                        + "VT may need prior state")
             }
         }
     }

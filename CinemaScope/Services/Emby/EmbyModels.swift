@@ -36,7 +36,7 @@ struct EmbyUser: Codable, Identifiable {
 
 // MARK: - Library
 
-struct EmbyLibrary: Codable, Identifiable {
+struct EmbyLibrary: Codable, Identifiable, Equatable {
     let id:           String
     let name:         String
     let collectionType: String?  // "movies", "tvshows", etc.
