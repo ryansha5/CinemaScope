@@ -55,18 +55,40 @@ final class FrameRenderer {
     /// Log per-frame layer status for this many frames, then go quiet.
     private static let kPerFrameStatusCount = 20
 
+    // MARK: - Video-only diagnostic mode
+    //
+    // When true, audioRenderer is NOT added to the synchronizer and audio
+    // samples are silently dropped in enqueueAudio().  This completely
+    // decouples audio from the shared AVSampleBufferRenderSynchronizer clock.
+    //
+    // PURPOSE: isolate whether a failing audio renderer (ParseAC3Header /
+    // AudioQueueObject Prime errors) is preventing the synchronizer timebase
+    // from running.  In a shared synchronizer, a renderer that fails to prime
+    // can block the clock for all attached renderers.
+    //
+    // Set to false to re-enable audio once video-only playback is confirmed.
+    static var videoOnlyDiagnostic: Bool = true
+
     // MARK: - Init
 
     init() {
         layer.videoGravity = .resizeAspect
         layer.backgroundColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
 
-        // Attach both renderers to the synchronizer.
-        // The synchronizer manages their shared timebase automatically.
         synchronizer.addRenderer(layer)
-        synchronizer.addRenderer(audioRenderer)
+
+        if FrameRenderer.videoOnlyDiagnostic {
+            // Audio renderer intentionally NOT attached — diagnostic mode.
+            fputs("[FrameRenderer] ⚠️ videoOnlyDiagnostic=true — "
+                + "audioRenderer NOT attached to synchronizer\n", stderr)
+        } else {
+            synchronizer.addRenderer(audioRenderer)
+        }
+
         synchronizer.rate = 0   // start paused
-        fputs("[FrameRenderer] Synchronizer created — layer + audioRenderer attached\n", stderr)
+        fputs("[FrameRenderer] Synchronizer created — "
+            + (FrameRenderer.videoOnlyDiagnostic ? "video-only" : "layer + audioRenderer")
+            + " attached\n", stderr)
     }
 
     // MARK: - Enqueue
@@ -151,7 +173,9 @@ final class FrameRenderer {
     }
 
     /// Enqueue one compressed audio CMSampleBuffer.
+    /// No-op when videoOnlyDiagnostic is true.
     func enqueueAudio(_ sampleBuffer: CMSampleBuffer) {
+        guard !FrameRenderer.videoOnlyDiagnostic else { return }
         audioRenderer.enqueue(sampleBuffer)
     }
 
@@ -233,7 +257,7 @@ final class FrameRenderer {
             self?.layer.stopRequestingMediaData()
         }
 
-        audioRenderer.flush()
+        if !FrameRenderer.videoOnlyDiagnostic { audioRenderer.flush() }
         framesEnqueued = 0
         firstFramePTS  = .invalid
         fputs("[FrameRenderer] flushAll() — layer + audio cleared, rate=0\n", stderr)
@@ -248,7 +272,7 @@ final class FrameRenderer {
 
     /// Flush only the audio renderer.
     func flushAudio() {
-        audioRenderer.flush()
+        if !FrameRenderer.videoOnlyDiagnostic { audioRenderer.flush() }
     }
 
     /// Flush both renderers in preparation for a seek.
@@ -280,7 +304,7 @@ final class FrameRenderer {
             self?.layer.stopRequestingMediaData()
         }
 
-        audioRenderer.flush()
+        if !FrameRenderer.videoOnlyDiagnostic { audioRenderer.flush() }
         framesEnqueued = 0
         firstFramePTS  = .invalid
         fputs("[FrameRenderer] flushForSeek() — pipeline quiesced, layer + audio cleared\n", stderr)
