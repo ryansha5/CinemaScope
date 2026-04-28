@@ -307,7 +307,8 @@ final class PacketFeeder {
         // complete GOPs.  Extension ≤ (gopSize−1) frames ≈ 23 frames for 24fps.
         // Only applied for MKV HEVC (fileOffset-sort path); MP4 is PTS-order and
         // does not need this.
-        if let mkv = mkvDemuxer, isHEVC {
+        let videoIsHEVC = CMFormatDescriptionGetMediaSubType(vFmt) == kCMVideoCodecType_HEVC
+        if let mkv = mkvDemuxer, videoIsHEVC {
             let desiredEnd = fromVideoIdx + limitedVideo
             if desiredEnd < videoSamplesTotal {
                 let nextIDR  = mkv.nextVideoKeyframeSampleIndex(from: desiredEnd)
