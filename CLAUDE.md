@@ -125,6 +125,27 @@ detected and filtered before reaching VideoToolbox.
   **Never apply the BL filter to non-DV HEVC** — legitimate HEVC frames in
   static scenes can be under 600 B.
 
+### 6. NAL format detection: LP check must come before start-code check (Sprint 53)
+
+`PacketFeeder.detectNALFormat` determines whether each video frame is Annex B
+or length-prefixed (LP) before handing it to VideoToolbox.
+
+**Never use a byte-prefix start-code fast-path before the LP validation.**
+
+For LP streams with a 4-byte length field, a NAL unit of 256–511 bytes has
+the LP prefix `00 00 01 XX`.  Bytes 0–2 match a 3-byte Annex B start code
+(`00 00 01`).  If the code returns `.annexB` based on that byte pattern,
+`convertAnnexBToLengthPrefixed` treats the `01` byte as the end of a 3-byte
+start code, shifts the entire NAL payload by 1 byte, and produces a corrupt
+HEVC NAL header.  VideoToolbox decodes the shifted bytes → visible distortion
+on every frame in that size range (~260–510 B, typical of non-reference/skip
+frames in low-motion scenes).
+
+**Correct order:**
+1. `isValidLengthPrefixed` — exact full-walk LP check (all bytes consumed)
+2. `looksLikeLPWithTrailingBytes` — LP with 1–3 trailing alignment bytes
+3. Fall back to `.annexB` only if both LP checks fail
+
 ### 5. Audio on dedicated audioSynchronizer, NOT the video synchronizer (Sprint 52)
 
 `AVSampleBufferRenderSynchronizer.setRate(1)` silently fails on tvOS when both

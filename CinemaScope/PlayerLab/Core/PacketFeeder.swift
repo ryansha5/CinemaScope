@@ -869,24 +869,63 @@ final class PacketFeeder {
     /// length-prefixed.
     ///
     /// Strategy:
-    ///   1. Try full LP validation with the expected `nalUnitLength`.
+    ///   1. Try exact full LP validation (`isValidLengthPrefixed`).
     ///      If every length field accounts for exactly the total buffer size,
     ///      the data is length-prefixed.
-    ///   2. Otherwise, treat as Annex B and convert.
+    ///   2. Try LP with trailing-byte tolerance (`looksLikeLPWithTrailingBytes`).
+    ///      Some MKV muxers append 1–3 alignment bytes after the last LP NAL;
+    ///      these cause the exact check to fail even though the data is LP.
+    ///   3. Otherwise fall back to Annex B conversion.
     ///
-    /// The old approach (check only bytes 0–3 for a start code) is kept as
-    /// a fast pre-filter: if the buffer literally starts with 00 00 00 01 or
-    /// 00 00 01 we know immediately it is Annex B without paying for the full
-    /// scan (avoids wasting time validating obviously Annex B data).
+    /// ⚠️  The former fast-path start-code checks are intentionally removed:
+    ///
+    ///   OLD (broken):
+    ///     if b[0]==0 && b[1]==0 && b[2]==1 { return .annexB }   // FALSE POSITIVE
+    ///
+    ///   For LP streams with 4-byte length fields and NAL sizes 256–511 bytes
+    ///   the length prefix is  00 00 01 XX  — b[2] == 1 is a coincidence of the
+    ///   size encoding, not an Annex B start code.  Returning .annexB here causes
+    ///   `convertAnnexBToLengthPrefixed` to treat `01` as the end of a 3-byte
+    ///   start code, shifting the entire NAL payload by one byte and feeding
+    ///   VideoToolbox a corrupt HEVC NAL header → visible distortion on every
+    ///   frame in that size range (~260–510 B, typical of non-reference/skip
+    ///   frames at low motion).
+    ///
+    ///   The full LP walk is the only reliable disambiguation.
     private static func detectNALFormat(_ b: [UInt8], nalUnitLength: Int) -> NALFormat {
-        // Fast path: definite Annex B start codes at byte 0
-        if b.count >= 4 && b[0] == 0 && b[1] == 0 && b[2] == 0 && b[3] == 1 { return .annexB }
-        if b.count >= 3 && b[0] == 0 && b[1] == 0 && b[2] == 1                { return .annexB }
-        // Slow path: full LP validation — only trust LP if every byte is
-        // accounted for by valid length-prefixed NAL units.
+        // Primary: exact LP validation — all bytes consumed by valid NAL units.
         if isValidLengthPrefixed(b, nalUnitLength: nalUnitLength) { return .lengthPrefixed }
-        // Validation failed → data is not valid LP; convert from Annex B.
+        // Secondary: LP with 1–(nalUnitLength-1) trailing padding bytes.
+        if looksLikeLPWithTrailingBytes(b, nalUnitLength: nalUnitLength) { return .lengthPrefixed }
+        // Neither LP check passed → data is not length-prefixed; convert from Annex B.
         return .annexB
+    }
+
+    /// Returns true when `b` looks like a length-prefixed NAL stream with a small
+    /// number of trailing padding/alignment bytes at the end.
+    ///
+    /// `isValidLengthPrefixed` requires `i == n` after the walk — it rejects buffers
+    /// whose last valid NAL ends before byte `n`.  This companion check succeeds when:
+    ///   • At least one complete LP NAL unit was parsed successfully, AND
+    ///   • The remaining bytes after the last valid NAL are fewer than `nalUnitLength`
+    ///     (i.e. not enough bytes to start another LP length field — they are padding,
+    ///     not a truncated NAL).
+    private static func looksLikeLPWithTrailingBytes(_ b: [UInt8], nalUnitLength: Int) -> Bool {
+        var i = 0
+        let n = b.count
+        var lastValidEnd = 0
+        while i < n {
+            guard i + nalUnitLength <= n else { break }
+            var len = 0
+            for k in 0..<nalUnitLength { len = (len << 8) | Int(b[i + k]) }
+            guard len > 0 else { break }
+            let naluEnd = i + nalUnitLength + len
+            guard naluEnd <= n else { break }
+            lastValidEnd = naluEnd
+            i = naluEnd
+        }
+        // At least one valid NAL found and the leftover is too small to be another NAL header.
+        return lastValidEnd > 0 && (n - lastValidEnd) < nalUnitLength
     }
 
     // MARK: - LP trailing-byte trimmer
