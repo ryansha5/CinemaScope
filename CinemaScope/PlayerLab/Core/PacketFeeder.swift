@@ -134,6 +134,37 @@ final class PacketFeeder {
     private var videoSamplesDiagnosed: Int = 0
     private static let kDiagnosticSampleCount = 20
 
+    // MARK: - Synthetic HEVC DTS (Sprint 50)
+    //
+    // HEVC MKV stores frames in decode order (non-monotonic PTS: IDR at 0.000,
+    // B-anchor at 0.209, B-frames at 0.125, 0.083, 0.042...).  Our pipeline
+    // fileOffset-sorts each batch, preserving decode order.  AVSampleBufferDisplayLayer
+    // requires a valid DTS to schedule decode before display reordering.  With
+    // dts=.invalid, the layer uses PTS as decode time, which causes B-frames that
+    // reference a future-PTS anchor to be scheduled before that anchor is decoded →
+    // chroma corruption on every affected B-frame group.
+    //
+    // Fix: synthesise DTS[n] = basePTS + n × frameDuration.  Each HEVC frame that
+    // completes makeVideoSampleBuffer increments the counter; BL-filtered frames
+    // do not (they never reach VideoToolbox).  Reset on prepare/stop (reset()) and
+    // seek (setCursors → resetHEVCDTSState()).
+
+    /// Monotonic counter for HEVC frames handed to VideoToolbox.
+    /// Skipped BL-filter frames do NOT count.
+    private var hevcDecodeCounter: Int = 0
+
+    /// PTS of the first HEVC frame after prepare/seek — the DTS origin.
+    /// Set on the very first makeVideoSampleBuffer call; reset on seek.
+    private var hevcDTSBasePTS: CMTime = .invalid
+
+    /// Duration of one HEVC video frame.
+    /// Derived once from videoSamplesTotal/duration; reset on prepare/stop only
+    /// (seek keeps it — same file, same fps).
+    private var hevcFrameDuration: CMTime = .invalid
+
+    /// Previous synthetic DTS — used to assert strict monotonicity each frame.
+    private var hevcLastSynthDTS: CMTime = .invalid
+
     // MARK: - Sprint 46: DV stripping toggle + BL frame filter
 
     /// Set to false to disable Dolby Vision NAL stripping entirely.
@@ -191,6 +222,10 @@ final class PacketFeeder {
         mkvDemuxer            = nil
         mp4Demuxer            = nil
         videoSamplesDiagnosed = 0
+        hevcDecodeCounter     = 0
+        hevcDTSBasePTS        = .invalid
+        hevcFrameDuration     = .invalid
+        hevcLastSynthDTS      = .invalid
     }
 
     // MARK: - Cursor teleport (seek)
@@ -202,6 +237,17 @@ final class PacketFeeder {
         nextAudioSampleIdx   = audioIdx
         lastEnqueuedVideoPTS = videoPTS
         lastEnqueuedAudioPTS = audioPTS
+        resetHEVCDTSState()
+    }
+
+    /// Reset the HEVC synthetic-DTS counter and base for a seek.
+    /// Called from setCursors() so the DTS sequence restarts from the seek IDR.
+    /// hevcFrameDuration is intentionally kept — same file, same fps.
+    private func resetHEVCDTSState() {
+        hevcDecodeCounter = 0
+        hevcDTSBasePTS    = .invalid
+        hevcLastSynthDTS  = .invalid
+        feederLog("[HEVC-DTS] state reset (seek/cursor reposition)")
     }
 
     // MARK: - Sample-count helpers
@@ -618,11 +664,95 @@ final class PacketFeeder {
             throw PlayerLabRenderError.blockBufferFailed(bbStatus)
         }
 
+        // ── Synthetic DTS for HEVC B-frame decode ordering ───────────────────
+        //
+        // H.264: frames arrive in PTS order (monotonic) → dts=.invalid is fine;
+        //        the layer treats PTS as decode time with no ill effect.
+        //
+        // HEVC: frames arrive in fileOffset (decode) order → PTS is non-monotonic
+        //        (e.g. 0.000, 0.209, 0.125, 0.083...).  With dts=.invalid the layer
+        //        uses PTS as decode time, scheduling B-frames before their reference
+        //        P-frame is decoded → chroma corruption every affected B-group.
+        //
+        //        Fix: DTS[n] = basePTS + n × frameDuration.  Strictly increasing,
+        //        matches decode (enqueue) order, gives the layer the ordering signal
+        //        it needs.  PTS is unchanged — display order is unaffected.
+        let decodeTSForBuffer: CMTime
+        if isHEVC {
+
+            // ── Derive frame duration (once, lazily) ──────────────────────────
+            // Primary: sampleCount / indexedDuration (set by prepare, accurate at
+            //          even the smallest initial window of 8–9 s of content).
+            // Fallback: 24 fps (covers the vast majority of cinematic content).
+            if !hevcFrameDuration.isValid {
+                if duration > 0, videoSamplesTotal > 0 {
+                    let fps = Double(videoSamplesTotal) / duration
+                    hevcFrameDuration = CMTime(seconds: 1.0 / fps,
+                                              preferredTimescale: 90_000)
+                    feederLog("[HEVC-DTS] frameDuration derived:"
+                            + " \(String(format: "%.6f", hevcFrameDuration.seconds))s"
+                            + " (fps=\(String(format: "%.4f", fps))"
+                            + " from \(videoSamplesTotal) samples"
+                            + " / \(String(format: "%.3f", duration))s)")
+                } else {
+                    hevcFrameDuration = CMTime(value: 3_750, timescale: 90_000) // 1/24 s
+                    feederLog("[HEVC-DTS] frameDuration fallback: 1/24 s"
+                            + " (videoSamplesTotal=\(videoSamplesTotal)"
+                            + " duration=\(duration))")
+                }
+            }
+
+            // ── Anchor base PTS on the first frame after prepare/seek ─────────
+            if !hevcDTSBasePTS.isValid {
+                hevcDTSBasePTS = packet.pts
+                feederLog("[HEVC-DTS] basePTS anchored:"
+                        + " \(String(format: "%.4f", hevcDTSBasePTS.seconds))s"
+                        + " (first HEVC frame after prepare/seek,"
+                        + " kf=\(packet.isKeyframe))")
+            }
+
+            // ── DTS[n] = basePTS + n × frameDuration ──────────────────────────
+            decodeTSForBuffer = CMTimeAdd(
+                hevcDTSBasePTS,
+                CMTimeMultiply(hevcFrameDuration, multiplier: Int32(hevcDecodeCounter))
+            )
+
+            // ── Diagnostic: first 20 HEVC frames ─────────────────────────────
+            if hevcDecodeCounter < 20 {
+                let delta = CMTimeSubtract(packet.pts, decodeTSForBuffer)
+                feederLog("[HEVC-DTS] [\(String(format: "%3d", hevcDecodeCounter))]"
+                        + "  off=\(packet.byteOffset)"
+                        + "  pts=\(String(format: "%.4f", packet.pts.seconds))s"
+                        + "  synDTS=\(String(format: "%.4f", decodeTSForBuffer.seconds))s"
+                        + "  Δ(pts-dts)=\(String(format: "%+.4f", delta.seconds))s"
+                        + "  kf=\(packet.isKeyframe)")
+            }
+
+            // ── Assert strict monotonicity ────────────────────────────────────
+            if hevcLastSynthDTS.isValid,
+               CMTimeCompare(decodeTSForBuffer, hevcLastSynthDTS) <= 0 {
+                feederLog("[HEVC-DTS] ❌ DTS did not increase!"
+                        + "  prev=\(String(format: "%.6f", hevcLastSynthDTS.seconds))s"
+                        + "  new=\(String(format: "%.6f", decodeTSForBuffer.seconds))s"
+                        + "  counter=\(hevcDecodeCounter)")
+                assertionFailure("[HEVC-DTS] synthetic DTS must strictly increase — "
+                               + "check hevcDecodeCounter/reset logic")
+            }
+            hevcLastSynthDTS = decodeTSForBuffer
+
+            // Counter increments after DTS is computed so counter 0 → DTS = basePTS.
+            hevcDecodeCounter += 1
+
+        } else {
+            // H.264: dts=.invalid correct — presentation order == decode order.
+            decodeTSForBuffer = packet.dts
+        }
+
         // ── CMSampleBuffer ────────────────────────────────────────────────────
         var timing = CMSampleTimingInfo(
             duration:              .invalid,
             presentationTimeStamp: packet.pts,
-            decodeTimeStamp:       packet.dts   // .invalid for video (Sprint 30 B-frame fix)
+            decodeTimeStamp:       decodeTSForBuffer
         )
         var sampleSize  = dataLen
         var sampleBuffer: CMSampleBuffer?

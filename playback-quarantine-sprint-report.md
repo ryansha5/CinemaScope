@@ -86,7 +86,9 @@ var isDolbyVisionDualLayer: Bool = false
 var isDolbyVisionDualLayer: Bool { firstVideoKeyframeIndex > 0 }
 ```
 
-`firstVideoKeyframeIndex` detects DV Profile 7 dual-layer structure by checking whether all inter-frames between the first two keyframes are tiny (< 200 B, characteristic of BL skip frames). A 2 KB guard on the first keyframe size was later added to prevent false positives from non-DV files with skip-coded frames near the start.
+`firstVideoKeyframeIndex` detects DV Profile 7 dual-layer structure by checking whether all inter-frames between the first two keyframes are tiny (< 200 B, characteristic of BL skip frames). A guard on the first keyframe size prevents false positives from non-DV files with skip-coded frames near the start.
+
+**Guard threshold correction (post-log analysis):** The guard was originally `< 2_000 B`. Log inspection revealed the test file's BL IDR is 3091 B — it includes VPS+SPS+PPS for the BL stream plus the BL IDR slice, pushing it above the original limit. Because 3091 B > 2000 B, the guard was firing and returning `firstKF = 0`, making `isDolbyVisionDualLayer = false` and disabling the BL filter entirely. BL skip frames (114–569 B) were reaching VideoToolbox, which cannot decode them against the EL bitstream profile, producing the observed corruption at consistent intervals. Threshold raised to `< 30_000 B`: observed BL IDR range is 114 B–3091 B; real HEVC IDRs at 1080p are always >> 30 KB at any reasonable quality.
 
 `PlayerLabPlaybackController.swift` — wired in the `.mkv` prepare case:
 ```swift
@@ -199,7 +201,7 @@ The dual-synchronizer approach is architecturally correct — the audio renderer
 | `Features/PlaybackQuarantine/PlaybackLabMinimalView.swift` | **New file** — full quarantine test UI |
 | `Features/Settings/SettingsView.swift` | Added "Quarantine Lab" entry point button |
 | `PlayerLab/Core/PacketFeeder.swift` | `isDolbyVisionDualLayer` instance flag; BL size filter gated on it; NAL stripping gated on `isHEVC`; codec detection split H.264 vs HEVC; `avcNalUnitLength` helper added; `trimLPTrailingBytes` fix for LP padding misclassification; `[HEVC-KF]`/`[HEVC-AnnexB]`/`[HEVC-HEAD/TAIL]` extended diagnostics |
-| `PlayerLab/Demux/MKV/MKVDemuxer.swift` | `isDolbyVisionDualLayer` computed property; `firstVideoKeyframeIndex` 3-condition DV detection with 2 KB first-keyframe guard |
+| `PlayerLab/Demux/MKV/MKVDemuxer.swift` | `isDolbyVisionDualLayer` computed property; `firstVideoKeyframeIndex` 3-condition DV detection; first-keyframe guard raised 2 KB → 30 KB (BL IDR on test file is 3091 B) |
 | `PlayerLab/Render/FrameRenderer.swift` | `videoOnlyDiagnostic` static → instance `let`; `init(videoOnly:)`; deferred `attachAudioRenderer()`; `audioRendererAttached` flag; all flush methods guard audio on `audioRendererAttached` |
 | `PlayerLab/Render/PlayerLabPlaybackController.swift` | `init(videoOnly:)` parameter; `feeder.isDolbyVisionDualLayer` wiring in `.mkv` prepare case; `attachAudioRenderer()` called after `activateAudioSession()` when `hasAudio` |
 | `Services/Emby/EmbyModels.swift` | `EmbyLibrary: Equatable` |
@@ -210,6 +212,6 @@ The dual-synchronizer approach is architecturally correct — the audio renderer
 
 | # | Issue | Severity | Next Step |
 |---|-------|----------|-----------|
-| 1 | Phase 3 HEVC distortion — specific frames corrupt, consistent position | High | **Fix applied** (`trimLPTrailingBytes`). Look for `[LP-Trim]` lines in the log at distortion timestamps to confirm. If no LP-Trim lines, inspect `[HEVC-AnnexB]` and `[HEVC-TAIL]` log lines for alternative causes. |
+| 1 | Phase 3 HEVC distortion — specific frames corrupt, consistent position | High | **Two fixes applied.** (a) `firstVideoKeyframeIndex` guard raised 2 KB → 30 KB so BL IDR at 3091 B is correctly detected; `isDolbyVisionDualLayer` now true; BL filter re-enabled. (b) `trimLPTrailingBytes` guards against LP trailing-byte misclassification. Rebuild and run — distortion should be gone. Check log for `isDolbyVisionDualLayer=true` in `[Prepare]` line to confirm DV detection. `[LP-Trim]` lines will appear if trailing-byte trimming also fires. |
 | 2 | Phase 4 — AVSampleBufferRenderSynchronizer clock stall with audio renderer on tvOS | High | Fix `PlayerLabDisplayView.updateUIView` to use identity check; re-implement dual-synchronizer; consider AVAudioEngine alternative |
 | 3 | Phase 3 buffering/stuttering | Low | Separate issue from distortion; investigate read-ahead depth and decoder queue pressure once distortion is resolved |

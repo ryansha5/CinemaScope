@@ -295,11 +295,13 @@ final class MKVDemuxer {
 
         // DV Profile 7 dual-layer detection — three conditions must all be true:
         //
-        // 1. The first keyframe is itself tiny (< 2 KB).
-        //    A real HEVC IDR at 1080p+ is always tens of kilobytes minimum.
-        //    A DV BL IDR is ~200–500 B.  This rules out non-DV files whose
-        //    first inter-frames happen to be skip-coded (near-zero bytes),
-        //    which would otherwise trigger condition 3 alone.
+        // 1. The first keyframe is small (< 30 KB).
+        //    A real HEVC IDR at 1080p+ with a full intra-coded slice is always
+        //    well above 30 KB at any reasonable quality.  A DV BL IDR carries
+        //    only VPS+SPS+PPS for the BL stream plus a BL skip/filler slice and
+        //    is typically 1–5 KB (observed: 114 B–3091 B across test files).
+        //    30 KB gives comfortable headroom above the largest observed BL IDR
+        //    while remaining far below any real HEVC IDR.
         //
         // 2. There is at least one inter-frame between the two keyframes.
         //    Back-to-back IDRs (scene cuts) have no preamble to examine.
@@ -307,7 +309,7 @@ final class MKVDemuxer {
         // 3. ALL inter-frames in that range are tiny (< 200 B).
         //    DV BL skip frames are ~110–130 B; a real 1080p P-frame is
         //    several hundred bytes minimum under normal encoder settings.
-        guard frameIndex[firstKF].size < 2_000 else { return firstKF }  // (1)
+        guard frameIndex[firstKF].size < 30_000 else { return firstKF }  // (1)
 
         let interRange = (firstKF + 1)..<secondKF
         guard !interRange.isEmpty else { return firstKF }                 // (2)
@@ -718,8 +720,9 @@ final class MKVDemuxer {
         let scanStart        = Date()
         var clusterCount     = 0
 
-        var cursor = backgroundScanCursor
-        let limit  = backgroundScanLimit
+        var cursor        = backgroundScanCursor
+        let limit         = backgroundScanLimit
+        var didEarlyExit  = false   // Sprint 50: guard post-loop cursor overwrite
 
         while cursor < limit {
             // Check for cooperative cancellation at each cluster boundary.
@@ -755,20 +758,54 @@ final class MKVDemuxer {
                 backgroundScanCursor = cursor + total
 
                 let indexedSec = frameIndex.last?.pts.seconds ?? 0
-                if indexedSec >= targetSeconds { break }
+                if indexedSec >= targetSeconds {
+                    // Sprint 50 fix: set flag so the post-loop assignment below
+                    // does NOT overwrite backgroundScanCursor with the stale
+                    // `cursor` value (which still points to the start of the
+                    // cluster we just finished — re-parsing it on the next call
+                    // would duplicate every frame and corrupt the index).
+                    didEarlyExit = true
+                    break
+                }
             }
 
             cursor += total
         }
 
-        // Final cursor update (advances past any trailing non-cluster elements).
-        backgroundScanCursor = cursor
+        // Final cursor update (advances past any trailing non-cluster elements
+        // when the loop exits naturally at EOF).
+        // Sprint 50: skip this when we broke out early — backgroundScanCursor
+        // was already set to cursor+total (start of next element) inside the
+        // loop, and overwriting it with the un-advanced `cursor` would re-
+        // introduce the duplication bug this fix is designed to prevent.
+        if !didEarlyExit {
+            backgroundScanCursor = cursor
+        }
         if cursor >= limit { isFullyIndexed = true }
 
         // Sort only the newly added slice (new frames have higher cluster timestamps,
         // so the sort is O(k log k) for the new k frames, not O(N log N) for all).
         if frameIndex.count > videoCountBefore {
             frameIndex[videoCountBefore...].sort { $0.pts < $1.pts }
+
+            // Sprint 50 debug: detect file-offset duplicates introduced by the
+            // startup-scan fence-post bug (backgroundScanCursor = cursor instead of
+            // cursor + total).  If this fires, two index entries share the same
+            // physical location — VideoToolbox will receive the same IDR twice,
+            // resetting decoder state mid-stream and producing chroma corruption.
+            var seenOffsets = Set<Int64>()
+            var dupCount = 0
+            for fi in frameIndex {
+                if !seenOffsets.insert(fi.fileOffset).inserted {
+                    dupCount += 1
+                    log("  [IndexDup] ⚠️  duplicate offset \(fi.fileOffset) pts=\(String(format: "%.3f", fi.pts.seconds))s kf=\(fi.isKeyframe)")
+                }
+            }
+            if dupCount == 0 {
+                log("  [IndexDup] ✅ no duplicate file offsets in frameIndex (\(frameIndex.count) entries)")
+            } else {
+                log("  [IndexDup] ❌ \(dupCount) duplicate offsets — frameIndex is corrupt")
+            }
         }
         if audioFrameIndex.count > audioCountBefore {
             audioFrameIndex[audioCountBefore...].sort { $0.pts < $1.pts }
@@ -1144,7 +1181,15 @@ final class MKVDemuxer {
                 // continueIndexing() resumes from backgroundScanCursor on-demand.
                 let indexedSec = frameIndex.last?.pts.seconds ?? 0
                 if indexedSec >= Self.startupScanSeconds {
-                    backgroundScanCursor = cursor  // resume point for background indexing
+                    // Sprint 50 fix: advance past the CURRENT cluster, not to its start.
+                    // Previously `backgroundScanCursor = cursor` pointed at the cluster
+                    // we just finished parsing.  continueIndexing() would then re-parse
+                    // the same cluster, duplicating every frame in its frameIndex entries
+                    // and causing the cross-batch IDR duplication that produced HEVC
+                    // chroma corruption.  Mirror the continueIndexing() pattern: set the
+                    // cursor to cursor + total (start of the NEXT element).
+                    let clusterTotal = Int64(hdrBytes) + (elem.payloadSize >= 0 ? elem.payloadSize : 0)
+                    backgroundScanCursor = cursor + clusterTotal
                     let elapsed = Date().timeIntervalSince(scanStart)
                     log("  [Startup] Startup index complete — "
                       + "\(String(format: "%.1f", indexedSec))s indexed  "
