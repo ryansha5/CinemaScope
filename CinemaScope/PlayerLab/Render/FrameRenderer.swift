@@ -218,9 +218,22 @@ final class FrameRenderer {
     /// Flush all enqueued frames (video + audio) and reset to initial state.
     /// Call before loading a new stream or before a seek.
     func flushAll() {
-        layer.flushAndRemoveImage()
-        audioRenderer.flush()
         synchronizer.rate = 0
+        layer.flushAndRemoveImage()
+
+        // Re-arm isReadyForMoreMediaData.
+        // flushAndRemoveImage() cancels the synchronizer's internal
+        // requestMediaDataWhenReady registration on the layer, leaving
+        // isReadyForMoreMediaData stuck at false permanently.  On the next
+        // prepare() + play() call, setRate(1) will silently refuse to run
+        // because the display layer's queue management is in a broken state.
+        // This one-shot request/stop cycle resets the flag immediately so the
+        // next enqueue + play() sequence works correctly.
+        layer.requestMediaDataWhenReady(on: .main) { [weak self] in
+            self?.layer.stopRequestingMediaData()
+        }
+
+        audioRenderer.flush()
         framesEnqueued = 0
         firstFramePTS  = .invalid
         fputs("[FrameRenderer] flushAll() — layer + audio cleared, rate=0\n", stderr)
