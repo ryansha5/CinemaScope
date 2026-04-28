@@ -828,6 +828,10 @@ final class PlayerLabPlaybackController: ObservableObject {
 
         // ── Phase 4: CLOCK — re-anchor synchronizer at keyframe PTS ──────────
         renderer.synchronizer.setRate(wasPlaying ? 1 : 0, time: keyframePTS)
+        // Sprint 52: re-anchor audio synchronizer to the same position.
+        if renderer.audioRendererAttached {
+            renderer.audioSynchronizer.setRate(wasPlaying ? 1 : 0, time: keyframePTS)
+        }
         // Update startPTS so that a subsequent play() call (from .ready state)
         // resumes from the seeked position instead of the original prepare() PTS.
         // Without this, play() calls renderer.play(from: prepareTimePTS) which
@@ -852,6 +856,10 @@ final class PlayerLabPlaybackController: ObservableObject {
         await seek(toFraction: 0)
         if wasPlaying, state != .playing {
             renderer.synchronizer.setRate(1, time: startPTS)
+            if renderer.audioRendererAttached {
+                renderer.audioSynchronizer.setRate(0, time: startPTS)
+                renderer.audioSynchronizer.setRate(1, time: .invalid)
+            }
             state = .playing
             startFeedLoop()
             startTimeTracking()
@@ -936,6 +944,13 @@ final class PlayerLabPlaybackController: ObservableObject {
                  + "a=\(feeder.nextAudioSampleIdx)/\(feeder.audioSamplesTotal)  "
                  + "indexedDur=\(idxDur)s  indexTask=\(idxTask)  "
                  + "fullyIndexed=\(fullyIdx)  [\(state.statusLabel)]")
+            // Sprint 52 / Phase 4: log both synchronizer clocks when audio is active.
+            // Key metric: aTbRate must be 1.0 — if 0.0 the dual-sync fix did not resolve
+            // the clock stall.  Also watch drift(A-V): should stay within ±20 ms.
+            if renderer.audioRendererAttached {
+                record("[P4-diag] \(renderer.dualSyncDiagnostic)  "
+                     + "audioRenderer.status=\(audioRendererStatusLabel())")
+            }
         }
 
         // ── Sprint 47 (rev 2): Proactive non-blocking background index extension ────
@@ -1031,6 +1046,8 @@ final class PlayerLabPlaybackController: ObservableObject {
             let taskState = backgroundIndexTask != nil ? "🔄 scanning" : "idle — waiting for network?"
             transition(to: .buffering, "underrun \(String(format: "%.2f", buffered))s")
             renderer.synchronizer.rate = 0
+            // Sprint 52: pause audio synchronizer on underrun too
+            if renderer.audioRendererAttached { renderer.audioSynchronizer.rate = 0 }
             record("[Buffer] UNDERRUN  video=\(String(format: "%.2f", buffered))s  "
                  + "audio=\(String(format: "%.2f", audioBuffered))s  "
                  + "nextV=\(feeder.nextVideoSampleIdx)/\(feeder.videoSamplesTotal)  "
@@ -1068,7 +1085,14 @@ final class PlayerLabPlaybackController: ObservableObject {
 
             if policy.isRecovered(bufferedSeconds: newBuf) {
                 transition(to: .playing, "buffer recovered \(String(format: "%.2f", newBuf))s")
-                renderer.synchronizer.setRate(1, time: renderer.currentTime)
+                let recoverTime = renderer.currentTime
+                renderer.synchronizer.setRate(1, time: recoverTime)
+                // Sprint 52: re-anchor audio synchronizer at current video time before resuming
+                // so it resumes from the same position (no A/V drift from the pause interval).
+                if renderer.audioRendererAttached {
+                    renderer.audioSynchronizer.setRate(0, time: recoverTime)
+                    renderer.audioSynchronizer.setRate(1, time: .invalid)
+                }
                 record("[Buffer] RESUME  video=\(String(format: "%.2f", newBuf))s")
             }
             return
@@ -1138,7 +1162,10 @@ final class PlayerLabPlaybackController: ObservableObject {
     // MARK: - End-of-stream  (Sprint 27)
 
     private func onPlaybackEnded() {
-        if state == .buffering { renderer.synchronizer.rate = 0 }
+        if state == .buffering {
+            renderer.synchronizer.rate = 0
+            if renderer.audioRendererAttached { renderer.audioSynchronizer.rate = 0 }
+        }
         stopFeedLoop()
         stopTimeTracking()
         subtitleCoordinator.onPlaybackEnded()   // SC5
@@ -1203,5 +1230,15 @@ final class PlayerLabPlaybackController: ObservableObject {
         if n < 1_048_576     { return String(format: "%.1f KB",  Double(n) / 1_024) }
         if n < 1_073_741_824 { return String(format: "%.2f MB",  Double(n) / 1_048_576) }
         return                        String(format: "%.2f GB",  Double(n) / 1_073_741_824)
+    }
+
+    // Sprint 52: helper for [P4-diag] log line.
+    private func audioRendererStatusLabel() -> String {
+        switch renderer.audioRenderer.status {
+        case .unknown:    return "unknown"
+        case .rendering:  return "rendering"
+        case .failed:     return "failed(\(renderer.audioRenderer.error?.localizedDescription ?? "?"))"
+        @unknown default: return "unknownFuture"
+        }
     }
 }
