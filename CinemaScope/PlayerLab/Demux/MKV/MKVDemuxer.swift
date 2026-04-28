@@ -1897,6 +1897,20 @@ final class MKVDemuxer {
         return frameIndex[index].pts
     }
 
+    /// Returns the index of the first keyframe at or after `startIndex`.
+    /// Returns `frameIndex.count` if no keyframe exists from `startIndex` onward.
+    ///
+    /// Used by PacketFeeder to snap batch boundaries to GOP boundaries so that
+    /// every extraction batch contains only complete GOPs and cross-batch
+    /// P→B reference dependencies never occur.
+    func nextVideoKeyframeSampleIndex(from startIndex: Int) -> Int {
+        guard startIndex >= 0 else { return 0 }
+        for i in startIndex..<frameIndex.count {
+            if frameIndex[i].isKeyframe { return i }
+        }
+        return frameIndex.count
+    }
+
     func findVideoKeyframeSampleIndex(nearestBeforePTS target: CMTime) -> Int {
         guard !frameIndex.isEmpty else { return 0 }
         var lo = 0, hi = frameIndex.count - 1, best = 0

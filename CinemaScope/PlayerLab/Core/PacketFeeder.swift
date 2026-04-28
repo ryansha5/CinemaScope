@@ -285,8 +285,42 @@ final class PacketFeeder {
         var result = FetchResult(label: label)
         guard let vFmt = videoFormatDesc else { return result }
 
-        let limitedVideo = min(videoCount, videoSamplesTotal - fromVideoIdx)
+        var limitedVideo = min(videoCount, videoSamplesTotal - fromVideoIdx)
         guard limitedVideo > 0 else { return result }
+
+        // ── Sprint 51: Snap batch end to next GOP (IDR) boundary ─────────────
+        //
+        // The frameIndex is sorted by PTS, so a batch of N frames starting at
+        // fromVideoIdx covers frames [fromVideoIdx, fromVideoIdx+N).  Inside
+        // extractVideoPackets those frames are RE-SORTED by fileOffset (decode
+        // order) before being handed to VideoToolbox.
+        //
+        // Problem: if the desired batch-end (fromVideoIdx+N) falls in the middle
+        // of a GOP, the B-frames of the last sub-GOP are included in this batch
+        // but their reference P-frame has a HIGHER PTS (→ higher index → next
+        // batch).  In fileOffset order the P-frame precedes the B-frames it
+        // anchors, so those B-frames end up at VT without a decoded reference
+        // frame → VideoToolbox produces deterministic chroma corruption at the
+        // same positions every run.
+        //
+        // Fix: extend limitedVideo so the batch ends at nextIDR−1, giving VT
+        // complete GOPs.  Extension ≤ (gopSize−1) frames ≈ 23 frames for 24fps.
+        // Only applied for MKV HEVC (fileOffset-sort path); MP4 is PTS-order and
+        // does not need this.
+        if let mkv = mkvDemuxer, isHEVC {
+            let desiredEnd = fromVideoIdx + limitedVideo
+            if desiredEnd < videoSamplesTotal {
+                let nextIDR  = mkv.nextVideoKeyframeSampleIndex(from: desiredEnd)
+                let extended = min(nextIDR, videoSamplesTotal) - fromVideoIdx
+                if extended > limitedVideo {
+                    feederLog("[fetchPackets] GOP-snap [\(label)]:"
+                            + " extended video batch \(limitedVideo)→\(extended)"
+                            + " (desiredEnd=\(desiredEnd) non-IDR"
+                            + " → nextIDR=\(nextIDR))")
+                    limitedVideo = extended
+                }
+            }
+        }
 
         // ── Video ─────────────────────────────────────────────────────────────
 
