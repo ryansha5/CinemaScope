@@ -95,27 +95,41 @@ record("[Prepare] isDolbyVisionDualLayer=\(r.demuxer.isDolbyVisionDualLayer)  "
      + "firstKF=\(r.demuxer.firstVideoKeyframeIndex)")
 ```
 
-#### Root cause 2 — unresolved ⚠️
+#### Root cause 2 — LP trailing-byte misclassification (fix applied, pending verification)
 
-After the above fix, distortion persists on a 1080p HEVC test file. Characteristics:
+After the DV BL filter fix, distortion persists on a 1080p HEVC test file. The DV-strip toggle was confirmed OFF → distortion persists, ruling out NAL stripping as the cause. Sprint 47's fileOffset-sort for decode order is already applied to both H.264 and HEVC in `MKVDemuxer.extractPackets`.
 
-- **Consistent** — always the same frames, not random
+**Updated characteristics:**
+- **Consistent** — always the same frames, every 20–30 seconds
 - **Onset** — clean through production logo splash screens, distortion begins when the main feature starts
 - **File is healthy** — plays perfectly in Infuse and Emby
 - **Not full-stream** — a few frames at a time distort, most of the stream is clean
 
-**Hypotheses (not yet tested):**
+**Confirmed ruled out:**
+1. ~~DV NAL stripping~~ — strip OFF still distorts
+2. ~~HEVC decode-order sort missing~~ — Sprint 47 already sorts both codecs by fileOffset
 
-1. `stripDolbyVisionNALs()` is incorrectly stripping legitimate NALs from non-DV frames. The NAL-level stripping pass (`if isHEVC && stripDolbyVisionNALsEnabled`) still runs on **all** HEVC files, not just DV ones. If this file has any NAL type 62/63 content (HDR10+ metadata, DV single-layer RPU, or encoder-specific use of reserved NAL types), those bytes would be removed from specific frames consistently.
-   - **Diagnostic:** toggle DV strip OFF in the sidebar → if distortion disappears, the stripping code is at fault and needs to be gated on `isDolbyVisionDualLayer` just like the size filter.
+**Active hypothesis — LP trailing-byte misclassification:**
 
-2. NAL unit boundary mis-parsing in `stripDolbyVisionNALs()` causing the function to misidentify legitimate NAL payload bytes as type 62/63 headers on certain frame data patterns.
+`isValidLengthPrefixed` requires `i == n` after walking all LP NAL units (all bytes consumed exactly). Some MKV muxers append 1–3 alignment/padding bytes after the last LP NAL. When this check fails for a specific frame, `detectNALFormat` falls back to `.annexB` and calls `convertAnnexBToLengthPrefixed` on data that is already correctly length-prefixed. Since HEVC LP payloads use RBSP encoding (emulation-prevention bytes prevent bare `00 00 01` patterns), the Annex B converter finds no start codes, produces empty output, and the frame is thrown as `.emptyPayload` and silently dropped. A dropped reference frame causes all B-frames that depend on it to produce corrupted output — "several clustered frames" at consistent positions every 20–30 seconds (matching the GOP keyframe interval of the main feature).
 
-3. B-frame decode order issue for HEVC content — Sprint 47 added decode-order sorting for H.264 B-frames; HEVC may have the same requirement but not the same fix.
+**Fix applied — `PacketFeeder.trimLPTrailingBytes`:**
 
-4. `firstVideoKeyframeIndex` heuristic still producing a false positive for this file, causing `isDolbyVisionDualLayer = true` and re-enabling the 600 B size filter. The 2 KB guard helps but may not be sufficient for all files.
+New private static function in `PacketFeeder.swift`. Walks the LP NAL units the same way as `isValidLengthPrefixed` but records `lastValidEnd` as it goes. After the walk, if `lastValidEnd < n`, trailing bytes are present — the data is trimmed to `lastValidEnd` and the trim is logged:
 
-**The single most valuable next step:** run the DV-strip toggle test (off = no stripping at all). If distortion disappears, the fix is to move the entire `stripDolbyVisionNALs()` call inside an `isDolbyVisionDualLayer` guard, not just the size filter.
+```
+[LP-Trim] trailing bytes removed  total=NNB  validLP=MMB  trailing=KB
+```
+
+`makeVideoSampleBuffer` now calls `trimLPTrailingBytes` in the LP branch instead of using `packet.data` directly. `isValidLengthPrefixed` and `detectNALFormat` are unchanged (still used in diagnostic logging).
+
+**New diagnostics added:**
+
+- `[HEVC-KF]` — logged for every HEVC keyframe: index, PTS, fileOffset, raw/norm size, format detected (LP vs AnnexB→LP), NAL type list. Reveals GOP structure and identifies any keyframes misclassified as Annex B.
+- `[HEVC-AnnexB]` — logged for any HEVC frame (beyond the first 20 SampleDiag frames) where `detectNALFormat` returns `.annexB`. Direct confirmation of LP validation failures on specific frames.
+- `[HEVC-{label}-HEAD/TAIL]` — logged for the first and last 3 packets of every HEVC video batch, in decode order (fileOffset-sorted). Shows batch boundary contents including PTS, fileOffset, keyframe flag, and size. Helps identify cross-batch B-frame reference gaps as a secondary hypothesis.
+
+**Verification:** If `[LP-Trim]` lines appear in the log for the frames at the distortion positions, the hypothesis is confirmed and the fix resolves it. If no `[LP-Trim]` lines appear, check `[HEVC-AnnexB]` lines for any non-keyframe Annex B detections, and `[HEVC-{label}-TAIL]` for batch boundary anomalies.
 
 ---
 
@@ -184,7 +198,7 @@ The dual-synchronizer approach is architecturally correct — the audio renderer
 |------|--------|
 | `Features/PlaybackQuarantine/PlaybackLabMinimalView.swift` | **New file** — full quarantine test UI |
 | `Features/Settings/SettingsView.swift` | Added "Quarantine Lab" entry point button |
-| `PlayerLab/Core/PacketFeeder.swift` | `isDolbyVisionDualLayer` instance flag; BL size filter gated on it; NAL stripping gated on `isHEVC`; codec detection split H.264 vs HEVC; `avcNalUnitLength` helper added |
+| `PlayerLab/Core/PacketFeeder.swift` | `isDolbyVisionDualLayer` instance flag; BL size filter gated on it; NAL stripping gated on `isHEVC`; codec detection split H.264 vs HEVC; `avcNalUnitLength` helper added; `trimLPTrailingBytes` fix for LP padding misclassification; `[HEVC-KF]`/`[HEVC-AnnexB]`/`[HEVC-HEAD/TAIL]` extended diagnostics |
 | `PlayerLab/Demux/MKV/MKVDemuxer.swift` | `isDolbyVisionDualLayer` computed property; `firstVideoKeyframeIndex` 3-condition DV detection with 2 KB first-keyframe guard |
 | `PlayerLab/Render/FrameRenderer.swift` | `videoOnlyDiagnostic` static → instance `let`; `init(videoOnly:)`; deferred `attachAudioRenderer()`; `audioRendererAttached` flag; all flush methods guard audio on `audioRendererAttached` |
 | `PlayerLab/Render/PlayerLabPlaybackController.swift` | `init(videoOnly:)` parameter; `feeder.isDolbyVisionDualLayer` wiring in `.mkv` prepare case; `attachAudioRenderer()` called after `activateAudioSession()` when `hasAudio` |
@@ -196,6 +210,6 @@ The dual-synchronizer approach is architecturally correct — the audio renderer
 
 | # | Issue | Severity | Next Step |
 |---|-------|----------|-----------|
-| 1 | Phase 3 HEVC distortion — specific frames corrupt, consistent position | High | Test with DV strip toggle OFF; if clean, gate `stripDolbyVisionNALs()` call on `isDolbyVisionDualLayer` |
+| 1 | Phase 3 HEVC distortion — specific frames corrupt, consistent position | High | **Fix applied** (`trimLPTrailingBytes`). Look for `[LP-Trim]` lines in the log at distortion timestamps to confirm. If no LP-Trim lines, inspect `[HEVC-AnnexB]` and `[HEVC-TAIL]` log lines for alternative causes. |
 | 2 | Phase 4 — AVSampleBufferRenderSynchronizer clock stall with audio renderer on tvOS | High | Fix `PlayerLabDisplayView.updateUIView` to use identity check; re-implement dual-synchronizer; consider AVAudioEngine alternative |
 | 3 | Phase 3 buffering/stuttering | Low | Separate issue from distortion; investigate read-ahead depth and decoder queue pressure once distortion is resolved |

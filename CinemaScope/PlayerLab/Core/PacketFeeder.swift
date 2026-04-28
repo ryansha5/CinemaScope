@@ -260,6 +260,28 @@ final class PacketFeeder {
             // Codec type — used for the BL frame filter and makeVideoSampleBuffer branching.
             let isHEVC = CMFormatDescriptionGetMediaSubType(vFmt) == kCMVideoCodecType_HEVC
 
+            // ── HEVC batch boundary diagnostic ────────────────────────────────
+            // Log the first and last 3 packets in the order delivered by the
+            // demuxer (decode / fileOffset order after Sprint 47 sort).  This
+            // lets us verify that B-frame reference frames are present at both
+            // ends of each batch and identify cross-batch reference gaps.
+            if isHEVC, !packets.isEmpty {
+                let n = packets.count
+                let logIndices: [Int] = n <= 6
+                    ? Array(0..<n)
+                    : [0, 1, 2, n-3, n-2, n-1]
+                for i in logIndices {
+                    let p    = packets[i]
+                    let pos  = (n <= 6 || i < 3) ? "HEAD" : "TAIL"
+                    feederLog("[HEVC-\(label)-\(pos)[\(i)/\(n)]]"
+                            + " idx=\(p.index)"
+                            + " pts=\(String(format: "%.3f", p.pts.seconds))s"
+                            + " off=\(p.byteOffset)"
+                            + " kf=\(p.isKeyframe)"
+                            + " sz=\(p.data.count)B")
+                }
+            }
+
             for pkt in packets {
                 // ── DV BL frame filter (HEVC / Dolby Vision only) ────────────────
                 // DV Profile 7 MKVs interleave Base Layer (BL) frames with
@@ -467,7 +489,52 @@ final class PacketFeeder {
             normalizedBytes = PacketFeeder.convertAnnexBToLengthPrefixed(rawBytes,
                                                                           nalUnitLength: nalUnitLength)
         } else {
-            normalizedBytes = packet.data
+            // LP format: trim any trailing padding bytes before handing to VT.
+            //
+            // Some MKV muxers append 1–3 alignment/padding bytes after the last
+            // LP NAL unit.  isValidLengthPrefixed requires i == n (all bytes
+            // consumed exactly) — trailing bytes make it return false, causing
+            // detectNALFormat to fall back to Annex B classification on data
+            // that is already correctly length-prefixed.  convertAnnexBToLengthPrefixed
+            // then finds no start codes in the LP payload and produces empty output,
+            // or in rare cases finds a false start code match and corrupts the frame.
+            //
+            // trimLPTrailingBytes walks the LP NAL units and returns the data
+            // trimmed to the last valid NAL boundary.  This is the fix for the
+            // "specific HEVC frames consistently distort" issue observed in Phase 3.
+            normalizedBytes = PacketFeeder.trimLPTrailingBytes(rawBytes,
+                                                               nalUnitLength: nalUnitLength,
+                                                               original: packet.data)
+        }
+
+        // ── HEVC extended diagnostics ──────────────────────────────────────────
+        //
+        // 1. Log all HEVC keyframes — gives us the GOP structure, IDR vs. CRA type,
+        //    and confirms the NAL format detected for each random-access point.
+        // 2. Log any Annex B detections beyond the first kDiagnosticSampleCount
+        //    frames — these indicate LP validation failures on specific frames,
+        //    which is the symptom the trailing-byte fix addresses.
+        if isHEVC {
+            if packet.isKeyframe {
+                let nalTypes = PacketFeeder.nalTypesFromLengthPrefixed(
+                    Array(normalizedBytes), nalUnitLength: nalUnitLength, isHEVC: true)
+                let typeDesc = nalTypes.isEmpty ? "—" : nalTypes.map {
+                    "\(PacketFeeder.hevcNALTypeName($0.type)):\($0.size)B"
+                }.joined(separator: " ")
+                feederLog("[HEVC-KF] idx=\(packet.index)"
+                        + "  pts=\(String(format: "%.3f", packet.pts.seconds))s"
+                        + "  offset=\(packet.byteOffset)"
+                        + "  raw=\(packet.data.count)B  norm=\(normalizedBytes.count)B"
+                        + "  fmt=\(fmt == .annexB ? "AnnexB→LP" : "LP")"
+                        + "  NALs: \(typeDesc)")
+            }
+            if fmt == .annexB && videoSamplesDiagnosed >= PacketFeeder.kDiagnosticSampleCount {
+                feederLog("[HEVC-AnnexB] idx=\(packet.index)"
+                        + "  pts=\(String(format: "%.3f", packet.pts.seconds))s"
+                        + "  offset=\(packet.byteOffset)"
+                        + "  size=\(packet.data.count)B"
+                        + "  ⚠️ LP validation failed → AnnexB conversion applied")
+            }
         }
 
         // Strip Dolby Vision NAL types 62 (RPU) and 63 (EL wrapper) before
@@ -655,6 +722,66 @@ final class PacketFeeder {
         if isValidLengthPrefixed(b, nalUnitLength: nalUnitLength) { return .lengthPrefixed }
         // Validation failed → data is not valid LP; convert from Annex B.
         return .annexB
+    }
+
+    // MARK: - LP trailing-byte trimmer
+
+    /// Walk `b` as length-prefixed HEVC/AVC NAL units and return a `Data`
+    /// slice that ends at the last complete NAL boundary, stripping any
+    /// trailing padding bytes that follow.
+    ///
+    /// **Why this is needed:**
+    /// `isValidLengthPrefixed` requires `i == n` after walking all NALs —
+    /// it rejects buffers with trailing bytes.  Some MKV muxers append 1–3
+    /// alignment/padding bytes after the last LP NAL unit (common with
+    /// 4-byte block alignment).  When that strict check fails, `detectNALFormat`
+    /// falls back to treating the buffer as Annex B and calls
+    /// `convertAnnexBToLengthPrefixed`.  Since HEVC LP payloads use RBSP
+    /// encoding (emulation-prevention bytes), there are no bare `00 00 01`
+    /// start codes inside them — the conversion produces empty output, the
+    /// sample is thrown as `.emptyPayload`, and the frame is silently dropped.
+    /// Dropped reference frames cause the consistent per-frame corruption seen
+    /// in Phase 3.
+    ///
+    /// - Returns: `original` unchanged when there are no trailing bytes
+    ///   (no allocation).  Returns a trimmed prefix when 1–3 trailing bytes
+    ///   are present, and logs the trim for diagnostic visibility.
+    ///   Returns `original` if the walk produces zero valid NALs (corrupt data
+    ///   — let downstream error handling deal with it rather than silently
+    ///   truncating).
+    private static func trimLPTrailingBytes(
+        _ b:           [UInt8],
+        nalUnitLength: Int,
+        original:      Data
+    ) -> Data {
+        var i            = 0
+        let n            = b.count
+        var lastValidEnd = 0
+
+        while i < n {
+            guard i + nalUnitLength <= n else { break }
+            var len = 0
+            for k in 0..<nalUnitLength { len = (len << 8) | Int(b[i + k]) }
+            guard len > 0 else { break }          // zero-length NAL → padding reached
+            let naluEnd = i + nalUnitLength + len
+            guard naluEnd <= n else { break }     // NAL overruns buffer → stop
+            lastValidEnd = naluEnd
+            i = naluEnd
+        }
+
+        // No valid NALs found at all — return original and let VT / error
+        // handling surface the problem rather than truncating to 0 bytes.
+        guard lastValidEnd > 0 else { return original }
+
+        // All bytes consumed — no trailing bytes, nothing to trim.
+        if lastValidEnd == n { return original }
+
+        // Trailing bytes found: trim and log.
+        let trailing = n - lastValidEnd
+        feederLog("[LP-Trim] trailing bytes removed"
+                + "  total=\(n)B  validLP=\(lastValidEnd)B  trailing=\(trailing)B"
+                + "  (MKV alignment padding — harmless once trimmed)")
+        return original.prefix(lastValidEnd)
     }
 
     // MARK: - DV NAL stripping
