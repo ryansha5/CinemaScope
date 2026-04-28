@@ -46,10 +46,10 @@ Tests the full custom pipeline — `MKVDemuxer` → `PacketFeeder` → `FrameRen
 
 ## Phase 3 — HEVC Custom Pipeline (videoOnly: true)
 
-**Status: ⚠️ PARTIAL — Video plays but periodic frame distortion unresolved**
+**Status: ✅ PASS — All distortion resolved (Sprints 50 + 51)**
 
 ### What works
-HEVC streams play back. Duration tracking, the feed loop, and seek all function. Audio is intentionally suppressed.
+HEVC streams play back cleanly at 3840×2160. Duration tracking, the feed loop, and seek all function. No corruption at any point in the file. Audio is intentionally suppressed (Phase 4 handles audio).
 
 ### Distortion investigation
 
@@ -137,7 +137,7 @@ New private static function in `PacketFeeder.swift`. Walks the LP NAL units the 
 
 ## Phase 4 — Audio Isolation (videoOnly: false)
 
-**Status: ❌ BLOCKED — AVSampleBufferRenderSynchronizer clock hard-stalls**
+**Status: ⏳ IN PROGRESS — Sprint 52 fix committed, pending device verification**
 
 ### What was attempted
 
@@ -182,15 +182,21 @@ The separate-synchronizer approach modified `PlayerLabDisplayView.updateUIView` 
 
 **All Phase 4 changes have been reverted.** Phase 3 code is restored to the state that preceded Phase 4 work (i.e., the `isDolbyVisionDualLayer` fix is present but the open distortion question remains).
 
-### Phase 4 path forward
+### Sprint 52 fix — dual-synchronizer architecture
 
-The dual-synchronizer approach is architecturally correct — the audio renderer must not share a synchronizer with the video display layer on tvOS. The implementation needs:
+`PlayerLabDisplayView.updateUIView` was already correct (resizes the layer only, never re-attaches), so the identity-check prerequisite from the earlier regression was already satisfied.
 
-1. `PlayerLabDisplayView.updateUIView` must only call `attachDisplayLayer` when the renderer *identity* changes (not on every prop update). Track the attached layer identity and compare before re-attaching.
+**Fix:** `FrameRenderer` now uses two synchronizers:
+- `synchronizer` — `AVSampleBufferDisplayLayer` only (video clock, unchanged from Phase 2/3)
+- `audioSynchronizer` — `AVSampleBufferAudioRenderer` only (new in Sprint 52)
 
-2. With two independent clocks, A/V sync requires manual drift correction or a clock-tying mechanism (e.g., a `CADisplayLink` that adjusts `audioSynchronizer`'s rate/offset based on the video timebase).
+`attachAudioRenderer()` now adds the audio renderer to `audioSynchronizer` instead of `synchronizer`. Both clocks are anchored to the same PTS in `play(from:)`, `resume()`, `seek(to:)`, and all direct `setRate` calls in the controller.
 
-3. Alternatively, investigate whether `AVAudioEngine` + `AVAudioPlayerNode` with manual PTS scheduling can replace `AVSampleBufferAudioRenderer` entirely, avoiding the synchronizer stall altogether.
+**Verification:** Run Phase 4 in Quarantine Lab and check the log for:
+```
+[FrameRenderer] [P4/Sprint52] aTbRate=1.0  ✅ clock running
+```
+If `aTbRate=0.0` (the stall persists even with separate synchronizers), the fallback is `AVAudioEngine` + `AVAudioPlayerNode` with manual PTS scheduling.
 
 ---
 
@@ -200,11 +206,12 @@ The dual-synchronizer approach is architecturally correct — the audio renderer
 |------|--------|
 | `Features/PlaybackQuarantine/PlaybackLabMinimalView.swift` | **New file** — full quarantine test UI |
 | `Features/Settings/SettingsView.swift` | Added "Quarantine Lab" entry point button |
-| `PlayerLab/Core/PacketFeeder.swift` | `isDolbyVisionDualLayer` instance flag; BL size filter gated on it; NAL stripping gated on `isHEVC`; codec detection split H.264 vs HEVC; `avcNalUnitLength` helper added; `trimLPTrailingBytes` fix for LP padding misclassification; `[HEVC-KF]`/`[HEVC-AnnexB]`/`[HEVC-HEAD/TAIL]` extended diagnostics |
-| `PlayerLab/Demux/MKV/MKVDemuxer.swift` | `isDolbyVisionDualLayer` computed property; `firstVideoKeyframeIndex` 3-condition DV detection; first-keyframe guard raised 2 KB → 30 KB (BL IDR on test file is 3091 B) |
-| `PlayerLab/Render/FrameRenderer.swift` | `videoOnlyDiagnostic` static → instance `let`; `init(videoOnly:)`; deferred `attachAudioRenderer()`; `audioRendererAttached` flag; all flush methods guard audio on `audioRendererAttached` |
-| `PlayerLab/Render/PlayerLabPlaybackController.swift` | `init(videoOnly:)` parameter; `feeder.isDolbyVisionDualLayer` wiring in `.mkv` prepare case; `attachAudioRenderer()` called after `activateAudioSession()` when `hasAudio` |
+| `PlayerLab/Core/PacketFeeder.swift` | `isDolbyVisionDualLayer` instance flag; BL size filter gated on it; NAL stripping gated on `isHEVC`; codec detection split H.264 vs HEVC; `avcNalUnitLength` helper added; `trimLPTrailingBytes` fix for LP padding misclassification; `[HEVC-KF]`/`[HEVC-AnnexB]`/`[HEVC-HEAD/TAIL]` extended diagnostics; **Sprint 51:** GOP-boundary batch snapping (`nextVideoKeyframeSampleIndex` + `limitedVideo` extension); **Sprint 50:** synthetic HEVC DTS |
+| `PlayerLab/Demux/MKV/MKVDemuxer.swift` | `isDolbyVisionDualLayer` computed property; `firstVideoKeyframeIndex` 3-condition DV detection; first-keyframe guard raised 2 KB → 30 KB (BL IDR on test file is 3091 B); **Sprint 50:** both `backgroundScanCursor` fence-post bugs fixed; `[IndexDup]` diagnostic; **Sprint 51:** `nextVideoKeyframeSampleIndex(from:)` |
+| `PlayerLab/Render/FrameRenderer.swift` | `videoOnlyDiagnostic` static → instance `let`; `init(videoOnly:)`; deferred `attachAudioRenderer()`; `audioRendererAttached` flag; all flush methods guard audio on `audioRendererAttached`; **Sprint 52:** `audioSynchronizer` (dedicated audio clock); all transport methods drive both clocks; `dualSyncDiagnostic` property; `[P4/Sprint52]` diagnostic in `play()` |
+| `PlayerLab/Render/PlayerLabPlaybackController.swift` | `init(videoOnly:)` parameter; `feeder.isDolbyVisionDualLayer` wiring in `.mkv` prepare case; `attachAudioRenderer()` called after `activateAudioSession()` when `hasAudio`; **Sprint 52:** all direct `renderer.synchronizer.setRate` calls also drive `audioSynchronizer`; `[P4-diag]` periodic dual-clock log; `audioRendererStatusLabel()` helper |
 | `Services/Emby/EmbyModels.swift` | `EmbyLibrary: Equatable` |
+| `CLAUDE.md` | **New file** — architectural reference: pipeline diagram, critical invariants, key files, diagnostics guide |
 
 ---
 
@@ -212,6 +219,6 @@ The dual-synchronizer approach is architecturally correct — the audio renderer
 
 | # | Issue | Severity | Next Step |
 |---|-------|----------|-----------|
-| 1 | Phase 3 HEVC distortion — specific frames corrupt, consistent position | High | **Two fixes applied.** (a) `firstVideoKeyframeIndex` guard raised 2 KB → 30 KB so BL IDR at 3091 B is correctly detected; `isDolbyVisionDualLayer` now true; BL filter re-enabled. (b) `trimLPTrailingBytes` guards against LP trailing-byte misclassification. Rebuild and run — distortion should be gone. Check log for `isDolbyVisionDualLayer=true` in `[Prepare]` line to confirm DV detection. `[LP-Trim]` lines will appear if trailing-byte trimming also fires. |
-| 2 | Phase 4 — AVSampleBufferRenderSynchronizer clock stall with audio renderer on tvOS | High | Fix `PlayerLabDisplayView.updateUIView` to use identity check; re-implement dual-synchronizer; consider AVAudioEngine alternative |
-| 3 | Phase 3 buffering/stuttering | Low | Separate issue from distortion; investigate read-ahead depth and decoder queue pressure once distortion is resolved |
+| 1 | ~~Phase 3 HEVC distortion~~ | ~~High~~ | ✅ **Resolved** — Sprint 50 (frameIndex fence-post + duplicate detection) + Sprint 51 (GOP-boundary batch snapping). Confirmed clean on 3840×2160 test file. |
+| 2 | Phase 4 — AVSampleBufferRenderSynchronizer clock stall with audio renderer on tvOS | High | Sprint 52 committed (`be0a1ec`). Dual-synchronizer architecture implemented. **Needs device run** — check log for `[P4/Sprint52] aTbRate=1.0 ✅`. Fallback if still stalled: AVAudioEngine + AVAudioPlayerNode. |
+| 3 | Phase 3 buffering/stuttering under heavy load | Low | Separate from distortion. Investigate read-ahead depth and decoder queue pressure once Phase 4 is confirmed. |
