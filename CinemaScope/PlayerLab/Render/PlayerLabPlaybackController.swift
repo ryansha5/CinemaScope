@@ -936,28 +936,31 @@ final class PlayerLabPlaybackController: ObservableObject {
         let rawTime   = renderer.currentTime.seconds
         let nowSec    = rawTime.isNaN ? currentTimeFloor : max(rawTime, currentTimeFloor)
 
-        // Sprint 59: two buffer depth measures.
+        // Sprint 59: two buffer depth measures — used for different purposes.
         //
         // optimisticBuffered — tail of frames handed to FrameRenderer.enqueueVideo().
         //   Advances immediately when frames are appended to pendingVideoQueue.
-        //   WRONG for threshold decisions: the display layer hasn't accepted these frames yet.
+        //   Correct for WATERMARK decisions: frames in pendingVideoQueue WILL drain
+        //   into the layer via requestMediaDataWhenReady before their PTS is reached.
+        //   They represent real buffer headroom against the playback clock.
         //
         // actualBuffered — tail of frames that have physically reached layer.enqueue()
-        //   inside FrameRenderer.performLayerEnqueue().  This is the real buffer depth.
-        //   The gap between the two is the "pending lag" — frames we think are buffered
-        //   but the layer will discard if the clock advances past them before delivery.
+        //   inside FrameRenderer.performLayerEnqueue().  The layer's internal queue
+        //   depth is ~50 frames (~2s), so this is always 1–2s regardless of how many
+        //   frames are in pendingVideoQueue.
+        //   Correct for UNDERRUN detection: if this hits zero, the clock has outrun
+        //   what the layer actually holds, regardless of what's in the pending queue.
         //
-        // All threshold decisions (underrun, low-watermark, recovery) use actualBuffered.
-        // optimisticBuffered is retained for the LOW WATERMARK refill-size calculation so
-        // we don't over-fetch when the pending queue is large and will drain soon.
+        // Watermark/refill decisions use optimisticBuffered.
+        // Underrun/recovery decisions use actualBuffered.
         let optimisticBuffered: Double = max(0, feeder.lastEnqueuedVideoPTS - nowSec)
         let actualLayerPTS = renderer.actualLayerEnqueuedMaxPTS
         let actualBuffered: Double = actualLayerPTS.isValid
             ? max(0, actualLayerPTS.seconds - nowSec)
             : optimisticBuffered  // no frames through layer yet (startup) — use feeder tail
 
-        let buffered  = actualBuffered
-        videoBuffered = buffered
+        let buffered  = optimisticBuffered   // watermark / refill uses feeder tail
+        videoBuffered = actualLayerPTS.isValid ? actualBuffered : optimisticBuffered
         audioBuffered = max(0, feeder.lastEnqueuedAudioPTS - nowSec)
 
         // ── Periodic log (Sprint 46 + Sprint 59 diagnostics) ─────────────────────
@@ -1068,7 +1071,7 @@ final class PlayerLabPlaybackController: ObservableObject {
             return
         }
 
-        // ── Underrun detection (Sprint 19) ────────────────────────────────────
+        // ── Underrun detection (Sprint 19 / Sprint 59) ───────────────────────
         //
         // NOTE: This block is intentionally placed BEFORE the cursor-exhausted
         // guard below (Sprint 58 fix).  The original placement had the cursor-
@@ -1078,14 +1081,22 @@ final class PlayerLabPlaybackController: ObservableObject {
         // with no frames to enqueue, frames fell "in the past" relative to the
         // synchronizer, and the display layer discarded them silently — causing
         // deterministic visual distortion at the start of every refill cycle.
-        if state == .playing && policy.isUnderrun(bufferedSeconds: buffered) {
+        //
+        // Sprint 59: underrun uses actualBuffered (what the layer physically holds),
+        // not optimisticBuffered (feeder tail including pendingVideoQueue).  A real
+        // underrun means the display layer's clock has nearly outrun its accepted
+        // frames — pendingVideoQueue headroom is irrelevant at that point if the
+        // layer's requestMediaDataWhenReady callback hasn't fired yet.
+        if state == .playing && policy.isUnderrun(bufferedSeconds: actualBuffered) {
             let idxDur   = mkvDemuxer.map { String(format: "%.1f", $0.indexedDurationSeconds) } ?? "—"
             let taskState = backgroundIndexTask != nil ? "🔄 scanning" : "idle — waiting for network?"
-            transition(to: .buffering, "underrun \(String(format: "%.2f", buffered))s")
+            transition(to: .buffering, "underrun actual=\(String(format: "%.2f", actualBuffered))s")
             renderer.synchronizer.rate = 0
             // Sprint 54: pause audio player on underrun
             if renderer.audioRendererAttached { renderer.pauseAudioPlayer() }
-            record("[Buffer] UNDERRUN  video=\(String(format: "%.2f", buffered))s  "
+            record("[Buffer] UNDERRUN  actualVideo=\(String(format: "%.2f", actualBuffered))s  "
+                 + "optVideo=\(String(format: "%.2f", buffered))s  "
+                 + "pendingQ=\(pendingQ)  "
                  + "audio=\(String(format: "%.2f", audioBuffered))s  "
                  + "nextV=\(feeder.nextVideoSampleIdx)/\(feeder.videoSamplesTotal)  "
                  + "indexedDur=\(idxDur)s  indexTask=\(taskState)  "
@@ -1161,13 +1172,15 @@ final class PlayerLabPlaybackController: ObservableObject {
 
         // ── Normal low-watermark refill (Sprint 17) ───────────────────────────
         //
-        // Sprint 59: threshold check uses actualBuffered (frames the layer has
-        // accepted) rather than optimisticBuffered (frames in pendingVideoQueue).
-        // refillSeconds uses optimisticBuffered so we don't over-fetch when the
-        // pending queue will drain shortly and fill the layer without a new HTTP fetch.
+        // Sprint 59: both threshold check and refill sizing use buffered =
+        // optimisticBuffered (feeder tail, including frames in pendingVideoQueue).
+        // Frames in pendingVideoQueue WILL drain into the layer via
+        // requestMediaDataWhenReady — they represent real buffer headroom.
+        // Using actualBuffered (layer-only, ~1-2s) here would create a permanent
+        // watermark trigger loop since the layer's internal queue is always shallow.
         guard policy.isLowWatermark(bufferedSeconds: buffered) else { return }
 
-        let toFill     = policy.refillSeconds(currentlyBuffered: optimisticBuffered)
+        let toFill     = policy.refillSeconds(currentlyBuffered: buffered)
         let videoCount = feeder.videoSamplesFor(seconds: toFill)
         record("[feed] ⚠️ LOW WATERMARK  "
              + "actualBuf=\(String(format: "%.2f", actualBuffered))s  "
