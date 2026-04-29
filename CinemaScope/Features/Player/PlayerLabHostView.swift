@@ -161,7 +161,12 @@ struct PlayerLabHostView: View {
             }
 
             controller.play()
-            sessionLog("PlayerLabHostView .task END (play() called)  sid=\(sid)")
+            // Sprint 68: log controller state immediately after play() so the log
+            // shows whether the state is .playing or if something transitioned it
+            // back to .buffering/.failed in the same run-loop turn.
+            sessionLog("PlayerLabHostView .task END (play() called)  "
+                     + "state=\(controller.state.statusLabel)  "
+                     + "sid=\(sid)")
         }
         // Sprint 44: kick off countdown when playback reaches .ended
         .onChange(of: controller.state) { _, newState in

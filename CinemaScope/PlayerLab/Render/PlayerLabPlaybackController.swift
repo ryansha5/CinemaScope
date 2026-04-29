@@ -495,7 +495,26 @@ final class PlayerLabPlaybackController: ObservableObject {
         // Activate AVAudioSession before the first audio buffer is enqueued,
         // then start the AVAudioEngine (Sprint 54 path).  Order matters:
         // AVAudioSession must be active before AVAudioEngine starts.
-        if hasAudio {
+        //
+        // Sprint 68: Gate on !renderer.videoOnlyDiagnostic.
+        //
+        // activateAudioSession() and startAudioEngine() are only meaningful when
+        // audio will actually be played.  When videoOnlyDiagnostic=true (the
+        // default for PlayerLabHostView), calling activateAudioSession() changes
+        // the system AVAudioSession category to .playback/.moviePlayback before
+        // the initial feedWindow call, which has been observed to interfere with
+        // AVSampleBufferRenderSynchronizer clock startup on tvOS — specifically,
+        // the synchronizer's timebase can remain at rate=0 after setRate(1) fires
+        // when the audio session route change notification arrives mid-setup.
+        //
+        // Phase 2 and Phase 3 (H.264/HEVC videoOnly) worked because their audio
+        // either fell back to AVPlayer or had no audio track — so activateAudioSession
+        // was never called.  H.264/AC3/PGS files via PlayerLabHostView expose this
+        // path for the first time in production context.
+        //
+        // With this guard, videoOnly=true runs identically to Phase 2/3 regardless
+        // of whether the file has an audio track.
+        if hasAudio && !renderer.videoOnlyDiagnostic {
             activateAudioSession()
             // Sprint 54: startAudioEngine replaces attachAudioRenderer.
             // AVSampleBufferAudioRenderer is gone — AVAudioEngine + AVAudioConverter
@@ -505,6 +524,11 @@ final class PlayerLabPlaybackController: ObservableObject {
             } else {
                 record("  ⚠️ [7] hasAudio=true but feeder.audioFormatDesc is nil — audio engine not started")
             }
+        } else if hasAudio {
+            // videoOnly=true: audio format description was built (for future use),
+            // but audio session and engine are intentionally skipped.
+            // The renderer's enqueueAudio() is also a no-op in this mode.
+            record("  ℹ️ [7] videoOnly=true — audio session and engine skipped (Sprint 68)")
         }
 
         // For Dolby Vision Profile 7 dual-layer MKV, the first MKV cluster
@@ -755,6 +779,19 @@ final class PlayerLabPlaybackController: ObservableObject {
             startFeedLoop()
             startTimeTracking()
             record("▶ play() — synchronizer at PTS=\(String(format: "%.4f", startPTS.seconds))s")
+            // Sprint 68: immediate post-play sanity check.
+            // Fires synchronously (same run-loop turn) so we can see layer and clock
+            // state before the first feed-loop cycle runs 100 ms later.
+            let vl68 = renderer.layer
+            let tbRate68 = CMTimebaseGetRate(renderer.synchronizer.timebase)
+            let tbTime68 = CMTimebaseGetTime(renderer.synchronizer.timebase)
+            record("[play-check] layer=\(renderer.layerStatusDescription)  "
+                 + "isReady=\(vl68.isReadyForMoreMediaData)  "
+                 + "pendingQ=\(renderer.pendingVideoQueueCount)  "
+                 + "framesEnqueued=\(renderer.framesEnqueued)  "
+                 + "tbRate=\(tbRate68)  "
+                 + "tbTime=\(tbTime68.isValid ? String(format: "%.4f", tbTime68.seconds) + "s" : "invalid")  "
+                 + "videoOnly=\(renderer.videoOnlyDiagnostic)")
         case .paused:
             renderer.resume()
             transition(to: .playing, "resume()")

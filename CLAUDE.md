@@ -386,6 +386,25 @@ Locations:
 - `PlayerLabHostView` — `let sessionID: UUID` input; `.task(id: url)` for defense-in-depth
   (restarts the task if `url` ever changes while the view is alive, even if identity holds).
 
+### Sprint 68 — videoOnly=true: skip activateAudioSession to prevent synchronizer interference
+
+**Root cause hypothesis:** `PlayerLabPlaybackController.prepare()` called `activateAudioSession()` unconditionally whenever `hasAudio=true`, including when `renderer.videoOnlyDiagnostic=true` (the default for `PlayerLabHostView`). Changing the system `AVAudioSession` category to `.playback / .moviePlayback` immediately before `feedWindow`'s `enqueueVideo` calls has been observed to interfere with `AVSampleBufferRenderSynchronizer` clock startup on tvOS — the synchronizer's timebase can remain at `rate=0` after `setRate(1)` if an audio route-change notification arrives during the setup window.
+
+**Why Phase 2/3 worked:** Those tests used files with no audio track (`hasAudio=false`) or the audio classification result was `.fallbackToAVPlayer` — meaning `activateAudioSession` was never reached. H.264/AC3/PGS files via `PlayerLabHostView` expose this path for the first time: AC3 is classified as direct-playback, `hasAudio=true`, and `activateAudioSession()` fires during the critical pre-play window.
+
+**Fix:** `activateAudioSession()` and `startAudioEngine()` are now gated on `!renderer.videoOnlyDiagnostic`. When `videoOnly=true`, both calls are skipped and a diagnostic log line is emitted instead. The video synchronizer setup is now identical to Phase 2/3 regardless of whether the file has an audio track.
+
+**Diagnostics added:**
+- `[play-check]` log line fires synchronously in `play()` (same run-loop turn) showing `layer.status`, `isReadyForMoreMediaData`, `pendingQ`, `framesEnqueued`, `tbRate`, `tbTime`, and `videoOnly` — the definitive snapshot of renderer state when playback starts.
+- `PlayerLabHostView .task END (play() called)  state=X` includes the controller state label right after `play()` so the log shows if the state is immediately `.playing` or if something transitioned it.
+
+**Never call `activateAudioSession()` when `renderer.videoOnlyDiagnostic=true`** — it changes the audio session category with no benefit and risks interfering with the video synchronizer during the critical pre-play window on tvOS.
+
+Locations:
+- `PlayerLabPlaybackController.prepare()` — `if hasAudio && !renderer.videoOnlyDiagnostic` guard replacing the unconditional `if hasAudio` block
+- `PlayerLabPlaybackController.play()` — `[play-check]` diagnostic block after `renderer.play(from:)`
+- `PlayerLabHostView.task` — updated `.task END` log includes `state=\(controller.state.statusLabel)`
+
 ---
 
 ## Key file locations
