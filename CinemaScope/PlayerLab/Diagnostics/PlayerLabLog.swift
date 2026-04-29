@@ -43,11 +43,20 @@ enum PlayerLabLog {
         // Truncate on every fresh launch so stale data doesn't confuse reads.
         truncate()
 
-        // freopen: redirect stderr → file (append mode so subsequent calls stack)
+        // freopen: redirect stderr → file (write mode, truncates on every launch)
         guard freopen(url.path, "w", stderr) != nil else {
             print("⚠️ [PlayerLabLog] freopen failed — logging to Xcode console only")
             return
         }
+
+        // Disable C stdio buffering on stderr so every fputs() call reaches the
+        // log file immediately.  Without this, the FILE* uses block-buffering
+        // (~4 KB default for a regular file) and any fputs() bytes sitting in the
+        // in-process buffer are silently lost when the process crashes.  Setting
+        // _IONBF makes the file write happen synchronously on every fputs() —
+        // slightly slower for high-volume logging but acceptable for diagnostics,
+        // and essential for seeing exactly where a crash cuts the log.
+        setvbuf(stderr, nil, _IONBF, 0)
 
         // Print the path to stdout (NOT stderr) so it remains visible in Xcode.
         print("📋 [PlayerLabLog] Logging to: \(url.path)")

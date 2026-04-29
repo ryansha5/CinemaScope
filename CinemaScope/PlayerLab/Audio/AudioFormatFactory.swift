@@ -170,19 +170,7 @@ enum AudioFormatFactory {
         // returns a fully-initialised object.  Without a layout the format description is
         // technically valid for CoreMedia but leaves AVAudioFormat with a nil/dangling internal
         // layout pointer — which causes AVAudioConverter(from:to:) to crash with EXC_BAD_ACCESS.
-        let layoutTag: AudioChannelLayoutTag
-        switch effCh {
-        case 1:  layoutTag = kAudioChannelLayoutTag_Mono
-        case 2:  layoutTag = kAudioChannelLayoutTag_Stereo
-        case 3:  layoutTag = kAudioChannelLayoutTag_MPEG_3_0_A
-        case 4:  layoutTag = kAudioChannelLayoutTag_MPEG_4_0_A
-        case 5:  layoutTag = kAudioChannelLayoutTag_MPEG_5_0_A
-        case 6:  layoutTag = kAudioChannelLayoutTag_MPEG_5_1_A  // L R C LFE Ls Rs
-        case 7:  layoutTag = kAudioChannelLayoutTag_MPEG_6_1_A
-        case 8:  layoutTag = kAudioChannelLayoutTag_MPEG_7_1_A
-        default: layoutTag = kAudioChannelLayoutTag_DiscreteInOrder
-                           | AudioChannelLayoutTag(effCh)
-        }
+        let layoutTag = channelLayoutTag(for: effCh)
         var layout = AudioChannelLayout()
         layout.mChannelLayoutTag         = layoutTag
         layout.mChannelBitmap            = AudioChannelBitmap(rawValue: 0)
@@ -216,6 +204,11 @@ enum AudioFormatFactory {
     // AC3 and EAC3 are self-framing — each DemuxPacket is a complete sync frame.
     // No magic cookie needed; the decoder initialises from the stream header.
     // Standard frame size for both is 1536 PCM samples.
+    //
+    // Sprint 65 fix: embed an explicit AudioChannelLayout in the description,
+    // mirroring the AAC path.  Without a layout, AVAudioFormat(cmAudioFormatDescription:)
+    // returns an object with sr=0 / ch=0 (nil ObjC object), which causes
+    // AVAudioConverter(from:to:) to crash with EXC_BAD_ACCESS.
 
     private static func makeAC3(
         channelCount: UInt16,
@@ -224,7 +217,8 @@ enum AudioFormatFactory {
         record:       (String) -> Void
     ) -> CMAudioFormatDescription? {
         let formatID: AudioFormatID = isEAC3 ? kAudioFormatEnhancedAC3 : kAudioFormatAC3
-        let label = isEAC3 ? "E-AC3" : "AC3"
+        let label    = isEAC3 ? "E-AC3" : "AC3"
+        let effCh    = channelCount > 0 ? channelCount : 6
         var asbd = AudioStreamBasicDescription(
             mSampleRate:       sampleRate > 0 ? sampleRate : 48_000,
             mFormatID:         formatID,
@@ -232,25 +226,38 @@ enum AudioFormatFactory {
             mBytesPerPacket:   0,
             mFramesPerPacket:  1536,
             mBytesPerFrame:    0,
-            mChannelsPerFrame: UInt32(channelCount > 0 ? channelCount : 6),
+            mChannelsPerFrame: UInt32(effCh),
             mBitsPerChannel:   0,
             mReserved:         0
         )
+
+        // Embed an explicit channel layout so that AVAudioFormat(cmAudioFormatDescription:)
+        // returns a fully-initialised object.  Same pattern as makeMPEG4AAC.
+        let layoutTag = channelLayoutTag(for: effCh)
+        var layout = AudioChannelLayout()
+        layout.mChannelLayoutTag          = layoutTag
+        layout.mChannelBitmap             = AudioChannelBitmap(rawValue: 0)
+        layout.mNumberChannelDescriptions = 0
+        let layoutSize = MemoryLayout<AudioChannelLayout>.size
+
         var desc: CMAudioFormatDescription?
-        let status = CMAudioFormatDescriptionCreate(
-            allocator:            kCFAllocatorDefault,
-            asbd:                 &asbd,
-            layoutSize:           0,
-            layout:               nil,
-            magicCookieSize:      0,
-            magicCookie:          nil,
-            extensions:           nil,
-            formatDescriptionOut: &desc
-        )
+        let status = withUnsafePointer(to: layout) { layoutPtr in
+            CMAudioFormatDescriptionCreate(
+                allocator:            kCFAllocatorDefault,
+                asbd:                 &asbd,
+                layoutSize:           layoutSize,
+                layout:               layoutPtr,
+                magicCookieSize:      0,
+                magicCookie:          nil,
+                extensions:           nil,
+                formatDescriptionOut: &desc
+            )
+        }
         if status != noErr {
             record("  ⚠️ CMAudioFormatDescriptionCreate (\(label)) failed: \(status)")
             return nil
         }
+        record("  ✅ \(label) format description  ch=\(effCh) sr=\(Int(sampleRate)) Hz")
         return desc
     }
 
@@ -278,6 +285,7 @@ enum AudioFormatFactory {
         // kAudioFormatDTS ('dtsc' = 0x64747363) — not exported by the tvOS SDK headers;
         // use the raw FourCC directly. Value is stable across all Apple platforms.
         let kAudioFormatDTScore: AudioFormatID = 0x64747363
+        let effCh = channelCount > 0 ? channelCount : 6
         var asbd = AudioStreamBasicDescription(
             mSampleRate:       sampleRate > 0 ? sampleRate : 48_000,
             mFormatID:         kAudioFormatDTScore,
@@ -285,28 +293,57 @@ enum AudioFormatFactory {
             mBytesPerPacket:   0,
             mFramesPerPacket:  512,
             mBytesPerFrame:    0,
-            mChannelsPerFrame: UInt32(channelCount > 0 ? channelCount : 6),
+            mChannelsPerFrame: UInt32(effCh),
             mBitsPerChannel:   0,
             mReserved:         0
         )
+
+        // Sprint 65: embed channel layout, same as AC3/AAC paths.
+        let layoutTag = channelLayoutTag(for: effCh)
+        var layout = AudioChannelLayout()
+        layout.mChannelLayoutTag          = layoutTag
+        layout.mChannelBitmap             = AudioChannelBitmap(rawValue: 0)
+        layout.mNumberChannelDescriptions = 0
+        let layoutSize = MemoryLayout<AudioChannelLayout>.size
+
         var desc: CMAudioFormatDescription?
-        let status = CMAudioFormatDescriptionCreate(
-            allocator:            kCFAllocatorDefault,
-            asbd:                 &asbd,
-            layoutSize:           0,
-            layout:               nil,
-            magicCookieSize:      0,
-            magicCookie:          nil,
-            extensions:           nil,
-            formatDescriptionOut: &desc
-        )
+        let status = withUnsafePointer(to: layout) { layoutPtr in
+            CMAudioFormatDescriptionCreate(
+                allocator:            kCFAllocatorDefault,
+                asbd:                 &asbd,
+                layoutSize:           layoutSize,
+                layout:               layoutPtr,
+                magicCookieSize:      0,
+                magicCookie:          nil,
+                extensions:           nil,
+                formatDescriptionOut: &desc
+            )
+        }
         if status != noErr {
             record("  ⚠️ CMAudioFormatDescriptionCreate (DTS-Core) failed: \(status)")
             return nil
         }
-        record("  ✅ DTS-Core format description  ch=\(channelCount) sr=\(Int(sampleRate)) Hz  "
+        record("  ✅ DTS-Core format description  ch=\(effCh) sr=\(Int(sampleRate)) Hz  "
              + "(attempting passthrough)")
         return desc
+    }
+
+    // MARK: - Shared channel layout helper
+
+    /// Returns the canonical `AudioChannelLayoutTag` for a given channel count.
+    /// Used by all codec paths so the mapping is consistent.
+    private static func channelLayoutTag(for ch: UInt16) -> AudioChannelLayoutTag {
+        switch ch {
+        case 1:  return kAudioChannelLayoutTag_Mono
+        case 2:  return kAudioChannelLayoutTag_Stereo
+        case 3:  return kAudioChannelLayoutTag_MPEG_3_0_A
+        case 4:  return kAudioChannelLayoutTag_MPEG_4_0_A
+        case 5:  return kAudioChannelLayoutTag_MPEG_5_0_A
+        case 6:  return kAudioChannelLayoutTag_MPEG_5_1_A
+        case 7:  return kAudioChannelLayoutTag_MPEG_6_1_A
+        case 8:  return kAudioChannelLayoutTag_MPEG_7_1_A
+        default: return kAudioChannelLayoutTag_DiscreteInOrder | AudioChannelLayoutTag(ch)
+        }
     }
 
     // MARK: - AudioSpecificConfig — channel count extractor

@@ -190,78 +190,84 @@ struct HomeView: View {
                     standardShell.transition(.opacity)
                 }
             }
+
+            // ── Sprint 43 / Sprint 67: PlayerLab full-screen player ───────────
+            //
+            // Sprint 67: replaced .fullScreenCover(item:) with a direct ZStack
+            // overlay.  On tvOS, fullScreenCover's system modal presentation did
+            // not reliably complete — the presented view's .task modifier never
+            // fired and prepare() was never called.  Rendering directly inside
+            // the ZStack uses SwiftUI's standard conditional-rendering lifecycle
+            // which is fully reliable on tvOS: .task fires as soon as the view
+            // enters the hierarchy, and is cancelled cleanly when pendingLabPlay
+            // is set back to nil (onExit / onFallback).
+            if let pending = pendingLabPlay {
+                PlayerLabHostView(
+                    url:         pending.url,
+                    startTicks:  pending.ticks,
+                    itemName:    pending.item.name,
+                    backdropURL: pending.backdrop,
+                    onExit: {
+                        pendingLabPlay = nil
+                    },
+                    onFallback: { reason in
+                        // PlayerLab could not play the content.  Dismiss and hand
+                        // off to AVPlayer using the already-resolved PlaybackResult
+                        // captured in PendingLabPlay — no second Emby round-trip.
+                        //
+                        // Note: if mode == .playerLabOnlyDebug we still fall back
+                        // so the app doesn't hang, but we log it loudly.
+                        print("[Route] PlayerLab fallback — reason='\(reason)' — switching to AVPlayer")
+                        if settings.playbackEngineMode == .playerLabOnlyDebug {
+                            print("[Route] ⚠️  mode=playerLabOnlyDebug but falling back anyway — AVPlayer takes over")
+                        }
+                        let cap = pending
+                        pendingLabPlay = nil
+                        // Brief async hop lets SwiftUI finish removing
+                        // PlayerLabHostView before AVPlayer's destination
+                        // change is applied.
+                        Task { @MainActor in
+                            try? await Task.sleep(nanoseconds: 150_000_000)
+                            launchAVPlayer(
+                                item:   cap.item,
+                                result: cap.result,
+                                ticks:  cap.ticks,
+                                server: cap.server,
+                                user:   cap.user,
+                                token:  cap.token
+                            )
+                        }
+                    },
+                    // Sprint 44: auto-play next — resolve in parallel with countdown.
+                    fetchNextCandidate: {
+                        guard let nextItem = await AutoPlayNextResolver.resolve(
+                            for:    pending.item,
+                            server: pending.server,
+                            userId: pending.user.id,
+                            token:  pending.token
+                        ) else { return nil }
+                        let backdropTag  = nextItem.backdropImageTags?.first
+                        let nextBackdrop: URL? = backdropTag.flatMap {
+                            URL(string: "\(pending.server.url)/Items/\(nextItem.id)/Images/Backdrop/0"
+                              + "?api_key=\(pending.token)&tag=\($0)")
+                        }
+                        return AutoPlayCandidate(item: nextItem, backdropURL: nextBackdrop)
+                    },
+                    onPlayNext: { nextItem in
+                        pendingLabPlay = nil
+                        Task { @MainActor in
+                            try? await Task.sleep(nanoseconds: 150_000_000)
+                            play(nextItem)
+                        }
+                    }
+                )
+                .ignoresSafeArea()
+                .transition(.opacity)
+                .zIndex(50)
+            }
         }
         .animation(.easeInOut(duration: 0.25), value: destination)
         .animation(.easeInOut(duration: 0.4),  value: settings.scopeUIEnabled)
-        // Sprint 43: PlayerLab full-screen cover.  onFallback hands off to AVPlayer
-        // using the already-resolved PlaybackResult so no second Emby round-trip.
-        .fullScreenCover(item: $pendingLabPlay) { pending in
-            PlayerLabHostView(
-                url:         pending.url,
-                startTicks:  pending.ticks,
-                itemName:    pending.item.name,
-                backdropURL: pending.backdrop,
-                onExit: {
-                    pendingLabPlay = nil
-                },
-                onFallback: { reason in
-                    // PlayerLab could not play the content.  Dismiss the cover and
-                    // hand off to AVPlayer using the Emby-provided result captured in
-                    // PendingLabPlay.  This result contains the TranscodingUrl /
-                    // DirectStreamUrl from Emby — NOT the raw stream URL that PlayerLab
-                    // was using.  AVPlayer can play this without any PlayerLab involvement.
-                    //
-                    // Note: if mode == .playerLabOnlyDebug we still fall back so the
-                    // app doesn't hang, but we log it loudly.
-                    print("[Route] PlayerLab fallback — reason='\(reason)' — switching to AVPlayer")
-                    if settings.playbackEngineMode == .playerLabOnlyDebug {
-                        print("[Route] ⚠️  mode=playerLabOnlyDebug but falling back anyway — AVPlayer takes over")
-                    }
-                    let cap = pending
-                    pendingLabPlay = nil
-                    // Brief async hop lets the fullScreenCover begin dismissal before
-                    // AVPlayer's destination change is applied.
-                    Task { @MainActor in
-                        try? await Task.sleep(nanoseconds: 150_000_000)
-                        launchAVPlayer(
-                            item:   cap.item,
-                            result: cap.result,
-                            ticks:  cap.ticks,
-                            server: cap.server,
-                            user:   cap.user,
-                            token:  cap.token
-                        )
-                    }
-                },
-                // Sprint 44 — Auto-play next: resolve the next item in parallel with
-                // the 5-second countdown, then dismiss the cover and play it.
-                fetchNextCandidate: {
-                    guard let nextItem = await AutoPlayNextResolver.resolve(
-                        for:    pending.item,
-                        server: pending.server,
-                        userId: pending.user.id,
-                        token:  pending.token
-                    ) else { return nil }
-                    // Build backdrop URL for the countdown overlay preview
-                    let backdropTag = nextItem.backdropImageTags?.first
-                    let nextBackdrop: URL? = backdropTag.flatMap {
-                        URL(string: "\(pending.server.url)/Items/\(nextItem.id)/Images/Backdrop/0"
-                          + "?api_key=\(pending.token)&tag=\($0)")
-                    }
-                    return AutoPlayCandidate(item: nextItem, backdropURL: nextBackdrop)
-                },
-                onPlayNext: { nextItem in
-                    // Dismiss the current cover, then play the next item.
-                    // The 150 ms pause matches the onFallback pattern to let
-                    // SwiftUI begin the cover dismissal animation first.
-                    pendingLabPlay = nil
-                    Task { @MainActor in
-                        try? await Task.sleep(nanoseconds: 150_000_000)
-                        play(nextItem)
-                    }
-                }
-            )
-        }
         .task {
             guard let server = session.server,
                   let user   = session.user,

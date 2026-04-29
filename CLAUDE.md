@@ -91,11 +91,27 @@ P-frames that are in the *next* batch.  Those P-frames haven't been decoded yet,
 so VT produces deterministic chroma corruption at the same positions every run.
 
 `PacketFeeder.fetchPackets` calls `MKVDemuxer.nextVideoKeyframeSampleIndex(from:)`
-to extend each batch to the next IDR.  **Removing this extension causes
-HEVC chroma corruption at GOP boundaries (~every 20–30 seconds).**
+to extend each batch to include the IDR frame at the next GOP boundary.
+**The IDR must be the last frame in the batch by PTS — and the first by
+fileOffset** (it is the forward-reference anchor for the tail B-frames).
+
+Sprint 64 root-cause fix: the snap calculation uses `nextIDR + 1` so the
+IDR itself is included in the batch.  Before Sprint 64 the formula was
+`min(nextIDR, videoSamplesTotal)` which ended the batch at `nextIDR-1` —
+one frame short.  The B-frames in the last mini-GOP (~12–16 frames) of
+each GOP all reference the IDR as their forward anchor; without it VT
+decoded them with a missing reference and produced deterministic corruption
+at every GOP boundary (~19.5 s, ~29 s, ~39.8 s before the 20/30/40 s IDRs).
+
+The next batch starts at `nextIDR + 1`.  VT's decoder state for
+`AVSampleBufferDisplayLayer` persists across enqueue calls, so the IDR
+decoded in batch N is available as a reference for batch N+1's inter-frames.
+
+**Removing the +1 or reverting to `min(nextIDR, …)` reintroduces the
+corruption at every GOP boundary.**
 
 Location: `PacketFeeder.fetchPackets` — the `if let mkv = mkvDemuxer, videoIsHEVC { ... }`
-GOP-snap block.
+GOP-snap block; the line `let extended = min(nextIDR + 1, videoSamplesTotal) - fromVideoIdx`.
 
 ### 3. backgroundScanCursor must advance past the parsed cluster
 
@@ -266,7 +282,7 @@ architecture confirmed this extends to the dedicated-synchronizer case too).
 `FrameRenderer` uses `AVAudioEngine` + `AVAudioConverter` + `AVAudioPlayerNode`:
 
 ```
-CMSampleBuffer (AAC)  →  AVAudioConverter (AAC → Float32 PCM)
+CMSampleBuffer (AAC/AC3/EAC3/DTS)  →  AVAudioConverter (compressed → Float32 PCM)
 →  AVAudioPlayerNode (sequential scheduling)  →  AVAudioEngine  →  output
 ```
 
@@ -281,6 +297,81 @@ CMSampleBuffer (AAC)  →  AVAudioConverter (AAC → Float32 PCM)
 **Never use `AVSampleBufferAudioRenderer` or `AVSampleBufferRenderSynchronizer`
 for audio on tvOS** — this is a confirmed platform bug with no known workaround
 short of bypassing the entire AVSampleBuffer audio stack.
+
+### Sprint 65 — AC3/EAC3/DTS channel layout requirement
+
+`AudioFormatFactory.makeAC3` and `makeDTSCore` previously created
+`CMAudioFormatDescription` objects with `layoutSize=0` (no channel layout).
+`AVAudioFormat(cmAudioFormatDescription:)` returns an object with `sr=0/ch=0`
+when the description has no layout — and `AVAudioConverter(from:to:)` then crashes
+with `EXC_BAD_ACCESS` because it dereferences the nil layout pointer inside Apple's
+framework.
+
+**Fix:** all codec paths in `AudioFormatFactory` (`makeMPEG4AAC`, `makeAC3`,
+`makeDTSCore`) now embed an explicit `AudioChannelLayout` via the shared
+`channelLayoutTag(for:)` helper.  `startAudioEngine` also has a defensive
+`sr > 0 && ch > 0` guard that logs and returns cleanly instead of crashing.
+
+**Never create a `CMAudioFormatDescription` for audio without an embedded channel
+layout if that description will be passed to `AVAudioFormat(cmAudioFormatDescription:)`.**
+
+Locations: `AudioFormatFactory.channelLayoutTag(for:)`, `FrameRenderer.startAudioEngine`.
+
+### Sprint 66 — DV P7 TV episode distortion: BL filter scope + CRA cold-start
+
+Two root causes of distortion on Dolby Vision Profile 7 TV episodes (vs. DV P7 movies
+that worked correctly):
+
+**Root cause A — BL size filter applied beyond preamble:**
+`PacketFeeder.fetchPackets` filtered any frame below `kDVBLFrameSizeThreshold` (600 B)
+when `isDolbyVisionDualLayer=true`, including legitimate EL B-frames throughout the
+entire file.  In a TV episode with a CRA keyframe at `firstVideoKeyframeIndex=24`, this
+dropped 83 of 227 frames (37%) from the initial batch — the missing frames created decode
+graph holes, which VideoToolbox rendered as wrong-color blocks and greyed-out backgrounds.
+
+**Fix A:** `PacketFeeder.dvBLPreambleEndIndex` (set to `mkv.firstVideoKeyframeIndex` by
+`prepare()`) gates the size filter.  The filter now only fires for frames whose index is
+strictly less than `dvBLPreambleEndIndex` — the BL-only preamble cluster.  EL frames at
+or beyond that index are never filtered by size regardless of their byte count.
+
+**Root cause B — Cold-starting HEVC decoder at CRA_NUT:**
+`firstVideoKeyframeIndex` returns the second keyframe in the file — the start of the EL
+track.  On some DV P7 encodes this keyframe is CRA_NUT (HEVC NAL type 21) rather than
+IDR_N_LP (type 20).  Cold-starting at a CRA without any prior decoder state causes RASL
+leading-picture corruption from frame 1 (RASL frames reference the CRA's pre-roll
+context which doesn't exist when starting cold).
+
+**Fix B:** `MKVDemuxer.firstIDRVideoKeyframeIndex(from:)` fetches the first 8 bytes of
+each candidate keyframe and checks the HEVC NAL unit type.  If the EL boundary is a CRA,
+it advances to the next keyframe and repeats until finding an IDR_N_LP (up to
+`maxKeyframesToCheck=6` keyframes before falling back).  `prepare()` calls this instead
+of using `firstVideoKeyframeIndex` directly as the cursor start.
+
+**Never apply the DV BL size filter to frames at or beyond `dvBLPreambleEndIndex`.**
+**Never cold-start the HEVC decoder at a CRA_NUT keyframe** — always find the nearest
+IDR_N_LP at or after the EL boundary.
+
+Locations:
+- `PacketFeeder.dvBLPreambleEndIndex` — property + gating condition in `fetchPackets`
+- `MKVDemuxer.videoFrameHEVCNALType(at:)` — small HTTP fetch to read NAL type
+- `MKVDemuxer.firstIDRVideoKeyframeIndex(from:)` — scan for safe IDR start
+- `PlayerLabPlaybackController.prepare()` — sets `dvBLPreambleEndIndex`, calls `firstIDRVideoKeyframeIndex`
+
+### Sprint 67 — PlayerLabHostView never called: fullScreenCover .task lifecycle on tvOS
+
+`HomeView` originally presented `PlayerLabHostView` via `.fullScreenCover(item: $pendingLabPlay)`.
+On tvOS, the system modal presentation chain for `fullScreenCover` does not reliably complete —
+the presented view's `.task` modifier never fires, so `prepare()` is never called.
+
+**Fix:** `PlayerLabHostView` is now rendered directly inside `HomeView.body`'s root `ZStack`
+as a conditional `if let pending = pendingLabPlay` overlay with `.zIndex(50)`.  This uses
+SwiftUI's standard conditional-rendering lifecycle (view enters hierarchy → `.task` fires
+immediately) which is fully reliable on tvOS.  The `fullScreenCover` modifier has been removed.
+
+**Never re-introduce `.fullScreenCover` for `PlayerLabHostView` on tvOS** — the
+`.task` lifecycle is broken for fullScreenCover on tvOS and prepare() will silently never run.
+
+Location: `HomeView.body` — `if let pending = pendingLabPlay` block inside the root `ZStack`.
 
 ---
 

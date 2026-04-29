@@ -117,6 +117,10 @@ final class PlayerLabPlaybackController: ObservableObject {
     @Published private(set) var availableAudioTracks: [MKVAudioTrackDescriptor] = []
     @Published private(set) var selectedAudioTrack:   MKVAudioTrackDescriptor?  = nil
 
+    /// Current synchronizer playback rate (1.0 = normal, 0.5 = half-speed).
+    /// Resets to 1.0 on stop() and whenever play() is called from .ready.
+    @Published private(set) var playbackRate: Double = 1.0
+
     /// Sprint 27: chapter list populated after parse.
     @Published private(set) var chapters: [ChapterInfo] = []
 
@@ -257,6 +261,7 @@ final class PlayerLabPlaybackController: ObservableObject {
         chapters             = []
         subtitleCoordinator.reset()   // SC5
         feeder.reset()
+        FrameDiagnosticStore.shared.reset()   // Sprint 61: clear ring buffer for new prepare
 
         renderer.flushAll()
         stopFeedLoop()
@@ -505,19 +510,45 @@ final class PlayerLabPlaybackController: ObservableObject {
         // For Dolby Vision Profile 7 dual-layer MKV, the first MKV cluster
         // contains BL-only skip frames (~110 B each) that a standard HEVC
         // decoder cannot decode.  firstVideoKeyframeIndex detects this pattern
-        // and returns the second keyframe (the EL IDR) as the usable start.
+        // and returns the second keyframe (the EL start) as the usable start.
         // Advance the feeder cursor past the BL preamble before filling the
         // initial window so VT never receives undecodeble BL frames.
+        //
+        // Sprint 66 — two additional fixes for DV P7 TV episode files:
+        //
+        // 1. BL preamble scope: Tell the feeder exactly where the BL preamble
+        //    ends so the BL size filter only suppresses the preamble frames (indices
+        //    0 ..< firstVideoKeyframeIndex) and never touches EL frames beyond.
+        //
+        // 2. CRA cold-start: DV P7 files sometimes begin the EL with a CRA_NUT
+        //    keyframe instead of IDR_N_LP.  Cold-starting at a CRA causes RASL
+        //    leading-picture corruption (decoder has no prior reference state).
+        //    firstIDRVideoKeyframeIndex(from:) fetches the first few bytes of each
+        //    candidate keyframe and advances past any leading CRAs to the first
+        //    true IDR_N_LP.
         if let mkv = mkvDemuxer {
-            let startIdx = mkv.firstVideoKeyframeIndex
-            if startIdx > 0 {
+            let preambleEnd = mkv.firstVideoKeyframeIndex   // exclusive upper bound of BL preamble
+            feeder.dvBLPreambleEndIndex = preambleEnd       // Fix 1: restrict BL filter to preamble
+
+            if preambleEnd > 0 {
+                // Fix 2: scan from preambleEnd to find the first IDR_N_LP (not CRA).
+                let startIdx = await mkv.firstIDRVideoKeyframeIndex(from: preambleEnd)
                 let startPTSsec = mkv.videoPTS(forSample: startIdx).seconds
+
+                let nalLabel: String
+                if startIdx > preambleEnd {
+                    nalLabel = "CRA→IDR advance: skipped \(startIdx - preambleEnd) frame(s)"
+                } else {
+                    // startIdx == preambleEnd — either already IDR, or nothing better found
+                    nalLabel = "EL boundary IDR (no CRA advance needed)"
+                }
                 feeder.setCursors(videoIdx: startIdx,
                                   audioIdx: 0,
                                   videoPTS: startPTSsec,
                                   audioPTS: 0)
-                record("[7] DV BL preamble detected — advancing video cursor to EL IDR  "
-                     + "idx=\(startIdx)  pts=\(String(format: "%.4f", startPTSsec))s")
+                record("[7] DV BL preamble detected  preambleEnd=\(preambleEnd)  "
+                     + "startIdx=\(startIdx)  pts=\(String(format: "%.4f", startPTSsec))s  "
+                     + nalLabel)
             }
         }
 
@@ -718,6 +749,7 @@ final class PlayerLabPlaybackController: ObservableObject {
     func play() {
         switch state {
         case .ready:
+            playbackRate = 1.0   // always start at normal speed
             renderer.play(from: startPTS)
             transition(to: .playing, "play()")
             startFeedLoop()
@@ -743,6 +775,19 @@ final class PlayerLabPlaybackController: ObservableObject {
         record("⏸ pause() — feed loop stopped, queues preserved")
     }
 
+    /// Set the synchronizer playback rate while video is active.
+    /// Audio is silenced at rates ≠ 1 to avoid A/V desync — this is a
+    /// diagnostic tool for isolating distortion timestamps, not a
+    /// production speed-change feature.
+    /// Only takes effect in .playing or .buffering state.
+    func setPlaybackRate(_ rate: Double) {
+        guard state == .playing || state == .buffering || state == .paused else { return }
+        let clamped = max(0.1, min(2.0, rate))
+        renderer.setPlaybackRate(Float(clamped))
+        playbackRate = clamped
+        record("⏩ rate → \(String(format: "%.1f", clamped))×")
+    }
+
     func stop() {
         renderer.flushAll()
         stopFeedLoop()
@@ -759,6 +804,7 @@ final class PlayerLabPlaybackController: ObservableObject {
         videoBuffered     = 0
         audioBuffered     = 0
         currentTimeFloor  = 0
+        playbackRate      = 1.0
         availableAudioTracks      = []
         selectedAudioTrack        = nil
         requestedAudioTrackNumber = nil
@@ -1323,5 +1369,21 @@ final class PlayerLabPlaybackController: ObservableObject {
     private func audioRendererStatusLabel() -> String {
         guard renderer.audioRendererAttached else { return "engine not started" }
         return renderer.playerNode.isPlaying ? "▶ playing" : "⏸ paused/stopped"
+    }
+
+    // MARK: - Sprint 61: Distortion-window diagnostic dump
+
+    /// Dump all frame-level diagnostic records within ±`window` seconds of the
+    /// given timestamp to the controller log.  Use from the Quarantine Lab UI
+    /// after a test run with a known-distorted timestamp to compare frame data
+    /// against a clean window at a different timestamp.
+    ///
+    /// Usage: enter the timestamp (seconds) in the "Diag Dump" field in the
+    /// Quarantine Lab sidebar and tap "Dump Window".
+    func dumpDistortionWindow(aroundSeconds ts: Double, window: Double = 3.0) {
+        let output = FrameDiagnosticStore.shared.dump(aroundPTS: ts, window: window)
+        for line in output.components(separatedBy: "\n") {
+            record(line)
+        }
     }
 }

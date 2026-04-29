@@ -60,10 +60,29 @@ struct PlaybackLabMinimalView: View {
     // MARK: Browser state
     @State private var libraries:      [EmbyLibrary] = []
     @State private var selectedLib:    EmbyLibrary?  = nil
-    @State private var items:          [EmbyItem]    = []
+    @State private var items:          [EmbyItem]    = []   // library-level (movies or series)
     @State private var selectedItem:   EmbyItem?     = nil
     @State private var isBrowseLoading: Bool         = false
     @State private var browseError:    String?       = nil
+
+    // MARK: TV drill-down navigation
+    /// Non-nil when the user has tapped a Series and we're showing its seasons.
+    @State private var drillSeries:  EmbyItem?  = nil
+    /// Non-nil when the user has tapped a Season and we're showing its episodes.
+    @State private var drillSeason:  EmbyItem?  = nil
+    @State private var seasons:      [EmbyItem] = []
+    @State private var episodes:     [EmbyItem] = []
+
+    /// Tracks the focused row by item ID.  Set programmatically after drill-downs
+    /// so the remote cursor lands on Season 1 / Episode 1 instead of jumping to
+    /// the top of the sidebar.
+    @FocusState private var focusedItemID: String?
+
+    // MARK: Search
+    @State private var searchQuery:   String     = ""
+    @State private var searchResults: [EmbyItem] = []
+    /// In-flight debounce task — cancelled and replaced on every keystroke.
+    @State private var searchTask:    Task<Void, Never>? = nil
 
     // MARK: Playback state
     @State private var phase:          QuarantinePhase = .phase2H264
@@ -75,6 +94,9 @@ struct PlaybackLabMinimalView: View {
     @State private var dvStripEnabled: Bool            = true
     @State private var logLines:       [String]        = []
     @State private var avPlayer:       AVPlayer?       = nil
+    /// Sprint 61: running count of distortion marks placed this session.
+    /// Resets to 0 whenever a new prepare() starts (state → .loading).
+    @State private var diagMarkCount: Int = 0
 
     // Phase 2/3 controller — audio renderer NOT attached.
     @StateObject private var controller      = PlayerLabPlaybackController(videoOnly: true)
@@ -105,13 +127,48 @@ struct PlaybackLabMinimalView: View {
         .task { await loadLibraries() }
         .onChange(of: selectedLib) { _, lib in
             guard let lib else { return }
+            // Reset drill-down whenever a new library is chosen
+            drillSeries = nil; drillSeason = nil
+            seasons = []; episodes = []
             Task { await loadItems(library: lib) }
+        }
+        .onChange(of: searchQuery) { _, query in
+            // Debounce: cancel the previous task and wait 300 ms before firing
+            searchTask?.cancel()
+            let trimmed = query.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty else { searchResults = []; return }
+            searchTask = Task {
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                guard !Task.isCancelled else { return }
+                await performSearch(query: trimmed)
+            }
         }
         .onChange(of: controller.state) { _, s in
             log("State → \(s.statusLabel)")
+            if s == .loading { diagMarkCount = 0 }   // Sprint 61: clear marks on new prepare
         }
         .onChange(of: audioController.state) { _, s in
-            if phase == .phase4Audio { log("State → \(s.statusLabel)") }
+            if phase == .phase4Audio {
+                log("State → \(s.statusLabel)")
+                if s == .loading { diagMarkCount = 0 }
+            }
+        }
+        // Focus management: land on Season 1 after drilling into a series,
+        // Episode 1 after drilling into a season.  The 80 ms delay gives SwiftUI
+        // one layout pass so the new list is in the hierarchy before we move focus.
+        .onChange(of: seasons) { _, newSeasons in
+            guard !newSeasons.isEmpty else { return }
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 80_000_000)
+                focusedItemID = newSeasons.first?.id
+            }
+        }
+        .onChange(of: episodes) { _, newEpisodes in
+            guard !newEpisodes.isEmpty else { return }
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 80_000_000)
+                focusedItemID = newEpisodes.first?.id
+            }
         }
     }
 
@@ -153,6 +210,12 @@ struct PlaybackLabMinimalView: View {
 
                     // DV strip toggle
                     dvStripSection
+
+                    Divider()
+                        .background(CinemaTheme.peacockLight.opacity(0.15))
+
+                    // Distortion-window diagnostic dump
+                    diagSection
 
                     Divider()
                         .background(CinemaTheme.peacockLight.opacity(0.15))
@@ -212,6 +275,71 @@ struct PlaybackLabMinimalView: View {
                 )
             }
             .buttonStyle(LabFocusButtonStyle())
+        }
+    }
+
+    // MARK: Diag Mark Section (Sprint 61)
+
+    private var diagSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("DISTORTION MARKS")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(CinemaTheme.textTertiary(settings.colorMode))
+                .kerning(1.5)
+
+            Text("Tap when you see distortion — or on a clean section for comparison. Each tap captures the current playback time and dumps a ±3 s frame window to the log.")
+                .font(.system(size: 12))
+                .foregroundStyle(CinemaTheme.textTertiary(settings.colorMode))
+                .fixedSize(horizontal: false, vertical: true)
+
+            // Mark buttons — active during playing or buffering only.
+            let isLive = activeController.state == .playing
+                      || activeController.state == .buffering
+
+            HStack(spacing: 8) {
+                // Distortion mark
+                Button {
+                    let t = activeController.currentTime
+                    diagMarkCount += 1
+                    log("[DiagDump] ── Mark #\(diagMarkCount) 🔴 DISTORTED  t=\(String(format: "%.3f", t))s ──")
+                    activeController.dumpDistortionWindow(aroundSeconds: t)
+                } label: {
+                    Label("Distorted", systemImage: "exclamationmark.circle.fill")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(isLive ? .white : CinemaTheme.textTertiary(settings.colorMode))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(isLive ? Color.red.opacity(0.75) : CinemaTheme.peacockDeep.opacity(0.4))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                }
+                .buttonStyle(LabFocusButtonStyle())
+                .disabled(!isLive)
+
+                // Clean reference mark
+                Button {
+                    let t = activeController.currentTime
+                    diagMarkCount += 1
+                    log("[DiagDump] ── Mark #\(diagMarkCount) ✅ CLEAN  t=\(String(format: "%.3f", t))s ──")
+                    activeController.dumpDistortionWindow(aroundSeconds: t)
+                } label: {
+                    Label("Clean", systemImage: "checkmark.circle.fill")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(isLive ? .white : CinemaTheme.textTertiary(settings.colorMode))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(isLive ? CinemaTheme.teal.opacity(0.7) : CinemaTheme.peacockDeep.opacity(0.4))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                }
+                .buttonStyle(LabFocusButtonStyle())
+                .disabled(!isLive)
+            }
+
+            // Mark count badge
+            if diagMarkCount > 0 {
+                Text("\(diagMarkCount) mark\(diagMarkCount == 1 ? "" : "s") this run")
+                    .font(.system(size: 11))
+                    .foregroundStyle(CinemaTheme.textTertiary(settings.colorMode))
+            }
         }
     }
 
@@ -288,10 +416,12 @@ struct PlaybackLabMinimalView: View {
                 .foregroundStyle(CinemaTheme.textTertiary(settings.colorMode))
                 .kerning(1.5)
 
+            // Search bar — always visible
+            searchBar
+
             if isBrowseLoading {
                 HStack {
-                    ProgressView()
-                        .scaleEffect(0.8)
+                    ProgressView().scaleEffect(0.8)
                     Text("Loading…")
                         .font(.system(size: 14))
                         .foregroundStyle(CinemaTheme.textTertiary(settings.colorMode))
@@ -301,50 +431,161 @@ struct PlaybackLabMinimalView: View {
                     .font(.system(size: 13))
                     .foregroundStyle(.red.opacity(0.8))
                     .fixedSize(horizontal: false, vertical: true)
-            } else {
-                // Library picker
-                if !libraries.isEmpty {
-                    libraryPicker
-                }
-
-                // Item list
-                if !items.isEmpty {
-                    itemList
-                } else if selectedLib != nil && !isBrowseLoading {
-                    Text("No items")
-                        .font(.system(size: 14))
+            } else if !searchQuery.isEmpty {
+                // ── Search results ────────────────────────────────────────
+                if searchResults.isEmpty {
+                    Text("No results for \"\(searchQuery)\"")
+                        .font(.system(size: 13))
                         .foregroundStyle(CinemaTheme.textTertiary(settings.colorMode))
+                } else {
+                    VStack(spacing: 6) {
+                        ForEach(searchResults) { item in
+                            itemRow(item, context: .search)
+                        }
+                    }
+                }
+            } else {
+                // ── Library browser ───────────────────────────────────────
+                if !libraries.isEmpty { libraryPicker }
+
+                if let season = drillSeason, let series = drillSeries {
+                    // Episode level
+                    navBackButton("← " + (season.name ?? "Season")) {
+                        let restoreID = season.id   // focus the season row we came from
+                        drillSeason = nil; episodes = []
+                        Task { @MainActor in
+                            try? await Task.sleep(nanoseconds: 80_000_000)
+                            focusedItemID = restoreID
+                        }
+                    }
+                    Text(series.name)
+                        .font(.system(size: 12))
+                        .foregroundStyle(CinemaTheme.textTertiary(settings.colorMode))
+                        .padding(.leading, 4)
+                    if episodes.isEmpty {
+                        Text("No episodes")
+                            .font(.system(size: 14))
+                            .foregroundStyle(CinemaTheme.textTertiary(settings.colorMode))
+                    } else {
+                        VStack(spacing: 6) {
+                            ForEach(episodes) { ep in
+                                itemRow(ep, context: .episode)
+                            }
+                        }
+                    }
+
+                } else if let series = drillSeries {
+                    // Season level
+                    navBackButton("← " + series.name) {
+                        let restoreID = series.id   // focus the series row we came from
+                        drillSeries = nil; seasons = []
+                        Task { @MainActor in
+                            try? await Task.sleep(nanoseconds: 80_000_000)
+                            focusedItemID = restoreID
+                        }
+                    }
+                    if seasons.isEmpty {
+                        Text("No seasons")
+                            .font(.system(size: 14))
+                            .foregroundStyle(CinemaTheme.textTertiary(settings.colorMode))
+                    } else {
+                        VStack(spacing: 6) {
+                            ForEach(seasons) { season in
+                                itemRow(season, context: .season(series))
+                            }
+                        }
+                    }
+
+                } else {
+                    // Library level
+                    if !items.isEmpty {
+                        VStack(spacing: 6) {
+                            ForEach(items) { item in
+                                itemRow(item, context: item.type == "Series" ? .series : .movie)
+                            }
+                        }
+                    } else if selectedLib != nil {
+                        Text("No items")
+                            .font(.system(size: 14))
+                            .foregroundStyle(CinemaTheme.textTertiary(settings.colorMode))
+                    }
                 }
             }
         }
     }
 
+    // MARK: - Search bar
+
+    private var searchBar: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 14))
+                .foregroundStyle(CinemaTheme.textTertiary(settings.colorMode))
+            TextField("Search movies & TV…", text: $searchQuery)
+                .font(.system(size: 14))
+                .foregroundStyle(CinemaTheme.textPrimary(settings.colorMode))
+                .autocorrectionDisabled()
+            if !searchQuery.isEmpty {
+                Button { searchQuery = "" } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 14))
+                        .foregroundStyle(CinemaTheme.textTertiary(settings.colorMode))
+                }
+                .buttonStyle(LabFocusButtonStyle())
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(CinemaTheme.peacockDeep.opacity(0.5))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(CinemaTheme.peacockLight.opacity(0.25), lineWidth: 1)
+        )
+    }
+
+    // MARK: - Nav back button
+
+    private func navBackButton(_ label: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 11, weight: .semibold))
+                Text(label)
+                    .font(.system(size: 13, weight: .medium))
+            }
+            .foregroundStyle(CinemaTheme.teal)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(CinemaTheme.teal.opacity(0.1))
+            .clipShape(RoundedRectangle(cornerRadius: 7))
+        }
+        .buttonStyle(LabFocusButtonStyle())
+    }
+
+    // MARK: - Library picker
+
     private var libraryPicker: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
                 ForEach(libraries) { lib in
-                    Button {
-                        selectedLib = lib
-                    } label: {
+                    Button { selectedLib = lib } label: {
                         Text(lib.name)
                             .font(.system(size: 13, weight: selectedLib?.id == lib.id ? .semibold : .regular))
-                            .foregroundStyle(selectedLib?.id == lib.id ? CinemaTheme.teal : CinemaTheme.textSecondary(settings.colorMode))
+                            .foregroundStyle(selectedLib?.id == lib.id
+                                ? CinemaTheme.teal
+                                : CinemaTheme.textSecondary(settings.colorMode))
                             .padding(.horizontal, 12)
                             .padding(.vertical, 6)
-                            .background(
-                                selectedLib?.id == lib.id
-                                    ? CinemaTheme.teal.opacity(0.15)
-                                    : CinemaTheme.peacockDeep.opacity(0.4)
-                            )
+                            .background(selectedLib?.id == lib.id
+                                ? CinemaTheme.teal.opacity(0.15)
+                                : CinemaTheme.peacockDeep.opacity(0.4))
                             .clipShape(Capsule())
-                            .overlay(
-                                Capsule()
-                                    .strokeBorder(
-                                        selectedLib?.id == lib.id
-                                            ? CinemaTheme.teal.opacity(0.5)
-                                            : CinemaTheme.peacockLight.opacity(0.2),
-                                        lineWidth: 1)
-                            )
+                            .overlay(Capsule().strokeBorder(
+                                selectedLib?.id == lib.id
+                                    ? CinemaTheme.teal.opacity(0.5)
+                                    : CinemaTheme.peacockLight.opacity(0.2),
+                                lineWidth: 1))
                     }
                     .buttonStyle(LabFocusButtonStyle())
                 }
@@ -352,43 +593,96 @@ struct PlaybackLabMinimalView: View {
         }
     }
 
-    private var itemList: some View {
-        VStack(spacing: 6) {
-            ForEach(items) { item in
-                itemRow(item)
-            }
-        }
+    // MARK: - Unified item row
+
+    /// Context tells the row what kind of item it's rendering and how tapping behaves.
+    private enum ItemRowContext {
+        case movie                       // tap → select for playback
+        case series                      // tap → drill into seasons
+        case season(EmbyItem)            // tap → drill into episodes; carries parent series
+        case episode                     // tap → select for playback
+        case search                      // auto-detect from item.type
     }
 
-    private func itemRow(_ item: EmbyItem) -> some View {
+    private func itemRow(_ item: EmbyItem, context: ItemRowContext) -> some View {
         let isSelected = selectedItem?.id == item.id
+
+        // Resolve effective context for search results
+        let effective: ItemRowContext
+        if case .search = context {
+            effective = item.type == "Series" ? .series : .movie
+        } else {
+            effective = context
+        }
+
+        let drills: Bool
+        switch effective {
+        case .series, .season: drills = true
+        default:               drills = false
+        }
+
+        let isEpisode: Bool
+        if case .episode = effective { isEpisode = true } else { isEpisode = false }
+        let thumbSize = isEpisode
+            ? CGSize(width: 80, height: 45)
+            : CGSize(width: 36, height: 54)
+
         return Button {
-            selectedItem = item
-            log("Selected: \(item.name) (\(item.productionYear.map{"\($0)"} ?? "—"))")
+            switch effective {
+            case .series:
+                Task { await loadSeasons(for: item) }
+            case .season(let series):
+                Task { await loadEpisodes(for: item, series: series) }
+            case .movie, .episode, .search:
+                selectedItem = item
+                log("Selected: \(item.quarantineDisplayTitle)")
+            }
         } label: {
             HStack(spacing: 12) {
-                // Poster thumbnail
-                posterView(item: item, size: CGSize(width: 36, height: 54))
+                // Thumbnail — portrait for movies/series, landscape for episodes
+                posterView(item: item, size: thumbSize,
+                           preferThumb: isEpisode)
 
                 VStack(alignment: .leading, spacing: 3) {
+                    // Episode badge
+                    if case .episode = effective,
+                       let s = item.parentIndexNumber,
+                       let e = item.indexNumber {
+                        Text("S\(s)E\(e)")
+                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                            .foregroundStyle(CinemaTheme.teal)
+                            .padding(.horizontal, 5).padding(.vertical, 1)
+                            .background(CinemaTheme.teal.opacity(0.15))
+                            .clipShape(RoundedRectangle(cornerRadius: 4))
+                    }
+
                     Text(item.name)
-                        .font(.system(size: 15, weight: isSelected ? .semibold : .regular))
+                        .font(.system(size: 14, weight: isSelected ? .semibold : .regular))
                         .foregroundStyle(isSelected ? .white : CinemaTheme.textSecondary(settings.colorMode))
                         .lineLimit(2)
-                    if let year = item.productionYear {
-                        Text("\(year)")
-                            .font(.system(size: 12))
-                            .foregroundStyle(CinemaTheme.textTertiary(settings.colorMode))
+
+                    HStack(spacing: 6) {
+                        if let year = item.productionYear {
+                            Text("\(year)")
+                                .font(.system(size: 11))
+                                .foregroundStyle(CinemaTheme.textTertiary(settings.colorMode))
+                        }
+                        if item.type == "Series" {
+                            typeBadge("TV", color: .blue)
+                        }
+                        if let mins = item.runtimeMinutes, mins > 0 {
+                            Text("\(mins)m")
+                                .font(.system(size: 11))
+                                .foregroundStyle(CinemaTheme.textTertiary(settings.colorMode))
+                        }
                     }
                 }
 
                 Spacer()
 
-                if isSelected {
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 12))
-                        .foregroundStyle(CinemaTheme.teal)
-                }
+                Image(systemName: drills ? "chevron.right" : (isSelected ? "checkmark" : ""))
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(CinemaTheme.teal)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
@@ -396,20 +690,34 @@ struct PlaybackLabMinimalView: View {
                 ? CinemaTheme.teal.opacity(0.12)
                 : Color.white.opacity(0.03))
             .clipShape(RoundedRectangle(cornerRadius: 8))
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .strokeBorder(isSelected
-                        ? CinemaTheme.teal.opacity(0.35)
-                        : Color.clear, lineWidth: 1)
-            )
+            .overlay(RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(isSelected
+                    ? CinemaTheme.teal.opacity(0.35)
+                    : Color.clear, lineWidth: 1))
         }
         .buttonStyle(LabFocusButtonStyle())
+        .focused($focusedItemID, equals: item.id)
     }
 
+    private func typeBadge(_ label: String, color: Color) -> some View {
+        Text(label)
+            .font(.system(size: 10, weight: .semibold))
+            .foregroundStyle(color.opacity(0.9))
+            .padding(.horizontal, 5).padding(.vertical, 1)
+            .background(color.opacity(0.15))
+            .clipShape(RoundedRectangle(cornerRadius: 4))
+    }
+
+    // MARK: - Poster / thumbnail
+
     @ViewBuilder
-    private func posterView(item: EmbyItem, size: CGSize) -> some View {
+    private func posterView(item: EmbyItem, size: CGSize,
+                            preferThumb: Bool = false) -> some View {
         if let server = session.server,
-           let url = EmbyAPI.primaryImageURL(server: server, itemId: item.id, tag: item.imageTags?.primary, width: Int(size.width * 2)) {
+           let url = EmbyAPI.primaryImageURL(
+               server: server, itemId: item.id,
+               tag: item.imageTags?.primary,
+               width: Int(size.width * 2)) {
             AsyncImage(url: url) { phase in
                 switch phase {
                 case .success(let img):
@@ -418,20 +726,20 @@ struct PlaybackLabMinimalView: View {
                         .frame(width: size.width, height: size.height)
                         .clipShape(RoundedRectangle(cornerRadius: 4))
                 default:
-                    placeholderPoster(size: size)
+                    placeholderPoster(size: size, isThumb: preferThumb)
                 }
             }
         } else {
-            placeholderPoster(size: size)
+            placeholderPoster(size: size, isThumb: preferThumb)
         }
     }
 
-    private func placeholderPoster(size: CGSize) -> some View {
+    private func placeholderPoster(size: CGSize, isThumb: Bool = false) -> some View {
         RoundedRectangle(cornerRadius: 4)
             .fill(CinemaTheme.peacockDeep)
             .frame(width: size.width, height: size.height)
             .overlay(
-                Image(systemName: "film")
+                Image(systemName: isThumb ? "tv" : "film")
                     .font(.system(size: 12))
                     .foregroundStyle(CinemaTheme.peacockLight.opacity(0.5))
             )
@@ -493,6 +801,24 @@ struct PlaybackLabMinimalView: View {
                 if activeController.state == .idle || activeController.state == .loading {
                     emptyVideoSurface(label: "\(phase.label) — \(phase.subtitle)\nSelect a title and press Play")
                 }
+                // Timestamp overlay — always visible once playback starts
+                if activeController.state != .idle {
+                    VStack {
+                        Spacer()
+                        HStack {
+                            Spacer()
+                            Text(formatTimestamp(activeController.currentTime))
+                                .font(.system(size: 15, design: .monospaced))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
+                                .background(Color.black.opacity(0.60))
+                                .clipShape(RoundedRectangle(cornerRadius: 6))
+                                .padding(.trailing, 14)
+                                .padding(.bottom, 12)
+                        }
+                    }
+                }
             }
         }
     }
@@ -519,11 +845,30 @@ struct PlaybackLabMinimalView: View {
         Group {
             if let item = selectedItem {
                 VStack(alignment: .leading, spacing: 4) {
+                    // For episodes show "Series — S1E2 Title" layout
+                    if item.type == "Episode",
+                       let series = item.seriesName {
+                        Text(series)
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(CinemaTheme.teal)
+                            .lineLimit(1)
+                    }
                     Text(item.name)
                         .font(.system(size: 20, weight: .semibold))
                         .foregroundStyle(CinemaTheme.textPrimary(settings.colorMode))
-                        .lineLimit(1)
-                    HStack(spacing: 12) {
+                        .lineLimit(2)
+                    HStack(spacing: 10) {
+                        // Episode badge
+                        if item.type == "Episode",
+                           let s = item.parentIndexNumber,
+                           let e = item.indexNumber {
+                            Text("S\(s)E\(e)")
+                                .font(.system(size: 12, weight: .bold, design: .monospaced))
+                                .foregroundStyle(CinemaTheme.teal)
+                                .padding(.horizontal, 7).padding(.vertical, 2)
+                                .background(CinemaTheme.teal.opacity(0.15))
+                                .clipShape(RoundedRectangle(cornerRadius: 5))
+                        }
                         if let year = item.productionYear {
                             Text("\(year)")
                                 .font(.system(size: 14))
@@ -537,8 +882,7 @@ struct PlaybackLabMinimalView: View {
                         Text(phase.subtitle)
                             .font(.system(size: 13, weight: .medium))
                             .foregroundStyle(CinemaTheme.teal)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 2)
+                            .padding(.horizontal, 8).padding(.vertical, 2)
                             .background(CinemaTheme.teal.opacity(0.12))
                             .clipShape(Capsule())
                     }
@@ -578,6 +922,15 @@ struct PlaybackLabMinimalView: View {
                 enabled: isActivelyPlaying || activeController.state == .paused
             ) {
                 stopPlayback()
+            }
+
+            let isHalfSpeed = activeController.playbackRate < 0.9
+            transportButton(
+                icon:    isHalfSpeed ? "hare.fill"    : "tortoise.fill",
+                label:   isHalfSpeed ? "1×"           : "½×",
+                enabled: isActivelyPlaying || activeController.state == .paused
+            ) {
+                activeController.setPlaybackRate(isHalfSpeed ? 1.0 : 0.5)
             }
         }
     }
@@ -746,6 +1099,59 @@ struct PlaybackLabMinimalView: View {
         isBrowseLoading = false
     }
 
+    private func loadSeasons(for series: EmbyItem) async {
+        guard let server = session.server,
+              let user   = session.user,
+              let token  = session.token else { return }
+        isBrowseLoading = true
+        drillSeries = series
+        drillSeason = nil
+        episodes    = []
+        log("Loading seasons for \(series.name)…")
+        do {
+            seasons = try await EmbyAPI.fetchSeasons(
+                server: server, userId: user.id, token: token, seriesId: series.id)
+            log("Loaded \(seasons.count) seasons")
+        } catch {
+            log("❌ Seasons: \(error.localizedDescription)")
+        }
+        isBrowseLoading = false
+    }
+
+    private func loadEpisodes(for season: EmbyItem, series: EmbyItem) async {
+        guard let server = session.server,
+              let user   = session.user,
+              let token  = session.token else { return }
+        isBrowseLoading = true
+        drillSeason = season
+        log("Loading episodes for \(season.name ?? "season")…")
+        do {
+            episodes = try await EmbyAPI.fetchEpisodes(
+                server: server, userId: user.id, token: token,
+                seriesId: series.id, seasonId: season.id)
+            log("Loaded \(episodes.count) episodes")
+        } catch {
+            log("❌ Episodes: \(error.localizedDescription)")
+        }
+        isBrowseLoading = false
+    }
+
+    @MainActor
+    private func performSearch(query: String) async {
+        guard let server = session.server,
+              let user   = session.user,
+              let token  = session.token else { return }
+        do {
+            let results = try await EmbyAPI.search(
+                server: server, userId: user.id, token: token,
+                query: query, includeItemTypes: "Movie,Series", limit: 60)
+            searchResults = results
+            log("Search \"\(query)\" → \(results.count) results")
+        } catch {
+            log("❌ Search: \(error.localizedDescription)")
+        }
+    }
+
     // MARK: - Playback
 
     private func startPlayback() async {
@@ -836,6 +1242,47 @@ struct PlaybackLabMinimalView: View {
         let ts = Date().formatted(.dateTime.hour().minute().second())
         logLines.append("[\(ts)] \(msg)")
         if logLines.count > 300 { logLines.removeFirst(logLines.count - 300) }
+    }
+
+    // MARK: - Timestamp formatting
+
+    /// Format a playback position as `M:SS.mmm` or `H:MM:SS.mmm`.
+    private func formatTimestamp(_ t: TimeInterval) -> String {
+        guard t.isFinite, t >= 0 else { return "--:--.---" }
+        let totalMs = Int((t * 1000).rounded())
+        let ms = totalMs % 1000
+        let totalSec = totalMs / 1000
+        let s = totalSec % 60
+        let m = (totalSec / 60) % 60
+        let h = totalSec / 3600
+        if h > 0 {
+            return String(format: "%d:%02d:%02d.%03d", h, m, s, ms)
+        } else {
+            return String(format: "%d:%02d.%03d", m, s, ms)
+        }
+    }
+}
+
+// MARK: - EmbyItem + Quarantine helpers
+
+private extension EmbyItem {
+    /// Human-readable title for the Quarantine Lab log.
+    /// Movies: "Title (Year)".  Episodes: "Series — S1E2: Title".
+    var quarantineDisplayTitle: String {
+        switch type {
+        case "Episode":
+            var parts: [String] = []
+            if let s = seriesName { parts.append(s) }
+            if let sn = parentIndexNumber, let ep = indexNumber {
+                parts.append("S\(sn)E\(ep): \(name)")
+            } else {
+                parts.append(name)
+            }
+            return parts.joined(separator: " — ")
+        default:
+            if let y = productionYear { return "\(name) (\(y))" }
+            return name
+        }
     }
 }
 

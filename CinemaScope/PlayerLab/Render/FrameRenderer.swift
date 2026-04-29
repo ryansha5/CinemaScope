@@ -188,8 +188,11 @@ final class FrameRenderer {
         // AudioChannelLayout (layoutSize=0).  AVAudioFormat then ended up with a nil
         // internal layout pointer, which AVAudioConverter dereferenced → crash.
         //
-        // AudioFormatFactory.makeMPEG4AAC now always embeds an explicit layout
-        // (e.g. kAudioChannelLayoutTag_MPEG_5_1_A for 6-ch), so this path is safe.
+        // Sprint 65 fix: AudioFormatFactory now embeds explicit layouts for ALL
+        // codec paths (AAC, AC3, EAC3, DTS-Core), so AVAudioFormat returns a valid
+        // object.  The guard below is a last-resort safety net: if sr=0 or ch=0,
+        // the description is still unusable and we bail out cleanly rather than
+        // letting AVAudioConverter crash inside Apple's framework.
         let inFmt = AVAudioFormat(cmAudioFormatDescription: inputDesc)
         aacInputFormat = inFmt
 
@@ -197,6 +200,21 @@ final class FrameRenderer {
         let ch = inFmt.channelCount
         fputs("[FrameRenderer] [S54-pre] inFmt sr=\(Int(sr)) ch=\(ch) "
             + "layout=\(inFmt.channelLayout?.description ?? "nil")\n", stderr)
+
+        // Defensive guard: AVAudioFormat can return sr=0/ch=0 if the format description
+        // lacks a channel layout.  Passing such a format to AVAudioConverter crashes
+        // with EXC_BAD_ACCESS inside Apple's framework rather than returning nil.
+        guard sr > 0, ch > 0 else {
+            let asbd   = CMAudioFormatDescriptionGetStreamBasicDescription(inputDesc)?.pointee
+            let fmtID  = asbd?.mFormatID ?? 0
+            let fourCC = String(bytes: [UInt8((fmtID >> 24) & 0xFF), UInt8((fmtID >> 16) & 0xFF),
+                                        UInt8((fmtID >>  8) & 0xFF), UInt8( fmtID        & 0xFF)],
+                                encoding: .ascii) ?? "????"
+            fputs("[FrameRenderer] ❌ startAudioEngine: AVAudioFormat sr=0/ch=0 for codec "
+                + "'\(fourCC)' — format description missing channel layout; "
+                + "running video-only (check AudioFormatFactory for this codec)\n", stderr)
+            return
+        }
 
         // PCM output format: Float32 non-interleaved (the AVAudioEngine "standard" format).
         //
@@ -225,7 +243,8 @@ final class FrameRenderer {
         let outFmt = AVAudioFormat(standardFormatWithSampleRate: sr, channelLayout: outChannelLayout)
         pcmOutputFormat = outFmt
 
-        // Create the AAC → PCM converter.
+        // Create compressed → PCM converter.
+        // Supports any codec the system can decode (AAC, AC3, EAC3, DTS-Core).
         fputs("[FrameRenderer] [S54-pre] Creating AVAudioConverter…\n", stderr)
         guard let conv = AVAudioConverter(from: inFmt, to: outFmt) else {
             fputs("[FrameRenderer] ❌ startAudioEngine: AVAudioConverter init failed (returned nil)\n",
@@ -233,16 +252,19 @@ final class FrameRenderer {
             return
         }
 
-        // Set the magic cookie on the converter so the AAC decoder has the
-        // AudioSpecificConfig it needs.
+        // Set the magic cookie so the AAC decoder has the AudioSpecificConfig it needs.
+        // AC3 / EAC3 / DTS-Core do not use magic cookies — suppress the warning for them.
+        let isAAC = inFmt.streamDescription.pointee.mFormatID == kAudioFormatMPEG4AAC
         var cookieSize: Int = 0
         if let cookiePtr = CMAudioFormatDescriptionGetMagicCookie(inputDesc,
                                                                     sizeOut: &cookieSize),
            cookieSize > 0 {
             conv.magicCookie = Data(bytes: cookiePtr, count: cookieSize)
             fputs("[FrameRenderer] [S54-pre] magic cookie set (\(cookieSize) bytes)\n", stderr)
+        } else if isAAC {
+            fputs("[FrameRenderer] ⚠️ startAudioEngine: no magic cookie in AAC format desc\n", stderr)
         } else {
-            fputs("[FrameRenderer] ⚠️ startAudioEngine: no magic cookie in format desc\n", stderr)
+            fputs("[FrameRenderer] [S54-pre] no magic cookie (expected for AC3/EAC3/DTS-Core)\n", stderr)
         }
 
         audioConverter = conv
@@ -320,6 +342,8 @@ final class FrameRenderer {
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         let dts = CMSampleBufferGetDecodeTimeStamp(sampleBuffer)
         layer.enqueue(sampleBuffer)
+        // Sprint 61: record that this frame reached the display layer.
+        if pts.isValid { FrameDiagnosticStore.shared.markLayerEnqueued(pts: pts.seconds) }
         let isFirst = (framesEnqueued == 0)
         framesEnqueued += 1
 
@@ -404,7 +428,7 @@ final class FrameRenderer {
 
     /// Enqueue one compressed audio CMSampleBuffer.
     ///
-    /// Sprint 54: Converts AAC → Float32 PCM via AVAudioConverter, then
+    /// Sprint 54: Converts compressed audio → Float32 PCM via AVAudioConverter, then
     /// schedules the PCM buffer sequentially on the AVAudioPlayerNode.
     ///
     /// Sprint 56: Conversion is dispatched to a serial background queue so that
@@ -424,10 +448,13 @@ final class FrameRenderer {
         let dataLength = CMBlockBufferGetDataLength(blockBuffer)
         guard dataLength > 0 else { return }
 
-        // AVAudioConverter imposes a 6144-byte maximum packet size for VBR AAC.
-        let kAACMaxPacketBytes = 6144
-        if dataLength > kAACMaxPacketBytes {
-            fputs("[FrameRenderer] [S54] oversized AAC packet skipped: \(dataLength) B > \(kAACMaxPacketBytes) B\n",
+        // Sanity-check packet size.  AAC VBR is capped at 6144 B; AC3 frames are
+        // up to ~6 KB; EAC3 can be up to ~24 KB for high-bitrate streams.
+        // Use 65536 B (64 KB) as a codec-agnostic upper bound — anything larger
+        // indicates a demux error, not a legitimate audio frame.
+        let kMaxAudioPacketBytes = 65536
+        if dataLength > kMaxAudioPacketBytes {
+            fputs("[FrameRenderer] [S54] oversized audio packet skipped: \(dataLength) B > \(kMaxAudioPacketBytes) B\n",
                   stderr)
             return
         }
@@ -546,6 +573,24 @@ final class FrameRenderer {
         fputs("[FrameRenderer] resume() — synchronizer rate=1  playerNode resumed\n", stderr)
     }
 
+    /// Set an arbitrary playback rate on the video synchronizer.
+    ///
+    /// Audio is silenced at rates ≠ 1 to avoid A/V desync — this is
+    /// intended for diagnostic slow-motion use, not production playback.
+    /// Restoring rate=1 also restores the audio player node.
+    func setPlaybackRate(_ rate: Float) {
+        synchronizer.setRate(rate, time: .invalid)
+        if !videoOnlyDiagnostic && audioRendererAttached {
+            if rate == 1.0 {
+                playerNode.play()
+            } else {
+                playerNode.pause()   // silence audio to avoid A/V desync
+            }
+        }
+        fputs("[FrameRenderer] setPlaybackRate(\(rate))  "
+            + "audio=\(rate == 1.0 ? "▶ playing" : "⏸ paused (desync prevention)")\n", stderr)
+    }
+
     /// Seek to `pts` in the video timeline.
     ///
     /// Caller must call `flushForSeek()` first to stop audio and clear queues,
@@ -597,6 +642,7 @@ final class FrameRenderer {
 
         // Clear the pending queue and cancel any outstanding media callback.
         pendingVideoQueue.removeAll()
+        FrameDiagnosticStore.shared.markAllFlushed()   // Sprint 61
         if mediaCallbackActive {
             layer.stopRequestingMediaData()
             mediaCallbackActive = false
@@ -615,6 +661,7 @@ final class FrameRenderer {
     func flushVideo() {
         layer.flush()
         pendingVideoQueue.removeAll()
+        FrameDiagnosticStore.shared.markAllFlushed()   // Sprint 61
         if mediaCallbackActive {
             layer.stopRequestingMediaData()
             mediaCallbackActive = false
@@ -652,6 +699,7 @@ final class FrameRenderer {
         // flushAndRemoveImage() has already cancelled the existing callback in the layer;
         // we just need to clear our own state so ensureMediaCallbackRegistered re-registers.
         pendingVideoQueue.removeAll()
+        FrameDiagnosticStore.shared.markAllFlushed()   // Sprint 61
         mediaCallbackActive = false
 
         if !videoOnlyDiagnostic && audioRendererAttached {

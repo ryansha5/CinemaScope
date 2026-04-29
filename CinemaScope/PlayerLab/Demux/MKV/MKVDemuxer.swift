@@ -328,7 +328,13 @@ final class MKVDemuxer {
     private var pgsRawPackets: [PGSRawPacket] = []
 
     private var timecodeScaleNS:     UInt64      = 1_000_000
-    private let outputTimescale:     CMTimeScale = 1_000
+    // Sprint 62: nanosecond output timescale.
+    // Using 1_000_000_000 (ns) instead of 1_000 (ms) preserves the full
+    // precision the file actually contains, regardless of TimecodeScale.
+    // For files with the default 1ms TimecodeScale the values are identical;
+    // for files with finer scales (e.g. 1µs) the extra precision is retained.
+    // Stored in TrackInfo.timescale so that durationSeconds = durationTicks/1e9.
+    private let outputTimescale:     CMTimeScale = 1_000_000_000
     private var audioSampleRate:     Double      = 44_100
     private var audioFramesPerPacket: Int        = 1024
 
@@ -1279,6 +1285,36 @@ final class MKVDemuxer {
                                                             clusterTC:  clusterTimecode,
                                                             relTC:      raw.relTC,
                                                             isKeyframe: raw.isKeyframe))
+
+                        // Sprint 62: first-30-frame PTS precision diagnostic.
+                        // Logs the raw Matroska tick components alongside the
+                        // new ns-precision PTS and the old 1ms-quantized PTS,
+                        // so the log reveals whether TimecodeScale is coarser
+                        // or finer than 1ms and confirms delta uniformity.
+                        let diagIdx = frameIndex.count - 1
+                        if diagIdx < 30 {
+                            let fi    = frameIndex[diagIdx]
+                            let ticks = clusterTimecode + Int64(raw.relTC)
+                            // Recompute what the old ms path would have produced:
+                            let oldMS  = Int64(Double(ticks) * Double(timecodeScaleNS) / 1_000_000.0)
+                            let oldSec = Double(oldMS) / 1_000.0
+                            let newSec = fi.pts.seconds
+                            let deltaStr: String
+                            if diagIdx > 0 {
+                                let prevSec = frameIndex[diagIdx - 1].pts.seconds
+                                deltaStr = String(format: "%+.9f", newSec - prevSec)
+                            } else {
+                                deltaStr = "—"
+                            }
+                            log("[PTS-Prec #\(String(format: "%02d", diagIdx))]"
+                              + "  clusterTC=\(clusterTimecode)  relTC=\(raw.relTC)"
+                              + "  ticks=\(ticks)"
+                              + "  was=\(String(format: "%.3f", oldSec))s"
+                              + "  now=\(String(format: "%.9f", newSec))s"
+                              + "  Δ=\(deltaStr)s"
+                              + "  off=\(raw.dataOffset)"
+                              + "  kf=\(raw.isKeyframe)")
+                        }
                     } else if raw.lacingType != 0 {
                         // Video lacing is extremely rare in real files and not yet handled.
                         // Log and drop so the caller at least sees it in diagnostics.
@@ -1599,17 +1635,18 @@ final class MKVDemuxer {
     // MARK: - Subtitle Cue Extraction  (Sprint 26)
     //
     // S_TEXT/UTF8: block payload is raw UTF-8 subtitle text (no sequence number or timing header).
-    // End time comes from BlockDuration (ticks × timecodeScaleNS/1e6 → ms CMTime).
+    // End time comes from BlockDuration (ticks × timecodeScaleNS → nanosecond CMTime).
     // Fallback end time = startTime + 5 seconds.
 
     private func appendSubtitleCue(from raw: RawBlockInfo, clusterTC: Int64) async {
         let pts = makePTS(clusterTC: clusterTC, relTC: raw.relTC)
         let endPTS: CMTime
         if let dticks = raw.durationTicks, dticks > 0 {
-            let durationMS = Int64(Double(dticks) * Double(timecodeScaleNS) / 1_000_000.0)
-            endPTS = CMTimeAdd(pts, CMTime(value: durationMS, timescale: outputTimescale))
+            // Sprint 62: exact integer ns conversion — consistent with makePTS.
+            let durationNS = dticks * Int64(timecodeScaleNS)
+            endPTS = CMTimeAdd(pts, CMTime(value: durationNS, timescale: 1_000_000_000))
         } else {
-            endPTS = CMTimeAdd(pts, CMTime(seconds: 5.0, preferredTimescale: outputTimescale))
+            endPTS = CMTimeAdd(pts, CMTime(seconds: 5.0, preferredTimescale: 1_000_000_000))
         }
         guard raw.dataSize > 0,
               // Sprint 43: subtitle text payloads are small and sequential —
@@ -1632,16 +1669,25 @@ final class MKVDemuxer {
         let pts = makePTS(clusterTC: clusterTC, relTC: raw.relTC)
         let endPTS: CMTime?
         if let dticks = raw.durationTicks, dticks > 0 {
-            let durationMS = Int64(Double(dticks) * Double(timecodeScaleNS) / 1_000_000.0)
-            endPTS = CMTimeAdd(pts, CMTime(value: durationMS, timescale: outputTimescale))
+            // Sprint 62: exact integer ns conversion — consistent with makePTS.
+            let durationNS = dticks * Int64(timecodeScaleNS)
+            endPTS = CMTimeAdd(pts, CMTime(value: durationNS, timescale: 1_000_000_000))
         } else {
             endPTS = nil
         }
         // Sprint 43: PGS payloads are typically <100 KB and sequential — use
         // the 512 KB window.  Very large PGS packets fall back to a direct read
         // transparently via EBMLBufferedReader's fallback path.
-        guard let data = try? await bufferedReader.readBytes(at: raw.dataOffset, length: raw.dataSize)
+        guard let rawData = try? await bufferedReader.readBytes(at: raw.dataOffset, length: raw.dataSize)
         else { return }
+        // EBMLBufferedReader.readBytes() fast-path returns a Data SLICE from its
+        // internal window buffer, with startIndex = byte-offset-within-window (not 0).
+        // PGSParser.parseDisplaySet uses data.subdata(in: offset..<end) where
+        // `offset` is relative to position 0 — if startIndex != 0, `offset` falls
+        // before the valid range and the subdata call traps.
+        // Flatten to a contiguous 0-based copy once here so all downstream consumers
+        // are safe, regardless of how the data was fetched.
+        let data = rawData.startIndex == 0 ? rawData : Data(rawData)
         pgsRawPackets.append(PGSRawPacket(pts: pts, endPTS: endPTS, data: data))
     }
 
@@ -1791,10 +1837,21 @@ final class MKVDemuxer {
 
     // MARK: - Timestamp helpers
 
+    /// Convert Matroska tick-based timestamp to a nanosecond-precision CMTime.
+    ///
+    /// Sprint 62: rewritten to use exact integer arithmetic instead of the
+    /// previous float-intermediate path (which converted via ms, quantizing
+    /// any file with TimecodeScale < 1_000_000 ns to 1ms granularity).
+    ///
+    /// Formula: absolute_ns = (clusterTC + relTC) × timecodeScaleNS
+    ///
+    /// Overflow analysis: worst-case realistic tick for a 24h file at the
+    /// default 1ms/tick scale ≈ 86_400_000; × 1_000_000 (default scale) =
+    /// 86_400_000_000_000 ≈ 8.6 × 10^13  ≪  Int64.max (≈ 9.2 × 10^18). Safe.
+    /// Even a 1ns TimecodeScale at 10h produces 36_000_000_000_000 × 1 = same order.
     private func makePTS(clusterTC: Int64, relTC: Int16) -> CMTime {
         let ticks = clusterTC + Int64(relTC)
-        let ms    = Int64(Double(ticks) * Double(timecodeScaleNS) / 1_000_000.0)
-        return CMTime(value: ms, timescale: outputTimescale)
+        return CMTime(value: ticks * Int64(timecodeScaleNS), timescale: 1_000_000_000)
     }
 
     private func makeMKVFrameInfo(fileOffset: Int64, size: Int,
@@ -2104,6 +2161,90 @@ final class MKVDemuxer {
             if frameIndex[i].isKeyframe { return i }
         }
         return frameIndex.count
+    }
+
+    // MARK: - Sprint 66: CRA cold-start detection
+
+    /// HEVC NAL unit types relevant to keyframe cold-start safety.
+    enum HEVCKeyframeNALType {
+        case idrNLP      // type 20 — IDR, no leading pictures; safe to cold-start
+        case craNUT      // type 21 — Clean Random Access; may have RASL leading pictures
+        case other(UInt8)
+        case unreadable
+    }
+
+    /// Fetches the first 8 bytes of the video frame at `index` and returns its
+    /// HEVC NAL unit type.  Handles both length-prefixed (LP) and Annex B formats.
+    ///
+    /// Used by `firstIDRVideoKeyframeIndex(from:)` to detect CRA keyframes that
+    /// are unsafe for cold-starting the HEVC decoder.
+    func videoFrameHEVCNALType(at index: Int) async -> HEVCKeyframeNALType {
+        guard index >= 0, index < frameIndex.count else { return .unreadable }
+        let frame = frameIndex[index]
+        guard frame.size >= 8 else { return .unreadable }
+        guard let data = try? await reader.read(offset: frame.fileOffset, length: 8) else {
+            return .unreadable
+        }
+        guard data.count >= 5 else { return .unreadable }
+
+        // Determine which byte holds the first NAL header octet.
+        // LP format:   [0..3] = 32-bit BE length,  [4] = NAL header byte 0
+        // Annex B (3): [0..2] = 00 00 01,          [3] = NAL header byte 0
+        // Annex B (4): [0..3] = 00 00 00 01,       [4] = NAL header byte 0
+        let nalHeaderOffset: Int
+        if data[0] == 0x00 && data[1] == 0x00 {
+            if data[2] == 0x01 {
+                nalHeaderOffset = 3   // 3-byte Annex B start code
+            } else if data[2] == 0x00 && data[3] == 0x01 {
+                nalHeaderOffset = 4   // 4-byte Annex B start code
+            } else {
+                nalHeaderOffset = 4   // Assume LP: bytes 0-3 are length field
+            }
+        } else {
+            nalHeaderOffset = 4       // LP format: bytes 0-3 are the length field
+        }
+
+        guard nalHeaderOffset < data.count else { return .unreadable }
+        // HEVC NAL header byte 0: [forbidden(1)] [nal_unit_type(6)] [nuh_layer_id_msb(1)]
+        let nalType = (data[nalHeaderOffset] >> 1) & 0x3F
+        switch nalType {
+        case 20: return .idrNLP
+        case 21: return .craNUT
+        default: return .other(nalType)
+        }
+    }
+
+    /// Returns the index of the first IDR_N_LP keyframe at or after `startIndex`.
+    ///
+    /// Sprint 66: DV P7 dual-layer files sometimes begin their EL track with a
+    /// CRA_NUT keyframe instead of IDR_N_LP.  Cold-starting the HEVC decoder at
+    /// a CRA causes RASL leading-picture corruption (no prior reference state).
+    /// This method scans forward from `startIndex` through keyframe-flagged frames
+    /// to find the first true IDR.
+    ///
+    /// Returns `startIndex` unchanged if:
+    /// - the frame at `startIndex` is already IDR_N_LP, or
+    /// - no IDR_N_LP is found within `maxKeyframesToCheck` subsequent keyframes
+    ///   (fall back to CRA to avoid skipping too far into the file).
+    func firstIDRVideoKeyframeIndex(from startIndex: Int,
+                                    maxKeyframesToCheck: Int = 6) async -> Int {
+        // Collect the ordered list of keyframe indices at or after startIndex.
+        let kfIndices = (startIndex..<frameIndex.count).filter { frameIndex[$0].isKeyframe }
+        var checked = 0
+        for kfIdx in kfIndices {
+            let nalType = await videoFrameHEVCNALType(at: kfIdx)
+            switch nalType {
+            case .idrNLP:
+                return kfIdx
+            case .craNUT:
+                checked += 1
+                if checked >= maxKeyframesToCheck { return kfIdx }  // give up, use CRA
+            case .other, .unreadable:
+                checked += 1
+                if checked >= maxKeyframesToCheck { return kfIdx }
+            }
+        }
+        return startIndex   // nothing found — fall back to original
     }
 
     func findVideoKeyframeSampleIndex(nearestBeforePTS target: CMTime) -> Int {

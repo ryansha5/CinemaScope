@@ -174,6 +174,16 @@ final class PacketFeeder {
     /// Default: true (strip DV NALs before handing to VT).
     static var stripDolbyVisionNALsEnabled: Bool = true
 
+    /// When true, the GOP batch validator emits detailed [GOP-TAIL] lines for
+    /// the last ~10 frames before each IDR boundary.  The tail lines include
+    /// synthDTS and firstNALType sourced from FrameDiagnosticStore (populated
+    /// by makeVideoSampleBuffer immediately before the tail log fires).
+    ///
+    /// Disable in production — output is verbose (one line per B-frame, every
+    /// GOP, every ~10 seconds of playback).  Toggle from the debug console or
+    /// a hidden Settings switch during regression investigations.
+    static var gopDeepDebugEnabled: Bool = false
+
     /// Maximum raw byte size of a DV Base Layer frame.
     /// Any video packet below this threshold is treated as a BL skip/trailing
     /// frame and silently discarded when DV stripping is enabled AND the file
@@ -198,6 +208,20 @@ final class PacketFeeder {
     /// content regardless of stripDolbyVisionNALsEnabled.
     /// Set by PlayerLabPlaybackController.prepare() from mkvDemuxer.isDolbyVisionDualLayer.
     var isDolbyVisionDualLayer: Bool = false
+
+    /// The exclusive upper bound of the DV BL preamble cluster, expressed as a
+    /// video frame index.  Equals mkvDemuxer.firstVideoKeyframeIndex for DV
+    /// dual-layer files and 0 for all other files.
+    ///
+    /// The BL size filter in fetchPackets must only apply to frames whose index
+    /// is LESS THAN this value (the pre-EL BL-only preamble).  Frames at or
+    /// beyond this index are EL frames and must never be filtered by size —
+    /// legitimate EL B-frames in low-motion scenes can be well below 600 B.
+    ///
+    /// Sprint 66: restricting the filter scope here eliminates the false positive
+    /// that dropped 83 EL inter-frames from the initial batch on DV P7 files whose
+    /// EL starts at a CRA keyframe (e.g. idx=24).
+    var dvBLPreambleEndIndex: Int = 0
 
     // MARK: - Init
 
@@ -226,6 +250,8 @@ final class PacketFeeder {
         hevcDTSBasePTS        = .invalid
         hevcFrameDuration     = .invalid
         hevcLastSynthDTS      = .invalid
+        isDolbyVisionDualLayer = false
+        dvBLPreambleEndIndex  = 0
     }
 
     // MARK: - Cursor teleport (seek)
@@ -308,17 +334,43 @@ final class PacketFeeder {
         // Only applied for MKV HEVC (fileOffset-sort path); MP4 is PTS-order and
         // does not need this.
         let videoIsHEVC = CMFormatDescriptionGetMediaSubType(vFmt) == kCMVideoCodecType_HEVC
+
+        // Sprint 64: tracks the IDR index added by the GOP snap so the
+        // pre-IDR tail diagnostic (inside the do-block below) can reference it.
+        var gopSnapIDR: Int? = nil
+
         if let mkv = mkvDemuxer, videoIsHEVC {
             let desiredEnd = fromVideoIdx + limitedVideo
             if desiredEnd < videoSamplesTotal {
                 let nextIDR  = mkv.nextVideoKeyframeSampleIndex(from: desiredEnd)
-                let extended = min(nextIDR, videoSamplesTotal) - fromVideoIdx
+
+                // Sprint 64 root-cause fix: include the IDR frame itself (+1).
+                //
+                // Previous snap ended at nextIDR-1 (the frame just before the IDR).
+                // HEVC hierarchical B-frames at the tail of the current GOP use the
+                // IDR as their FORWARD reference anchor; when the IDR is absent VT
+                // decodes those B-frames with a missing reference and produces
+                // deterministic corruption in the last mini-GOP (~12–16 frames)
+                // before every GOP boundary.
+                //
+                // The IDR always has the smallest fileOffset in its mini-GOP
+                // (it must be decoded before the B-frames that depend on it).
+                // extractVideoPackets' fileOffset sort therefore places it first
+                // in the batch regardless of its PTS order position — VT sees the
+                // IDR before any of the B-frames that reference it.  ✅
+                //
+                // The next batch starts at nextIDR+1 (one past the IDR).  VT's
+                // decoder state for AVSampleBufferDisplayLayer persists across
+                // enqueue calls, so the IDR decoded in this batch is available as
+                // a reference frame for the next batch's inter-frames.  ✅
+                let extended = min(nextIDR + 1, videoSamplesTotal) - fromVideoIdx
                 if extended > limitedVideo {
                     feederLog("[fetchPackets] GOP-snap [\(label)]:"
                             + " extended video batch \(limitedVideo)→\(extended)"
                             + " (desiredEnd=\(desiredEnd) non-IDR"
-                            + " → nextIDR=\(nextIDR))")
+                            + " → IDR@\(nextIDR) INCLUDED ✅)")
                     limitedVideo = extended
+                    gopSnapIDR   = nextIDR
                 }
             }
         }
@@ -361,26 +413,149 @@ final class PacketFeeder {
                             + " kf=\(p.isKeyframe)"
                             + " sz=\(p.data.count)B")
                 }
+
+                // Sprint 64: Pre-IDR tail diagnostic — fires on every GOP snap.
+                //
+                // Shows the last 30 frames sorted by PTS so we can see the
+                // temporal approach to the IDR boundary and verify:
+                //   1. The IDR (largest PTS, smallest fileOffset) IS present.
+                //   2. Its fileOffset is smaller than the B-frames before it,
+                //      confirming the sort puts it first in VT's decode queue.
+                //   3. All B-frames near the tail share the same batch label
+                //      as the IDR (same enqueue call → VT has the reference).
+                if let snapIDR = gopSnapIDR {
+                    let ptsSorted = packets.sorted { $0.pts < $1.pts }
+                    let tail      = ptsSorted.suffix(min(30, ptsSorted.count))
+                    feederLog("[S64-\(label)-PreIDR] IDR=idx\(snapIDR)"
+                            + "  last \(tail.count) frames by PTS (batch=\(label)):")
+                    for p in tail {
+                        let tag = p.isKeyframe ? "✅IDR" : "   B"
+                        feederLog("  \(tag) idx=\(p.index)"
+                                + "  pts=\(String(format: "%.4f", p.pts.seconds))s"
+                                + "  off=\(p.byteOffset)"
+                                + "  sz=\(p.data.count)B")
+                    }
+                }
+
+                // ── GOP batch validation (Sprint 64) ──────────────────────────
+                //
+                // Verifies every HEVC batch is decode-complete BEFORE any frame
+                // reaches makeVideoSampleBuffer / VideoToolbox.
+                //
+                // Invariant: the last frame by PTS must be the IDR that anchors
+                // the tail B-frames as their forward reference.  If it is not,
+                // those B-frames will decode with a missing reference → the
+                // deterministic corruption we fixed in Sprint 64.
+                //
+                // [GOP-CHECK]  — always; one line per batch boundary
+                // [GOP-WINDOW] — always; prev/next keyframe context
+                // [GOP-ERROR]  — only on invariant violation (+ assertionFailure)
+
+                let ptsForCheck = packets.sorted { $0.pts < $1.pts }
+                if let firstP = ptsForCheck.first, let lastP = ptsForCheck.last {
+
+                    // 1. Batch boundary log
+                    feederLog("[GOP-CHECK] batch=\(label)"
+                            + "  startIdx=\(firstP.index)"
+                            + "  pts=\(String(format: "%.4f", firstP.pts.seconds))s"
+                            + "  kf=\(firstP.isKeyframe)")
+                    feederLog("[GOP-CHECK] batch=\(label)"
+                            + "  endIdx=\(lastP.index)"
+                            + "  pts=\(String(format: "%.4f", lastP.pts.seconds))s"
+                            + "  kf=\(lastP.isKeyframe ? "✅" : "❌")")
+
+                    // 3. Keyframe window — prevKF (the IDR that opened this GOP)
+                    //    and nextKF (the first IDR after the batch, outside it).
+                    if let mkv = mkvDemuxer {
+                        let prevKFIdx = fromVideoIdx == 0
+                            ? 0
+                            : mkv.findVideoKeyframeSampleIndex(nearestBeforePTS:
+                                mkv.videoPTS(forSample: fromVideoIdx))
+                        let nextKFIdx = mkv.nextVideoKeyframeSampleIndex(
+                                            from: lastP.index + 1)
+                        let prevKFPTS = String(format: "%.4f",
+                                               mkv.videoPTS(forSample: prevKFIdx).seconds)
+                        let nextKFPTS: String
+                        if nextKFIdx < videoSamplesTotal {
+                            nextKFPTS = String(format: "%.4f",
+                                               mkv.videoPTS(forSample: nextKFIdx).seconds)
+                        } else {
+                            nextKFPTS = "EOF"
+                        }
+                        feederLog("[GOP-WINDOW] batch=\(label)"
+                                + "  prevKF=idx\(prevKFIdx)/\(prevKFPTS)s"
+                                + "  batchEnd=idx\(lastP.index)/\(String(format: "%.4f", lastP.pts.seconds))s"
+                                + " \(lastP.isKeyframe ? "✅" : "❌")"
+                                + "  nextKF=idx\(nextKFIdx)/\(nextKFPTS)s")
+                    }
+
+                    // 2. Invalid boundary check + safety assertion
+                    //    Last frame by PTS MUST be a keyframe unless we are at
+                    //    end-of-file (no more samples to snap to).
+                    let isAtEOF = lastP.index >= videoSamplesTotal - 1
+                    if !lastP.isKeyframe && !isAtEOF {
+                        let errMsg = "[GOP-ERROR] batch=\(label)"
+                                   + " last frame idx=\(lastP.index)"
+                                   + " pts=\(String(format: "%.4f", lastP.pts.seconds))s"
+                                   + " is NOT a keyframe — tail B-frames lack"
+                                   + " forward reference → corruption imminent"
+                        feederLog(errMsg)
+                        assertionFailure(errMsg)  // debug builds only
+                    }
+
+                    // 5. First-batch keyframe check.
+                    //    Batch 0 must start with an IDR so VT has a clean base.
+                    if fromVideoIdx == 0, !firstP.isKeyframe {
+                        let errMsg = "[GOP-ERROR] batch=\(label)"
+                                   + " first batch (fromIdx=0) does not start"
+                                   + " with a keyframe!"
+                                   + " startIdx=\(firstP.index)"
+                                   + " pts=\(String(format: "%.4f", firstP.pts.seconds))s"
+                        feederLog(errMsg)
+                        assertionFailure(errMsg)  // debug builds only
+                    }
+                }
             }
 
             for pkt in packets {
                 // ── DV BL frame filter (HEVC / Dolby Vision only) ────────────────
-                // DV Profile 7 MKVs interleave Base Layer (BL) frames with
-                // Enhancement Layer (EL) frames on the same track throughout the
-                // whole file — not just at the initial BL preamble cluster.
-                // BL trailing/skip frames are tiny (~114–360 B); EL frames are
-                // ≥ 1002 B. Feeding BL frames to VideoToolbox corrupts the decode
-                // pipeline because VT is configured for the EL HEVC profile and
-                // cannot interpret context-free BL trailing slices.
-                // Skip any frame below kDVBLFrameSizeThreshold when stripping is on.
+                // DV Profile 7 BL preamble filter.
+                //
+                // The FIRST cluster of a DV P7 MKV contains Base Layer (BL) skip
+                // frames (~114–362 B) that a standard HEVC decoder cannot process.
+                // These live at indices 0 ..< dvBLPreambleEndIndex (typically 0 ..< 24).
+                //
+                // Sprint 66: The filter is now restricted to the BL preamble range
+                // (pkt.index < dvBLPreambleEndIndex).  Previous code applied the
+                // size threshold throughout the whole file, which incorrectly dropped
+                // legitimate EL B-frames in low-motion scenes (e.g. 83/227 frames in
+                // the initial batch of a DV P7 TV episode → decode graph holes → distortion).
+                //
+                // Frames at or beyond dvBLPreambleEndIndex are EL frames and are
+                // never filtered by size, regardless of their byte count.
                 // H.264 content never has DV BL frames — filter is HEVC-only.
                 if isHEVC
                     && PacketFeeder.stripDolbyVisionNALsEnabled
                     && isDolbyVisionDualLayer
+                    && dvBLPreambleEndIndex > 0
+                    && pkt.index < dvBLPreambleEndIndex
                     && pkt.data.count < PacketFeeder.kDVBLFrameSizeThreshold {
                     feederLog("  [\(label)] DV BL skip  pkt=\(pkt.index)"
                             + "  pts=\(String(format: "%.3f", pkt.pts.seconds))s"
                             + "  size=\(pkt.data.count)B  keyframe=\(pkt.isKeyframe)")
+                    FrameDiagnosticStore.shared.append(FrameDiagnosticRecord(
+                        sampleIndex:  pkt.index,
+                        pts:          pkt.pts.seconds,
+                        synthDTS:     Double.nan,
+                        fileOffset:   pkt.byteOffset,
+                        rawSize:      pkt.data.count,
+                        finalSize:    0,
+                        isKeyframe:   pkt.isKeyframe,
+                        firstNALType: "?",
+                        batchLabel:   label,
+                        state:        .filtered,
+                        filterReason: "DV-BL-size"
+                    ))
                     continue
                 }
 
@@ -388,7 +563,8 @@ final class PacketFeeder {
                 // failures are visible (try? was silently discarding them, causing
                 // SampleDiag to fire while enqueueAndAdvance received 0 buffers).
                 do {
-                    let sb = try makeVideoSampleBuffer(packet: pkt, formatDescription: vFmt)
+                    let sb = try makeVideoSampleBuffer(packet: pkt, formatDescription: vFmt,
+                                                       batchLabel: label)
                     result.videoBuffers.append((sb, pkt.pts.seconds))
                     result.lastVideoPTS = max(result.lastVideoPTS, pkt.pts.seconds)
                 } catch {
@@ -396,8 +572,61 @@ final class PacketFeeder {
                             + "pkt.index=\(pkt.index)  pts=\(String(format: "%.3f", pkt.pts.seconds))s  "
                             + "size=\(pkt.data.count)B  keyframe=\(pkt.isKeyframe)  "
                             + "error=\(error.localizedDescription)")
+                    FrameDiagnosticStore.shared.append(FrameDiagnosticRecord(
+                        sampleIndex:  pkt.index,
+                        pts:          pkt.pts.seconds,
+                        synthDTS:     Double.nan,
+                        fileOffset:   pkt.byteOffset,
+                        rawSize:      pkt.data.count,
+                        finalSize:    0,
+                        isKeyframe:   pkt.isKeyframe,
+                        firstNALType: "?",
+                        batchLabel:   label,
+                        state:        .filtered,
+                        filterReason: "make-failed"
+                    ))
                 }
             }
+
+            // ── GOP deep-debug tail (Sprint 64, optional) ─────────────────────
+            //
+            // Fires after makeVideoSampleBuffer has run for every packet in the
+            // batch so FrameDiagnosticStore contains synthDTS and firstNALType.
+            // Queries those records to produce a fully-annotated per-frame table
+            // for the last ~10 frames before each IDR boundary.
+            //
+            // Gate: gopDeepDebugEnabled must be true (default false).
+            // Overhead when disabled: one Bool check per batch — negligible.
+
+            if isHEVC, PacketFeeder.gopDeepDebugEnabled, let snapIDR = gopSnapIDR {
+                let ptsTail = packets
+                    .sorted  { $0.pts < $1.pts }
+                    .suffix(min(10, packets.count))
+                let idrPresent = packets.contains { $0.isKeyframe }
+                feederLog("[GOP-TAIL] batch=\(label)"
+                        + "  IDRinBatch=\(idrPresent ? "✅" : "❌")"
+                        + "  snapIDR=idx\(snapIDR)"
+                        + "  last \(ptsTail.count) frames:")
+                for p in ptsTail {
+                    let kfTag = p.isKeyframe ? "✅IDR" : "   B"
+                    // Pull DTS + NAL type from FrameDiagnosticStore — populated
+                    // by makeVideoSampleBuffer moments ago in the loop above.
+                    let rec = FrameDiagnosticStore.shared.record(
+                                nearPTS: p.pts.seconds, batchLabel: label)
+                    let dtsStr  = rec.flatMap {
+                        $0.synthDTS.isNaN ? nil : String(format: "%.4f", $0.synthDTS)
+                    } ?? "?"
+                    let typeStr = rec?.firstNALType ?? "?"
+                    feederLog("  [GOP-TAIL] \(kfTag)"
+                            + "  idx=\(p.index)"
+                            + "  pts=\(String(format: "%.4f", p.pts.seconds))s"
+                            + "  dts=\(dtsStr)s"
+                            + "  type=\(typeStr)"
+                            + "  sz=\(p.data.count)B"
+                            + "  nextKFInBatch=\(idrPresent)")
+                }
+            }
+
         } catch {
             log("  ⚠️ [\(label)] video fetch failed: \(error.localizedDescription)")
         }
@@ -549,7 +778,8 @@ final class PacketFeeder {
 
     private func makeVideoSampleBuffer(
         packet:            DemuxPacket,
-        formatDescription: CMVideoFormatDescription
+        formatDescription: CMVideoFormatDescription,
+        batchLabel:        String
     ) throws -> CMSampleBuffer {
 
         // ── Codec detection ───────────────────────────────────────────────────
@@ -842,6 +1072,29 @@ final class PacketFeeder {
                     + "keyframe=\(packet.isKeyframe)  "
                     + "dvStrip=\(PacketFeeder.stripDolbyVisionNALsEnabled)")
         }
+
+        // ── FrameDiagnosticStore: record successful frame (Sprint 61) ─────────
+        let diagFirstNAL: String = {
+            let nals = PacketFeeder.nalTypesFromLengthPrefixed(
+                Array(normalizedBytes), nalUnitLength: nalUnitLength, isHEVC: isHEVC)
+            guard let first = nals.first else { return "?" }
+            return isHEVC ? PacketFeeder.hevcNALTypeName(first.type)
+                          : PacketFeeder.avcNALTypeName(first.type)
+        }()
+        let diagSynthDTS: Double = isHEVC ? decodeTSForBuffer.seconds : Double.nan
+        FrameDiagnosticStore.shared.append(FrameDiagnosticRecord(
+            sampleIndex:  packet.index,
+            pts:          packet.pts.seconds,
+            synthDTS:     diagSynthDTS,
+            fileOffset:   packet.byteOffset,
+            rawSize:      packet.data.count,
+            finalSize:    sampleBytes.count,
+            isKeyframe:   packet.isKeyframe,
+            firstNALType: diagFirstNAL,
+            batchLabel:   batchLabel,
+            state:        .fetched,
+            filterReason: nil
+        ))
 
         return sampleBuffer
     }
