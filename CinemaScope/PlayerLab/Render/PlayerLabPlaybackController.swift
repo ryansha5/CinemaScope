@@ -935,27 +935,65 @@ final class PlayerLabPlaybackController: ObservableObject {
 
         let rawTime   = renderer.currentTime.seconds
         let nowSec    = rawTime.isNaN ? currentTimeFloor : max(rawTime, currentTimeFloor)
-        let buffered  = max(0, feeder.lastEnqueuedVideoPTS - nowSec)
+
+        // Sprint 59: two buffer depth measures.
+        //
+        // optimisticBuffered — tail of frames handed to FrameRenderer.enqueueVideo().
+        //   Advances immediately when frames are appended to pendingVideoQueue.
+        //   WRONG for threshold decisions: the display layer hasn't accepted these frames yet.
+        //
+        // actualBuffered — tail of frames that have physically reached layer.enqueue()
+        //   inside FrameRenderer.performLayerEnqueue().  This is the real buffer depth.
+        //   The gap between the two is the "pending lag" — frames we think are buffered
+        //   but the layer will discard if the clock advances past them before delivery.
+        //
+        // All threshold decisions (underrun, low-watermark, recovery) use actualBuffered.
+        // optimisticBuffered is retained for the LOW WATERMARK refill-size calculation so
+        // we don't over-fetch when the pending queue is large and will drain soon.
+        let optimisticBuffered: Double = max(0, feeder.lastEnqueuedVideoPTS - nowSec)
+        let actualLayerPTS = renderer.actualLayerEnqueuedMaxPTS
+        let actualBuffered: Double = actualLayerPTS.isValid
+            ? max(0, actualLayerPTS.seconds - nowSec)
+            : optimisticBuffered  // no frames through layer yet (startup) — use feeder tail
+
+        let buffered  = actualBuffered
         videoBuffered = buffered
         audioBuffered = max(0, feeder.lastEnqueuedAudioPTS - nowSec)
 
-        // ── Sprint 46: enhanced periodic log ─────────────────────────────────────
+        // ── Periodic log (Sprint 46 + Sprint 59 diagnostics) ─────────────────────
+        let pendingQ = renderer.pendingVideoQueueCount
+        let pendingLag = optimisticBuffered - actualBuffered
         if logCycle % policy.periodicLogInterval == 0 {
             let idxDur    = mkvDemuxer.map { String(format: "%.1f", $0.indexedDurationSeconds) } ?? "—"
             let idxTask   = backgroundIndexTask != nil ? "🔄" : "idle"
             let fullyIdx  = mkvDemuxer?.isFullyIndexed ?? true
             record("[feed] t=\(String(format: "%.1f", nowSec))s  "
-                 + "buf=\(String(format: "%.1f", buffered))s  "
+                 + "buf=\(String(format: "%.1f", actualBuffered))s  "           // actual (layer)
+                 + "optBuf=\(String(format: "%.1f", optimisticBuffered))s  "    // feeder tail
+                 + "pendingQ=\(pendingQ)  "                                     // frames not yet at layer
+                 + "lag=\(String(format: "%.2f", pendingLag))s  "              // gap = optBuf - buf
                  + "v=\(feeder.nextVideoSampleIdx)/\(feeder.videoSamplesTotal)  "
                  + "a=\(feeder.nextAudioSampleIdx)/\(feeder.audioSamplesTotal)  "
                  + "indexedDur=\(idxDur)s  indexTask=\(idxTask)  "
                  + "fullyIndexed=\(fullyIdx)  [\(state.statusLabel)]")
             // Sprint 54: log audio engine + player node state when audio is active.
-            // Key metric: playerNode=▶ playing  audioEngine=✅ running
             if renderer.audioRendererAttached {
                 record("[P4-diag] \(renderer.dualSyncDiagnostic)  "
                      + "audio=\(audioRendererStatusLabel())")
             }
+        }
+
+        // Sprint 59: warn when the pending lag is significant — this is the
+        // distortion signal.  If actualBuffered is near zero while optimisticBuffered
+        // looks healthy, the display layer is clock-starved while pendingVideoQueue
+        // holds frames it hasn't accepted yet.
+        if pendingLag > 1.0 && actualBuffered < policy.resumeThreshold {
+            record("[feed] ⚠️ PENDING-LAG  "
+                 + "actualBuf=\(String(format: "%.2f", actualBuffered))s  "
+                 + "optBuf=\(String(format: "%.2f", optimisticBuffered))s  "
+                 + "lag=\(String(format: "%.2f", pendingLag))s  "
+                 + "pendingQ=\(pendingQ)  "
+                 + "— layer has not accepted \(pendingQ) frames; clock may outrun delivery")
         }
 
         // ── Sprint 47 (rev 2): Proactive non-blocking background index extension ────
@@ -1122,14 +1160,23 @@ final class PlayerLabPlaybackController: ObservableObject {
         }
 
         // ── Normal low-watermark refill (Sprint 17) ───────────────────────────
+        //
+        // Sprint 59: threshold check uses actualBuffered (frames the layer has
+        // accepted) rather than optimisticBuffered (frames in pendingVideoQueue).
+        // refillSeconds uses optimisticBuffered so we don't over-fetch when the
+        // pending queue will drain shortly and fill the layer without a new HTTP fetch.
         guard policy.isLowWatermark(bufferedSeconds: buffered) else { return }
 
-        let toFill     = policy.refillSeconds(currentlyBuffered: buffered)
+        let toFill     = policy.refillSeconds(currentlyBuffered: optimisticBuffered)
         let videoCount = feeder.videoSamplesFor(seconds: toFill)
-        record("[feed] ⚠️ LOW WATERMARK  buf=\(String(format: "%.2f", buffered))s "
+        record("[feed] ⚠️ LOW WATERMARK  "
+             + "actualBuf=\(String(format: "%.2f", actualBuffered))s  "
+             + "optBuf=\(String(format: "%.2f", optimisticBuffered))s  "
+             + "pendingQ=\(pendingQ)  "
              + "< \(policy.lowWatermarkSeconds)s  "
              + "cursor=\(feeder.nextVideoSampleIdx)/\(feeder.videoSamplesTotal)  "
-             + "tail=\(String(format: "%.2f", feeder.lastEnqueuedVideoPTS))s  "
+             + "feederTail=\(String(format: "%.2f", feeder.lastEnqueuedVideoPTS))s  "
+             + "layerTail=\(actualLayerPTS.isValid ? String(format: "%.2f", actualLayerPTS.seconds) : "n/a")s  "
              + "layer=\(renderer.layerStatusDescription)  "
              + "refilling \(String(format: "%.1f", toFill))s ≈\(videoCount) samples")
 

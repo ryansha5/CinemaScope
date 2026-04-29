@@ -83,6 +83,26 @@ final class FrameRenderer {
     /// Number of video sample buffers successfully enqueued to the display layer.
     private(set) var framesEnqueued: Int = 0
 
+    /// PTS of the last frame actually handed to layer.enqueue() inside performLayerEnqueue().
+    ///
+    /// Sprint 59: This is the *real* video buffer tail — updated only when the frame
+    /// physically reaches AVSampleBufferDisplayLayer, not when it is appended to
+    /// pendingVideoQueue.  feeder.lastEnqueuedVideoPTS advances immediately when frames
+    /// are appended to pendingVideoQueue; this property lags behind until
+    /// isReadyForMoreMediaData fires and drainVideoQueue() delivers the frames.
+    ///
+    /// Use this (not feeder.lastEnqueuedVideoPTS) for buffer-depth calculations that
+    /// drive underrun detection and watermark triggers.  The difference between the two
+    /// is the "pending lag" — frames the pipeline thinks are buffered but the display
+    /// layer hasn't accepted yet.
+    private(set) var actualLayerEnqueuedMaxPTS: CMTime = .invalid
+
+    /// Number of frames currently sitting in pendingVideoQueue, waiting for
+    /// isReadyForMoreMediaData to become true so drainVideoQueue() can deliver them.
+    /// Non-zero means the display layer's internal queue is full; these frames have
+    /// NOT yet been handed to layer.enqueue().
+    var pendingVideoQueueCount: Int { pendingVideoQueue.count }
+
     /// PTS of the first enqueued video sample.
     private(set) var firstFramePTS: CMTime = .invalid
 
@@ -302,6 +322,17 @@ final class FrameRenderer {
         layer.enqueue(sampleBuffer)
         let isFirst = (framesEnqueued == 0)
         framesEnqueued += 1
+
+        // Sprint 59: track the highest PTS that has actually reached the layer.
+        // This is the ground-truth buffer tail used by the feed loop for underrun
+        // detection.  It lags feeder.lastEnqueuedVideoPTS by however many frames
+        // are queued in pendingVideoQueue waiting for isReadyForMoreMediaData.
+        if pts.isValid {
+            if !actualLayerEnqueuedMaxPTS.isValid
+                || CMTimeCompare(pts, actualLayerEnqueuedMaxPTS) > 0 {
+                actualLayerEnqueuedMaxPTS = pts
+            }
+        }
 
         // ── Status after enqueue ──────────────────────────────────────────────
         let statusAfter = layer.status
@@ -576,6 +607,7 @@ final class FrameRenderer {
         }
         framesEnqueued = 0
         firstFramePTS  = .invalid
+        actualLayerEnqueuedMaxPTS = .invalid   // Sprint 59: reset layer-tail tracking
         fputs("[FrameRenderer] flushAll() — layer + audio cleared, rate=0\n", stderr)
     }
 
@@ -589,6 +621,7 @@ final class FrameRenderer {
         }
         framesEnqueued = 0
         firstFramePTS  = .invalid
+        actualLayerEnqueuedMaxPTS = .invalid   // Sprint 59: reset layer-tail tracking
     }
 
     /// Flush only the audio player (clears all scheduled PCM buffers and stops).
@@ -626,6 +659,7 @@ final class FrameRenderer {
         }
         framesEnqueued = 0
         firstFramePTS  = .invalid
+        actualLayerEnqueuedMaxPTS = .invalid   // Sprint 59: reset layer-tail tracking
         fputs("[FrameRenderer] flushForSeek() — pipeline quiesced, layer + audio cleared\n", stderr)
     }
 
