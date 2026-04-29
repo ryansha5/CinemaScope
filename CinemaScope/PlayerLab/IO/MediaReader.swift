@@ -92,7 +92,16 @@ final class MediaReader {
         func slice(offset: Int64, length: Int) -> Data? {
             guard offset >= self.offset, offset + Int64(length) <= endOffset else { return nil }
             let start = Int(offset - self.offset)
-            return data[start ..< start + length]
+            // IMPORTANT: return a contiguous copy (startIndex == 0), NOT a slice.
+            //
+            // Data subscript `data[start..<end]` returns a *slice* whose startIndex
+            // equals `start`, not 0.  Callers in extractPackets use zero-based
+            // sliceOff offsets with subdata(in:), which takes absolute Data.Index
+            // values.  If startIndex != 0, every subdata call resolves to the
+            // wrong position and a range-check trap follows.
+            //
+            // subdata(in:) returns a new contiguous Data with startIndex == 0.
+            return data.subdata(in: start ..< start + length)
         }
     }
     private var readCache: ReadCache? = nil
@@ -310,7 +319,12 @@ final class MediaReader {
                                                         fileSize: Int64(data.count))
                 }
                 let end = min(start + length, data.count)
-                return data[start ..< end]
+                // IMPORTANT: data[start..<end] is a Data *slice* with startIndex=start
+                // (not 0).  Callers in extractPackets use zero-based sliceOff offsets
+                // with subdata(in:), which takes absolute Data.Index values.  A slice
+                // with non-zero startIndex would make every subdata call crash.
+                // Always return a contiguous copy so startIndex == 0.
+                return Data(data[start ..< end])
 
             default:
                 throw MediaReaderError.httpError(statusCode: status)

@@ -28,10 +28,29 @@ struct BufferPolicy {
     let initialWindowSeconds: Double = 3.0
 
     /// Desired buffer depth during normal playback.
-    let targetBufferSeconds:  Double = 8.0
+    /// Sprint 58: raised from 8.0 → 15.0 to stay above the new 10.0 s low-watermark.
+    let targetBufferSeconds:  Double = 15.0
 
     /// Low-watermark that triggers a background refill in the normal feed path.
-    let lowWatermarkSeconds:  Double = 2.0
+    ///
+    /// Sprint 55: raised from 2.0 → 5.0 to prevent audio underrun.
+    /// Sprint 58: raised from 5.0 → 10.0.
+    ///
+    /// Rationale: Gap-tolerant HTTP coalescing (Sprint 57) collapses an entire
+    /// 10 s refill batch into 1–2 HTTP requests.  For high-bitrate HEVC content
+    /// (100 KB+ frames, ~2 MB/s average), a single refill batch can be 15–20 MB.
+    /// At 5 MB/s download throughput (typical over LAN on the tvOS simulator),
+    /// that batch takes ~4 s to download.
+    ///
+    /// The feed loop fires at most every ~1 s.  With the old 5.0 s watermark, the
+    /// actual buffer when the download starts can be as low as 4.0 s.  A 4 s
+    /// download drains the buffer to ≈ 0 s → underrun → display layer discards
+    /// "late" frames → visible distortion.
+    ///
+    /// With the new 10.0 s watermark, the actual buffer at download start is ≥ 9 s.
+    /// A 4 s download leaves ≥ 5 s in the buffer — safely above the 0.5 s underrun
+    /// threshold even for very large high-bitrate refill batches.
+    let lowWatermarkSeconds:  Double = 10.0
 
     /// Minimum seconds to request per feed call (guards against tiny chunks
     /// when the deficit is very small).

@@ -3,6 +3,11 @@
 // Extracted from PlayerLabPlaybackController (Sprints 13, 22, 24).
 // Sprint 33 — DTS-Core passthrough path added.
 // Sprint 36 — AudioTrackPlaybackMode parameter; effectiveFourCC dispatch.
+// Sprint 54 — ascChannelCount() added; makeMPEG4AAC now derives channel count
+//             from the ASC rather than the MKV track header.  Track-header ch
+//             can disagree with ASC channelConfiguration (e.g. header says 6,
+//             ASC says 2) — the mismatch caused ACMP4AACBaseDecoder err = -1
+//             on every packet.  ASC is now authoritative.
 //
 // Handles:
 //   • MP4 AAC   (esds payload → parseAudioSpecificConfig → magic cookie)
@@ -119,6 +124,36 @@ enum AudioFormatFactory {
         sampleRate:   Double,
         record:       (String) -> Void
     ) -> CMAudioFormatDescription? {
+
+        // Sprint 54 fix: the ASBD channel count MUST match the AudioSpecificConfig.
+        //
+        // For MKV AAC, `channelCount` comes from the MKV TrackEntry Audio/Channels
+        // element, which may disagree with the channelConfiguration field embedded
+        // in the ASC.  The decoder is authoritative: it decodes exactly the channels
+        // the ASC describes.  If the ASBD claims more channels than the ASC,
+        // ACMP4AACBaseDecoder fails every packet with err = -1 because it cannot
+        // produce the declared channel count from the bitstream.
+        //
+        // Example: ASC = 0x11 0x90 → AAC-LC 48 kHz channelConfig=2 (stereo),
+        // but MKV header claimed ch=6.  Using ch=6 in the ASBD caused 100% decode
+        // failures.  Using the ASC-derived channel count (2) fixes them.
+        // Diagnostic: log raw ASC bytes so we can verify what the decoder is actually seeing.
+        let ascHex = asc.map { String(format: "%02X", $0) }.joined(separator: " ")
+        record("  [ASC-debug] count=\(asc.count) startIndex=\(asc.startIndex) bytes=[\(ascHex)]")
+
+        let ascCh   = ascChannelCount(from: asc)
+        record("  [ASC-debug] ascChannelCount=\(ascCh.map { "\($0)" } ?? "nil")  trackHeader ch=\(channelCount)")
+
+        let effCh: UInt16
+        if let a = ascCh, a > 0 {
+            if a != channelCount {
+                record("  ⚠️ [AAC] ASC channelConfig=\(a) overrides track header ch=\(channelCount) — using ASC value")
+            }
+            effCh = a
+        } else {
+            effCh = channelCount   // ASC parse failed; fall back to track header
+        }
+
         var asbd = AudioStreamBasicDescription(
             mSampleRate:       sampleRate,
             mFormatID:         kAudioFormatMPEG4AAC,
@@ -126,22 +161,48 @@ enum AudioFormatFactory {
             mBytesPerPacket:   0,
             mFramesPerPacket:  1024,
             mBytesPerFrame:    0,
-            mChannelsPerFrame: UInt32(channelCount),
+            mChannelsPerFrame: UInt32(effCh),
             mBitsPerChannel:   0,
             mReserved:         0
         )
+
+        // Provide an explicit AudioChannelLayout so that AVAudioFormat(cmAudioFormatDescription:)
+        // returns a fully-initialised object.  Without a layout the format description is
+        // technically valid for CoreMedia but leaves AVAudioFormat with a nil/dangling internal
+        // layout pointer — which causes AVAudioConverter(from:to:) to crash with EXC_BAD_ACCESS.
+        let layoutTag: AudioChannelLayoutTag
+        switch effCh {
+        case 1:  layoutTag = kAudioChannelLayoutTag_Mono
+        case 2:  layoutTag = kAudioChannelLayoutTag_Stereo
+        case 3:  layoutTag = kAudioChannelLayoutTag_MPEG_3_0_A
+        case 4:  layoutTag = kAudioChannelLayoutTag_MPEG_4_0_A
+        case 5:  layoutTag = kAudioChannelLayoutTag_MPEG_5_0_A
+        case 6:  layoutTag = kAudioChannelLayoutTag_MPEG_5_1_A  // L R C LFE Ls Rs
+        case 7:  layoutTag = kAudioChannelLayoutTag_MPEG_6_1_A
+        case 8:  layoutTag = kAudioChannelLayoutTag_MPEG_7_1_A
+        default: layoutTag = kAudioChannelLayoutTag_DiscreteInOrder
+                           | AudioChannelLayoutTag(effCh)
+        }
+        var layout = AudioChannelLayout()
+        layout.mChannelLayoutTag         = layoutTag
+        layout.mChannelBitmap            = AudioChannelBitmap(rawValue: 0)
+        layout.mNumberChannelDescriptions = 0
+        let layoutSize = MemoryLayout<AudioChannelLayout>.size
+
         var desc: CMAudioFormatDescription?
-        let status = asc.withUnsafeBytes { (ptr: UnsafeRawBufferPointer) -> OSStatus in
-            CMAudioFormatDescriptionCreate(
-                allocator:            kCFAllocatorDefault,
-                asbd:                 &asbd,
-                layoutSize:           0,
-                layout:               nil,
-                magicCookieSize:      asc.count,
-                magicCookie:          ptr.baseAddress!,
-                extensions:           nil,
-                formatDescriptionOut: &desc
-            )
+        let status = asc.withUnsafeBytes { (ascPtr: UnsafeRawBufferPointer) -> OSStatus in
+            withUnsafePointer(to: layout) { layoutPtr in
+                CMAudioFormatDescriptionCreate(
+                    allocator:            kCFAllocatorDefault,
+                    asbd:                 &asbd,
+                    layoutSize:           layoutSize,
+                    layout:               layoutPtr,
+                    magicCookieSize:      asc.count,
+                    magicCookie:          ascPtr.baseAddress!,
+                    extensions:           nil,
+                    formatDescriptionOut: &desc
+                )
+            }
         }
         if status != noErr {
             record("  ⚠️ CMAudioFormatDescriptionCreate (AAC) failed: \(status)")
@@ -246,6 +307,50 @@ enum AudioFormatFactory {
         record("  ✅ DTS-Core format description  ch=\(channelCount) sr=\(Int(sampleRate)) Hz  "
              + "(attempting passthrough)")
         return desc
+    }
+
+    // MARK: - AudioSpecificConfig — channel count extractor
+    //
+    // Extracts the channelConfiguration field from an AudioSpecificConfig (ISO 14496-3).
+    //
+    // ASC bit layout (for audioObjectType ≤ 30 and samplingFrequencyIndex ≠ 0xF):
+    //   bits  0– 4  audioObjectType        (5 bits)
+    //   bits  5– 8  samplingFrequencyIndex (4 bits)
+    //   bits  9–12  channelConfiguration   (4 bits)
+    //
+    // Returns nil if the ASC is too short, uses an extended audioObjectType (31),
+    // or uses a literal sample-rate escape (sfi == 0xF) — in those cases the caller
+    // falls back to the track-header channel count.
+    //
+    // channelConfiguration values:
+    //   0 = program_config_element (complex; not handled here)
+    //   1 = C           (mono)
+    //   2 = L R         (stereo)
+    //   3 = C L R       (3.0)
+    //   4 = C L R S     (4.0)
+    //   5 = C L R Ls Rs (5.0)
+    //   6 = C L R Ls Rs LFE   (5.1)
+    //   7 = C L R Ls Rs Lss Rss LFE (7.1)
+
+    private static func ascChannelCount(from asc: Data) -> UInt16? {
+        guard asc.count >= 2 else { return nil }
+        // Use startIndex-relative access: asc may be a subdata() slice whose
+        // startIndex is non-zero.  asc[0] would be out of bounds in that case.
+        let b0 = Int(asc[asc.startIndex])
+        let b1 = Int(asc[asc.startIndex + 1])
+
+        // audioObjectType: b0[7..3]
+        let aot = (b0 >> 3) & 0x1F
+        guard aot != 31 else { return nil }   // extended AOT — skip
+
+        // samplingFrequencyIndex: b0[2..0] ++ b1[7]
+        let sfi = ((b0 & 0x07) << 1) | ((b1 >> 7) & 0x01)
+        guard sfi != 0x0F else { return nil }  // 24-bit literal rate escape — skip
+
+        // channelConfiguration: b1[6..3]
+        let cc = (b1 >> 3) & 0x0F
+        guard cc > 0 else { return nil }       // 0 = program_config_element — skip
+        return UInt16(cc)
     }
 
     // MARK: - AudioSpecificConfig parser (MP4 esds payload)

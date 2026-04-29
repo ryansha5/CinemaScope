@@ -164,66 +164,65 @@ New `looksLikeLPWithTrailingBytes` private static function added to `PacketFeede
 
 ## Phase 4 — Audio Isolation (videoOnly: false)
 
-**Status: ⏳ IN PROGRESS — Sprint 52 fix committed, pending device verification**
+**Status: ⏳ IN PROGRESS — Sprint 54 fix committed, pending device verification**
 
-### What was attempted
+### Root cause history
 
-Phase 4 uses `audioController` (`videoOnly: false`) — a completely separate `PlayerLabPlaybackController` instance with its own `FrameRenderer`, `AVSampleBufferRenderSynchronizer`, and `AVSampleBufferAudioRenderer`.
+Phase 4 uses `audioController` (`videoOnly: false`) — a completely separate `PlayerLabPlaybackController` instance with its own `FrameRenderer`.
 
 Test file: 1080p HEVC + AAC 5.1.
 
-### Diagnostic log (500ms after play())
-
-```
-prepare() → Ready
-  hasAudio=true  audioAttached=true
-State → ▶ Playing
-[P4-diag] audioRenderer.status=rendering ✅
-[P4-diag] tbRate=0.0  tbTime=0.043s
-```
-
-Everything is set up correctly. The audio renderer primed. But `tbRate=0.0` — the synchronizer's CMTimebase clock is frozen at the initial anchor PTS and never starts.
-
-### Root cause
-
-`AVSampleBufferRenderSynchronizer.setRate(1)` fails silently on tvOS when `AVSampleBufferAudioRenderer` is attached to the same synchronizer. The failure is permanent — no amount of retrying `setRate(1)` un-blocks it. A 20-attempt retry loop (2 seconds, every 100 ms) confirmed this.
-
-This behaviour occurs even when:
-- `AVAudioSession` is active (`.playback` / `.moviePlayback`) before attachment
-- Audio renderer attachment is deferred until `prepare()` step 7 (after session activation, before `feedWindow`)
-- Audio renderer has already reached `.rendering` status
-
-The synchronizer accepting `rate=1` as a property value but the underlying CMTimebase staying at rate=0 is a known tvOS-specific divergence between `synchronizer.rate` (API value) and `CMTimebaseGetRate(synchronizer.timebase)` (actual clock rate).
-
-### Attempted fixes
+**Confirmed platform bug:** `AVSampleBufferRenderSynchronizer.setRate(1)` fails silently on tvOS when `AVSampleBufferAudioRenderer` is attached — the underlying CMTimebase stays at `rate=0` permanently. This was confirmed on both tvOS simulator AND real Apple TV hardware with `aTbRate=0.0` in the log.
 
 | Attempt | Result |
 |---------|--------|
-| Defer `attachAudioRenderer()` until after `AVAudioSession.setActive(true)` | No change — clock still stalls |
-| 20-attempt retry loop re-issuing `setRate(1, time: .invalid)` every 100 ms | No change — all retries fail |
-| Separate `audioSynchronizer` for the audio renderer (video on `synchronizer`, audio on `audioSynchronizer`) | Caused Phase 3 regression — `PlayerLabDisplayView.updateUIView` was calling `attachDisplayLayer` on every SwiftUI re-render, repeatedly tearing and re-attaching the display layer mid-playback → all distortion symptoms returned |
+| Defer `attachAudioRenderer()` until after `AVAudioSession.setActive(true)` | No change |
+| 20-attempt retry loop re-issuing `setRate(1, .invalid)` every 100 ms | No change |
+| Sprint 52: separate `audioSynchronizer` (no display layer, audio only) | `aTbRate=0.0` still — bug is in `AVSampleBufferAudioRenderer` + synchronizer interaction, not the shared-renderer setup |
 
-### Regression note
+`AVSampleBufferRenderSynchronizer` + `AVSampleBufferAudioRenderer` is fundamentally broken for audio on tvOS. The only reliable fix is to bypass it entirely.
 
-The separate-synchronizer approach modified `PlayerLabDisplayView.updateUIView` to re-attach the display layer on prop change. SwiftUI calls `updateUIView` on every state change during playback (frame count, buffer level, etc.), so the layer was being removed and re-added continuously, disrupting the display link and causing decoder corruption.
+### Sprint 54 fix — AVAudioEngine + AVAudioConverter + AVAudioPlayerNode
 
-**All Phase 4 changes have been reverted.** Phase 3 code is restored to the state that preceded Phase 4 work (i.e., the `isDolbyVisionDualLayer` fix is present but the open distortion question remains).
+`AVSampleBufferAudioRenderer` and both `AVSampleBufferRenderSynchronizer` audio instances are removed. The new audio path is:
 
-### Sprint 52 fix — dual-synchronizer architecture
-
-`PlayerLabDisplayView.updateUIView` was already correct (resizes the layer only, never re-attaches), so the identity-check prerequisite from the earlier regression was already satisfied.
-
-**Fix:** `FrameRenderer` now uses two synchronizers:
-- `synchronizer` — `AVSampleBufferDisplayLayer` only (video clock, unchanged from Phase 2/3)
-- `audioSynchronizer` — `AVSampleBufferAudioRenderer` only (new in Sprint 52)
-
-`attachAudioRenderer()` now adds the audio renderer to `audioSynchronizer` instead of `synchronizer`. Both clocks are anchored to the same PTS in `play(from:)`, `resume()`, `seek(to:)`, and all direct `setRate` calls in the controller.
-
-**Verification:** Run Phase 4 in Quarantine Lab and check the log for:
 ```
-[FrameRenderer] [P4/Sprint52] aTbRate=1.0  ✅ clock running
+CMSampleBuffer (AAC compressed)
+    → AVAudioConverter (AAC → Float32 PCM, non-interleaved)
+    → AVAudioPlayerNode  (sequential buffer scheduling, no absolute AVAudioTime)
+    → AVAudioEngine      → hardware output
 ```
-If `aTbRate=0.0` (the stall persists even with separate synchronizers), the fallback is `AVAudioEngine` + `AVAudioPlayerNode` with manual PTS scheduling.
+
+**AV sync:** `playerNode.play()` is called at the same wall-clock instant as `synchronizer.setRate(1, time: startPTS)`. Both run on system-clock-backed hardware (audio device clock + display vsync), so drift is typically < 1 ms/minute.
+
+**Key changes:**
+- `FrameRenderer.startAudioEngine(inputDesc: CMAudioFormatDescription)` replaces `attachAudioRenderer()`
+- `AVAudioFormat(cmAudioFormatDescription:)` extracts the AAC magic cookie for the converter
+- `AVAudioConverter(from: aacFmt, to: pcmFmt)` decodes each compressed CMSampleBuffer
+- `playerNode.scheduleBuffer(pcmBuf, completionHandler: nil)` queues PCM buffers sequentially
+- `playerNode.stop()` replaces `audioSynchronizer.rate = 0` + `audioRenderer.flush()` in all flush paths
+- `renderer.resumeAudioIfNeeded()` replaces `audioSynchronizer.setRate(1, ...)` after seek/recovery
+- `renderer.pauseAudioPlayer()` replaces `audioSynchronizer.rate = 0` on underrun/EOS
+
+**Verification:** Run Phase 4 in Quarantine Lab and check the log immediately after hitting Play:
+
+**Pass:**
+```
+[FrameRenderer] [P4/Sprint54] playerNode.play()  isPlaying=true  ✅ audio running
+[P4-diag] vTbRate=1.0  ...  audioEngine=✅ running  playerNode=▶ playing  audio=▶ playing
+```
+
+**Fail (engine didn't start):**
+```
+[FrameRenderer] ❌ AVAudioEngine start failed: <error>
+```
+→ Check AVAudioSession activation log line above this; ensure `.playback` category is active.
+
+**Fail (converter error):**
+```
+[FrameRenderer] [S54] AAC→PCM convert error: <error>
+```
+→ The `CMAudioFormatDescription` may not contain a valid AudioSpecificConfig. Check `[6] Building CMAudioFormatDescription` log lines in prepare().
 
 ---
 
@@ -235,8 +234,8 @@ If `aTbRate=0.0` (the stall persists even with separate synchronizers), the fall
 | `Features/Settings/SettingsView.swift` | Added "Quarantine Lab" entry point button |
 | `PlayerLab/Core/PacketFeeder.swift` | `isDolbyVisionDualLayer` instance flag; BL size filter gated on it; NAL stripping gated on `isHEVC`; codec detection split H.264 vs HEVC; `avcNalUnitLength` helper added; `trimLPTrailingBytes` fix for LP padding misclassification; `[HEVC-KF]`/`[HEVC-AnnexB]`/`[HEVC-HEAD/TAIL]` extended diagnostics; **Sprint 51:** GOP-boundary batch snapping (`nextVideoKeyframeSampleIndex` + `limitedVideo` extension); **Sprint 50:** synthetic HEVC DTS; **Sprint 53:** `detectNALFormat` false-positive fix — LP check before start-code check; `looksLikeLPWithTrailingBytes` helper |
 | `PlayerLab/Demux/MKV/MKVDemuxer.swift` | `isDolbyVisionDualLayer` computed property; `firstVideoKeyframeIndex` 3-condition DV detection; first-keyframe guard raised 2 KB → 30 KB (BL IDR on test file is 3091 B); **Sprint 50:** both `backgroundScanCursor` fence-post bugs fixed; `[IndexDup]` diagnostic; **Sprint 51:** `nextVideoKeyframeSampleIndex(from:)` |
-| `PlayerLab/Render/FrameRenderer.swift` | `videoOnlyDiagnostic` static → instance `let`; `init(videoOnly:)`; deferred `attachAudioRenderer()`; `audioRendererAttached` flag; all flush methods guard audio on `audioRendererAttached`; **Sprint 52:** `audioSynchronizer` (dedicated audio clock); all transport methods drive both clocks; `dualSyncDiagnostic` property; `[P4/Sprint52]` diagnostic in `play()` |
-| `PlayerLab/Render/PlayerLabPlaybackController.swift` | `init(videoOnly:)` parameter; `feeder.isDolbyVisionDualLayer` wiring in `.mkv` prepare case; `attachAudioRenderer()` called after `activateAudioSession()` when `hasAudio`; **Sprint 52:** all direct `renderer.synchronizer.setRate` calls also drive `audioSynchronizer`; `[P4-diag]` periodic dual-clock log; `audioRendererStatusLabel()` helper |
+| `PlayerLab/Render/FrameRenderer.swift` | `videoOnlyDiagnostic` static → instance `let`; `init(videoOnly:)`; `audioRendererAttached` flag; all flush methods guard audio; **Sprint 52:** `audioSynchronizer` (dedicated audio clock — later confirmed broken on tvOS); **Sprint 54:** `AVSampleBufferAudioRenderer` + `audioSynchronizer` removed; `AVAudioEngine` + `AVAudioPlayerNode` + `AVAudioConverter` (AAC → PCM) replace them; `startAudioEngine(inputDesc:)` replaces `attachAudioRenderer()`; `resumeAudioIfNeeded()` + `pauseAudioPlayer()` helpers; updated `dualSyncDiagnostic`; `[P4/Sprint54]` log in `play()` |
+| `PlayerLab/Render/PlayerLabPlaybackController.swift` | `init(videoOnly:)` parameter; `feeder.isDolbyVisionDualLayer` wiring; **Sprint 52:** `audioSynchronizer` transport calls; **Sprint 54:** all `audioSynchronizer` calls replaced with `resumeAudioIfNeeded()` / `pauseAudioPlayer()`; `startAudioEngine(inputDesc: feeder.audioFormatDesc)` call in step 7; updated `audioRendererStatusLabel()` |
 | `Services/Emby/EmbyModels.swift` | `EmbyLibrary: Equatable` |
 | `CLAUDE.md` | **New file** — architectural reference: pipeline diagram, critical invariants, key files, diagnostics guide |
 
@@ -247,6 +246,6 @@ If `aTbRate=0.0` (the stall persists even with separate synchronizers), the fall
 | # | Issue | Severity | Next Step |
 |---|-------|----------|-----------|
 | 1 | ~~Phase 3 HEVC distortion~~ | ~~High~~ | ✅ **Resolved** — Sprint 50 (frameIndex fence-post + duplicate detection) + Sprint 51 (GOP-boundary batch snapping). Confirmed clean on 3840×2160 test file. |
-| 2 | Phase 4 — AVSampleBufferRenderSynchronizer clock stall with audio renderer on tvOS | High | Sprint 52 committed (`be0a1ec`). Dual-synchronizer architecture implemented. **Needs device run** — check log for `[P4/Sprint52] aTbRate=1.0 ✅`. Fallback if still stalled: AVAudioEngine + AVAudioPlayerNode. |
+| 2 | Phase 4 audio — AVSampleBufferRenderSynchronizer confirmed broken on tvOS (both simulator + hardware) | High | Sprint 54 committed. `AVSampleBufferAudioRenderer` removed; replaced with `AVAudioEngine` + `AVAudioConverter` + `AVAudioPlayerNode`. **Needs device run** — check log for `[P4/Sprint54] playerNode.play()  isPlaying=true  ✅ audio running` and `[P4-diag] playerNode=▶ playing`. |
 | 3 | ~~Phase 4 HEVC distortion — LP false-positive Annex B detection~~ | ~~High~~ | ✅ **Resolved** — Sprint 53. `detectNALFormat` fast-path removed; LP validation now runs first. `[HEVC-AnnexB]` events should drop to zero for LP-encoded MKV. Needs device verification. |
 | 4 | Phase 3 buffering/stuttering under heavy load | Low | Separate from distortion. Investigate read-ahead depth and decoder queue pressure once Phase 4 is confirmed. |

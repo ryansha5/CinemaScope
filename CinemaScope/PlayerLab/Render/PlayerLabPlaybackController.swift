@@ -484,12 +484,18 @@ final class PlayerLabPlaybackController: ObservableObject {
         // ── Step 7: Load initial window (SC7 — feeder.feedWindow) ────────────
         //
         // Activate AVAudioSession before the first audio buffer is enqueued,
-        // then attach the audio renderer to the synchronizer.  Order matters:
-        // attaching the renderer before the session is active causes the
-        // synchronizer timebase to stall (rate appears 1 but clock never runs).
+        // then start the AVAudioEngine (Sprint 54 path).  Order matters:
+        // AVAudioSession must be active before AVAudioEngine starts.
         if hasAudio {
             activateAudioSession()
-            renderer.attachAudioRenderer()
+            // Sprint 54: startAudioEngine replaces attachAudioRenderer.
+            // AVSampleBufferAudioRenderer is gone — AVAudioEngine + AVAudioConverter
+            // + AVAudioPlayerNode bypass the broken tvOS synchronizer clock.
+            if let afd = feeder.audioFormatDesc {
+                renderer.startAudioEngine(inputDesc: afd)
+            } else {
+                record("  ⚠️ [7] hasAudio=true but feeder.audioFormatDesc is nil — audio engine not started")
+            }
         }
 
         // For Dolby Vision Profile 7 dual-layer MKV, the first MKV cluster
@@ -828,9 +834,9 @@ final class PlayerLabPlaybackController: ObservableObject {
 
         // ── Phase 4: CLOCK — re-anchor synchronizer at keyframe PTS ──────────
         renderer.synchronizer.setRate(wasPlaying ? 1 : 0, time: keyframePTS)
-        // Sprint 52: re-anchor audio synchronizer to the same position.
-        if renderer.audioRendererAttached {
-            renderer.audioSynchronizer.setRate(wasPlaying ? 1 : 0, time: keyframePTS)
+        // Sprint 54: playerNode was stopped by flushForSeek(); restart it if playing.
+        if wasPlaying && renderer.audioRendererAttached {
+            renderer.resumeAudioIfNeeded()
         }
         // Update startPTS so that a subsequent play() call (from .ready state)
         // resumes from the seeked position instead of the original prepare() PTS.
@@ -856,9 +862,9 @@ final class PlayerLabPlaybackController: ObservableObject {
         await seek(toFraction: 0)
         if wasPlaying, state != .playing {
             renderer.synchronizer.setRate(1, time: startPTS)
+            // Sprint 54: restart audio player node if needed.
             if renderer.audioRendererAttached {
-                renderer.audioSynchronizer.setRate(0, time: startPTS)
-                renderer.audioSynchronizer.setRate(1, time: .invalid)
+                renderer.resumeAudioIfNeeded()
             }
             state = .playing
             startFeedLoop()
@@ -944,12 +950,11 @@ final class PlayerLabPlaybackController: ObservableObject {
                  + "a=\(feeder.nextAudioSampleIdx)/\(feeder.audioSamplesTotal)  "
                  + "indexedDur=\(idxDur)s  indexTask=\(idxTask)  "
                  + "fullyIndexed=\(fullyIdx)  [\(state.statusLabel)]")
-            // Sprint 52 / Phase 4: log both synchronizer clocks when audio is active.
-            // Key metric: aTbRate must be 1.0 — if 0.0 the dual-sync fix did not resolve
-            // the clock stall.  Also watch drift(A-V): should stay within ±20 ms.
+            // Sprint 54: log audio engine + player node state when audio is active.
+            // Key metric: playerNode=▶ playing  audioEngine=✅ running
             if renderer.audioRendererAttached {
                 record("[P4-diag] \(renderer.dualSyncDiagnostic)  "
-                     + "audioRenderer.status=\(audioRendererStatusLabel())")
+                     + "audio=\(audioRendererStatusLabel())")
             }
         }
 
@@ -1025,29 +1030,23 @@ final class PlayerLabPlaybackController: ObservableObject {
             return
         }
 
-        // Edge case: cursor exhausted but indexing not confirmed done.
-        // Background task should already be in flight from the proactive trigger above.
-        // Log clearly if it isn't — that indicates a gap in the trigger logic.
-        if feeder.nextVideoSampleIdx >= feeder.videoSamplesTotal,
-           let mkv = mkvDemuxer, !mkv.isFullyIndexed {
-            let taskState = backgroundIndexTask != nil ? "running ✅" : "NOT running ⚠️ — re-triggering"
-            record("[IndexTask] cursor exhausted but not fully indexed  "
-                 + "cursor=\(feeder.nextVideoSampleIdx)=total  "
-                 + "indexedDur=\(String(format: "%.1f", mkv.indexedDurationSeconds))s  "
-                 + "indexTask=\(taskState)")
-            triggerBackgroundIndex(mkv: mkv, to: mkv.indexedDurationSeconds + 60.0)
-            // Fall through — feedWindow will return 0 frames this cycle, which is fine.
-            // Next cycle: totals updated by indexTask → normal refill resumes.
-        }
-
         // ── Underrun detection (Sprint 19) ────────────────────────────────────
+        //
+        // NOTE: This block is intentionally placed BEFORE the cursor-exhausted
+        // guard below (Sprint 58 fix).  The original placement had the cursor-
+        // exhausted guard returning early BEFORE this block, which meant the
+        // underrun check and clock-pause logic were never reached while the
+        // background indexer was running.  The video clock continued advancing
+        // with no frames to enqueue, frames fell "in the past" relative to the
+        // synchronizer, and the display layer discarded them silently — causing
+        // deterministic visual distortion at the start of every refill cycle.
         if state == .playing && policy.isUnderrun(bufferedSeconds: buffered) {
             let idxDur   = mkvDemuxer.map { String(format: "%.1f", $0.indexedDurationSeconds) } ?? "—"
             let taskState = backgroundIndexTask != nil ? "🔄 scanning" : "idle — waiting for network?"
             transition(to: .buffering, "underrun \(String(format: "%.2f", buffered))s")
             renderer.synchronizer.rate = 0
-            // Sprint 52: pause audio synchronizer on underrun too
-            if renderer.audioRendererAttached { renderer.audioSynchronizer.rate = 0 }
+            // Sprint 54: pause audio player on underrun
+            if renderer.audioRendererAttached { renderer.pauseAudioPlayer() }
             record("[Buffer] UNDERRUN  video=\(String(format: "%.2f", buffered))s  "
                  + "audio=\(String(format: "%.2f", audioBuffered))s  "
                  + "nextV=\(feeder.nextVideoSampleIdx)/\(feeder.videoSamplesTotal)  "
@@ -1087,15 +1086,39 @@ final class PlayerLabPlaybackController: ObservableObject {
                 transition(to: .playing, "buffer recovered \(String(format: "%.2f", newBuf))s")
                 let recoverTime = renderer.currentTime
                 renderer.synchronizer.setRate(1, time: recoverTime)
-                // Sprint 52: re-anchor audio synchronizer at current video time before resuming
-                // so it resumes from the same position (no A/V drift from the pause interval).
+                // Sprint 54: resume audio player node after buffer recovery.
                 if renderer.audioRendererAttached {
-                    renderer.audioSynchronizer.setRate(0, time: recoverTime)
-                    renderer.audioSynchronizer.setRate(1, time: .invalid)
+                    renderer.resumeAudioIfNeeded()
                 }
                 record("[Buffer] RESUME  video=\(String(format: "%.2f", newBuf))s")
             }
             return
+        }
+
+        // ── Cursor-exhausted guard (Sprint 57 / repositioned Sprint 58) ──────
+        //
+        // When the cursor has consumed all indexed frames AND the MKV indexer
+        // is still running, calling feedWindow yields 0 new frames and
+        // immediately triggers the LOW WATERMARK again — a tight spin loop that
+        // fires many times per second.
+        //
+        // Sprint 57 placed this guard ABOVE the underrun detection block, but
+        // that caused the clock-pause logic to be unreachable: the buffer drained
+        // silently while the app waited for the indexer, frames became "late",
+        // and the display layer discarded them (Sprint 58 fix).
+        //
+        // Correct placement: AFTER underrun/buffering so the clock can be paused
+        // when the buffer gets critically low, but BEFORE LOW WATERMARK so we
+        // don't spin-call feedWindow(0 frames) every cycle.
+        if feeder.nextVideoSampleIdx >= feeder.videoSamplesTotal,
+           let mkv = mkvDemuxer, !mkv.isFullyIndexed {
+            let taskState = backgroundIndexTask != nil ? "running ✅" : "NOT running ⚠️ — re-triggering"
+            record("[IndexTask] cursor exhausted but not fully indexed  "
+                 + "cursor=\(feeder.nextVideoSampleIdx)=total  "
+                 + "indexedDur=\(String(format: "%.1f", mkv.indexedDurationSeconds))s  "
+                 + "indexTask=\(taskState)")
+            triggerBackgroundIndex(mkv: mkv, to: mkv.indexedDurationSeconds + 60.0)
+            return  // wait for indexer — underrun already handled above if needed
         }
 
         // ── Normal low-watermark refill (Sprint 17) ───────────────────────────
@@ -1164,7 +1187,7 @@ final class PlayerLabPlaybackController: ObservableObject {
     private func onPlaybackEnded() {
         if state == .buffering {
             renderer.synchronizer.rate = 0
-            if renderer.audioRendererAttached { renderer.audioSynchronizer.rate = 0 }
+            if renderer.audioRendererAttached { renderer.pauseAudioPlayer() }
         }
         stopFeedLoop()
         stopTimeTracking()
@@ -1232,13 +1255,9 @@ final class PlayerLabPlaybackController: ObservableObject {
         return                        String(format: "%.2f GB",  Double(n) / 1_073_741_824)
     }
 
-    // Sprint 52: helper for [P4-diag] log line.
+    // Sprint 54: helper for [P4-diag] log line.
     private func audioRendererStatusLabel() -> String {
-        switch renderer.audioRenderer.status {
-        case .unknown:    return "unknown"
-        case .rendering:  return "rendering"
-        case .failed:     return "failed(\(renderer.audioRenderer.error?.localizedDescription ?? "?"))"
-        @unknown default: return "unknownFuture"
-        }
+        guard renderer.audioRendererAttached else { return "engine not started" }
+        return renderer.playerNode.isPlaying ? "▶ playing" : "⏸ paused/stopped"
     }
 }

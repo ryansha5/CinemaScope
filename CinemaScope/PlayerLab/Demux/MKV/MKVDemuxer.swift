@@ -544,7 +544,8 @@ final class MKVDemuxer {
         }
 
         log("  ✅ Indexed \(frameIndex.count) video / \(audioFrameIndex.count) audio / "
-          + "\(subtitleCues.count) SRT / \(pgsCues.count) PGS subtitle frames")
+          + "\(subtitleCues.count) SRT / \(pgsCues.count) PGS subtitle frames"
+          + (ebmlAudioBlocksIndexed > 0 ? "  [EBML-audio: \(ebmlAudioBlocksIndexed) blocks in initial scan]" : ""))
 
         // ── Build video TrackInfo ─────────────────────────────────────────────
         // Sprint 43: durationTicks uses fileDurationSeconds (true file duration from Info EBML)
@@ -822,6 +823,7 @@ final class MKVDemuxer {
         log("  [Background] indexed to \(String(format: "%.0f", indexedDurationSeconds))s "
           + "+\(videoAdded)v/+\(audioAdded)a  \(clusterCount) clusters  "
           + "\(String(format: "%.2f", elapsed))s"
+          + (ebmlAudioBlocksIndexed > 0 ? "  [EBML-audio: \(ebmlAudioBlocksIndexed) blocks]" : "")
           + (isFullyIndexed ? "  ✅ fully indexed" : ""))
 
         return (videoAdded, audioAdded)
@@ -1327,7 +1329,7 @@ final class MKVDemuxer {
         return RawBlockInfo(trackNum: trackNum, relTC: relTC,
                             isKeyframe: (flags & 0x80) != 0,
                             dataOffset: dataOffset, dataSize: dataSize,
-                            lacingType: (flags >> 2) & 0x03,   // bits 3:2 per Matroska spec
+                            lacingType: (flags >> 1) & 0x03,   // bits 2:1 per Matroska spec (lacing mask = 0x06)
                             durationTicks: nil)   // SimpleBlock has no BlockDuration
     }
 
@@ -1340,6 +1342,7 @@ final class MKVDemuxer {
     private var blockDiagCount         = 0
     private static let kBlockDiagMax   = 50
     private var lacedVideoBlocksDropped = 0
+    private var ebmlAudioBlocksIndexed  = 0   // Sprint 55: diagnostic counter
 
     private func decodeBlockGroup(_ elem: EBMLElement) async throws -> RawBlockInfo? {
         guard elem.payloadSize > 0 else { return nil }
@@ -1412,7 +1415,7 @@ final class MKVDemuxer {
         return RawBlockInfo(trackNum: trackNum, relTC: relTC,
                             isKeyframe: !hasRefBlock,
                             dataOffset: dataOffset, dataSize: dataSize,
-                            lacingType: (flags >> 2) & 0x03,   // bits 3:2 per Matroska spec
+                            lacingType: (flags >> 1) & 0x03,   // bits 2:1 per Matroska spec (lacing mask = 0x06)
                             durationTicks: blockDurTicks)   // Sprint 26
     }
 
@@ -1426,6 +1429,8 @@ final class MKVDemuxer {
                                                    totalSize:  raw.dataSize, basePTS: basePTS)
         case 2:  return await parseFixedLacedAudio(dataOffset: raw.dataOffset,
                                                     totalSize:  raw.dataSize, basePTS: basePTS)
+        case 3:  return await parseEBMLLacedAudio(dataOffset: raw.dataOffset,
+                                                   totalSize:  raw.dataSize, basePTS: basePTS)
         default: return []
         }
     }
@@ -1479,6 +1484,100 @@ final class MKVDemuxer {
         guard frameSize > 0 else { return [] }
         return buildLacedFrameInfos(sizes: Array(repeating: frameSize, count: frameCount),
                                     baseOffset: dataOffset + 1, basePTS: basePTS)
+    }
+
+    // MARK: - EBML lacing (Sprint 55)
+    //
+    // Matroska EBML lacing header format:
+    //   byte 0:      N-1, where N = number of laced frames
+    //   next bytes:  EBML unsigned vint → absolute size of frame 0
+    //   (N-2 more):  EBML signed vint → delta from previous frame size
+    //   last frame:  totalSize - headerBytes - sum(frame sizes 0..N-2)
+    //
+    // EBML vint width detection: count leading zero bits in first byte.
+    //   first byte 0x80..0xFF → 1 byte,  7-bit value  (mask off the 1 marker bit)
+    //   first byte 0x40..0x7F → 2 bytes, 14-bit value
+    //   first byte 0x20..0x3F → 3 bytes, 21-bit value
+    //   first byte 0x10..0x1F → 4 bytes, 28-bit value
+    //
+    // Signed vint bias (for delta sizes):
+    //   1-byte: bias = 2^6  - 1 = 63
+    //   2-byte: bias = 2^13 - 1 = 8191
+    //   3-byte: bias = 2^20 - 1 = 1048575
+    //   4-byte: bias = 2^27 - 1 = 134217727
+    //
+    // Before Sprint 55, these blocks fell into the `default: return []` branch in
+    // makeAudioFrames() and were silently dropped from the audio index.  The lacing
+    // fix in Sprint 54 (bits [2:1] instead of [3:2]) correctly identified them as
+    // type-3 EBML, but since EBML wasn't implemented the entire audio track was
+    // nearly empty — only unlaced/XIPH blocks were indexed.
+
+    private func parseEBMLLacedAudio(dataOffset: Int64, totalSize: Int,
+                                      basePTS: CMTime) async -> [MKVAudioFrameInfo] {
+        guard totalSize > 2 else { return [] }
+        ebmlAudioBlocksIndexed += 1
+        // Read enough for the lacing header; frame headers are compact.
+        let readLen = min(512, totalSize)
+        guard let hdr = try? await bufferedReader.readBytes(at: dataOffset, length: readLen),
+              hdr.count >= 2 else { return [] }
+
+        // ── Helper: read one EBML unsigned vint from hdr starting at hdr[at] ──
+        // Returns (value, bytesConsumed) or nil on error.
+        func readUVint(at start: Int) -> (value: Int, width: Int)? {
+            guard start < hdr.count else { return nil }
+            let b0 = Int(hdr[hdr.index(hdr.startIndex, offsetBy: start)])
+            let width: Int
+            if      b0 & 0x80 != 0 { width = 1 }
+            else if b0 & 0x40 != 0 { width = 2 }
+            else if b0 & 0x20 != 0 { width = 3 }
+            else if b0 & 0x10 != 0 { width = 4 }
+            else { return nil }              // ≥5-byte vint: bail
+            guard start + width <= hdr.count else { return nil }
+            var val = b0 & (0xFF >> width)   // strip the length marker bit
+            for i in 1..<width {
+                val = (val << 8) | Int(hdr[hdr.index(hdr.startIndex, offsetBy: start + i)])
+            }
+            return (val, width)
+        }
+
+        var hdrIdx = 0
+
+        // Byte 0: frameCount - 1
+        let frameCount = Int(hdr[hdr.startIndex]) + 1
+        hdrIdx = 1
+        guard frameCount >= 2 else {
+            // Degenerate: 1 frame — treat as unlaced
+            return [MKVAudioFrameInfo(fileOffset: dataOffset, size: totalSize, pts: basePTS)]
+        }
+
+        var frameSizes = [Int]()
+        frameSizes.reserveCapacity(frameCount)
+
+        // Frame 0: absolute size (unsigned vint)
+        guard let (sz0, w0) = readUVint(at: hdrIdx), sz0 > 0 else { return [] }
+        frameSizes.append(sz0)
+        hdrIdx += w0
+
+        // Frames 1..frameCount-2: signed delta vints
+        for _ in 1..<(frameCount - 1) {
+            guard let (rawU, w) = readUVint(at: hdrIdx) else { return [] }
+            hdrIdx += w
+            let bias  = (1 << (7 * w - 1)) - 1    // 63 / 8191 / 1048575 / …
+            let delta = rawU - bias
+            let prev  = frameSizes.last!
+            let next  = prev + delta
+            guard next > 0 else { return [] }
+            frameSizes.append(next)
+        }
+
+        // Last frame: whatever bytes remain after the header and preceding frames
+        let lastSize = totalSize - hdrIdx - frameSizes.reduce(0, +)
+        guard lastSize > 0 else { return [] }
+        frameSizes.append(lastSize)
+
+        return buildLacedFrameInfos(sizes: frameSizes,
+                                    baseOffset: dataOffset + Int64(hdrIdx),
+                                    basePTS: basePTS)
     }
 
     private func buildLacedFrameInfos(sizes: [Int], baseOffset: Int64,
@@ -1833,6 +1932,20 @@ final class MKVDemuxer {
             return Loc(idx: i, fileOff: index[i].fileOffset, size: index[i].size)
         }
 
+        // Sprint 58 diagnostic: log the first few raw index entries for every audio
+        // batch.  This fires once per refill cycle (cheap) and prints the actual
+        // fileOffset / size values BEFORE sorting so we can spot any corrupt entry
+        // that could cause a bad sliceOff or chunk-overrun crash downstream.
+        if streamType == .audio {
+            let diagEnd = min(startIndex + 5, endIndex)
+            var diagLines = "[extractPackets-AudioDiag] audio batch startIdx=\(startIndex) count=\(count) (showing first \(diagEnd - startIndex)):"
+            for i in startIndex..<diagEnd {
+                let f = index[i]
+                diagLines += "\n  [\(i)] fileOff=\(f.fileOffset)  size=\(f.size)  pts=\(String(format: "%.3f", f.pts.seconds))s"
+            }
+            fputs(diagLines + "\n", stderr)
+        }
+
         // For video: re-sort the extracted batch by fileOffset (= decode order).
         //
         // AVSampleBufferDisplayLayer / VideoToolbox requires frames in DECODE order:
@@ -1852,9 +1965,47 @@ final class MKVDemuxer {
         // Sprint 47: fixed Sprint 30 incorrect assumption ("AVSampleBufferDisplayLayer
         // handles B-frame reordering from presentation timestamps") — the layer does
         // NOT reorder for VT.  Frames must arrive at VT in decode order.
-        let locs: [Loc] = streamType == .video
-            ? ptsSortedLocs.sorted { $0.fileOff < $1.fileOff }
-            : ptsSortedLocs
+        // Sort ALL batches (video AND audio) by fileOffset.
+        //
+        // Video: fileOffset sort = decode order (MKV stores blocks in decode order;
+        //   PTS order ≠ decode order for B-frame content).  This was already done
+        //   for video; leaving the sort unconditional is safe and simplifies the code.
+        //
+        // Audio: audio frames "should" be in fileOffset order in audioFrameIndex
+        //   (they are appended in parse order = file order).  In practice, certain
+        //   lacing edge cases or unusual MKV layouts can produce a batch whose first
+        //   frame (ptsSortedLocs[0]) does NOT have the minimum fileOffset among all
+        //   frames in the batch.  If that happens, sliceOff = Int(loc.fileOff - runOff)
+        //   goes negative for the out-of-order frame, and chunk.subdata(in:) fatally
+        //   traps on the negative lower bound — even though the guard below checks
+        //   (sliceOff + loc.size ≤ chunk.count), because a negative sliceOff can still
+        //   satisfy that inequality.
+        //
+        // Sorting by fileOffset for both tracks guarantees runOff = minimum fileOff in
+        // the batch, making sliceOff ≥ 0 for every frame.  For audio the sort is a
+        // negligible cost (≤ 600 elements, once per refill cycle).
+        let locs: [Loc] = ptsSortedLocs.sorted { $0.fileOff < $1.fileOff }
+
+        // Sprint 57: gap-tolerant run coalescing.
+        //
+        // In interleaved MKV files, consecutive video (or audio) frames are
+        // separated by blocks from the OTHER track.  The original exact-contiguity
+        // check (c.fileOff == p.fileOff + p.size) formed a new run at every such
+        // interleaving boundary, turning a 285-frame batch into 285 individual
+        // HTTP byte-range requests (~35 ms each on the tvOS simulator → ~10 s per
+        // refill).
+        //
+        // Fix: coalesce frames whose gap is ≤ kMaxRunGapBytes.  For typical MKV
+        // interleaving, the gap between consecutive video frames is one audio block
+        // (~4–16 KB of EBML-laced AAC).  Setting the threshold to 1 MB collapses
+        // an entire 10-second refill batch into 1–2 HTTP requests (~500 ms total
+        // instead of ~10 s), eliminating the "late frame" discard that caused
+        // deterministic visual distortion at every refill boundary.
+        //
+        // The fetched chunk contains both target-track frames AND interleaved
+        // data from other tracks.  Only the target-track frames are extracted
+        // (via sliceOff below); the interleaved bytes are simply ignored.
+        let kMaxRunGapBytes: Int64 = 1_048_576   // 1 MB — safely larger than any audio block
 
         var packets = [DemuxPacket](); packets.reserveCapacity(locs.count)
         var runStart = 0
@@ -1862,7 +2013,13 @@ final class MKVDemuxer {
             var runEnd = runStart + 1
             while runEnd < locs.count {
                 let p = locs[runEnd - 1], c = locs[runEnd]
-                if c.fileOff == p.fileOff + Int64(p.size) { runEnd += 1 } else { break }
+                // Coalesce if the gap between the end of frame p and the start of
+                // frame c is within the interleaving tolerance.
+                if c.fileOff <= p.fileOff + Int64(p.size) + kMaxRunGapBytes {
+                    runEnd += 1
+                } else {
+                    break
+                }
             }
             let runOff = locs[runStart].fileOff
             let runLen = locs[runEnd - 1].fileOff + Int64(locs[runEnd - 1].size) - runOff
@@ -1872,7 +2029,45 @@ final class MKVDemuxer {
                 let loc      = locs[j]
                 let frame    = index[loc.idx]
                 let sliceOff = Int(loc.fileOff - runOff)
-                guard sliceOff + loc.size <= chunk.count else { continue }
+                // Belt-and-suspenders guards — all must pass before calling subdata.
+                //
+                // Guard 1: sliceOff >= 0.
+                //   The fileOffset sort guarantees this (runOff = min fileOff in batch).
+                //   Log and skip if it ever fires — indicates a corrupted index entry.
+                guard sliceOff >= 0 else {
+                    fputs("[extractPackets] ⚠️ negative sliceOff=\(sliceOff) for \(streamType) idx=\(loc.idx) fileOff=\(loc.fileOff) runOff=\(runOff) chunkCount=\(chunk.count) chunkStart=\(chunk.startIndex) — skipping\n", stderr)
+                    continue
+                }
+                // Guard 2: frame fits within the fetched chunk — overflow-safe form.
+                //   `sliceOff + loc.size <= chunk.count` can overflow for huge loc.size
+                //   values (e.g. from a corrupted index).  Use subtraction to avoid:
+                //   first ensure sliceOff ≤ chunk.count, then compare loc.size against
+                //   the remaining space.
+                guard sliceOff <= chunk.count, loc.size <= chunk.count - sliceOff else {
+                    fputs("[extractPackets] ⚠️ frame overruns chunk for \(streamType) idx=\(loc.idx) sliceOff=\(sliceOff) size=\(loc.size) chunkCount=\(chunk.count) chunkStart=\(chunk.startIndex) runOff=\(runOff) runLen=\(runLen) — skipping\n", stderr)
+                    continue
+                }
+                // Guard 3: chunk must be a flat (non-slice) Data — startIndex must be 0.
+                //   MediaReader.readRemoteRange should always return contiguous Data,
+                //   but if the HTTP 200 fallback path ever fires it returns a slice
+                //   whose startIndex != 0.  subdata(in:) uses absolute Data.Index values;
+                //   if startIndex != 0, sliceOff = 0 would resolve to index 0 which is
+                //   before the slice's valid range, causing a fatal trap.
+                guard chunk.startIndex == 0 else {
+                    fputs("[extractPackets] ⚠️ chunk has non-zero startIndex=\(chunk.startIndex) for \(streamType) — check MediaReader HTTP 200 path\n", stderr)
+                    // Reconstruct a flat copy and fall through — safe but slow.
+                    let flat = Data(chunk)
+                    guard sliceOff <= flat.count, loc.size <= flat.count - sliceOff else { continue }
+                    let data = flat.subdata(in: sliceOff..<(sliceOff + loc.size))
+                    let dts: CMTime = streamType == .video ? .invalid : frame.pts
+                    packets.append(DemuxPacket(
+                        streamType: streamType, index: loc.idx,
+                        pts: frame.pts, dts: dts, data: data,
+                        isKeyframe: frame.isKeyframe, byteOffset: loc.fileOff,
+                        duration: duration
+                    ))
+                    continue
+                }
                 let data = chunk.subdata(in: sliceOff..<(sliceOff + loc.size))
                 // DTS: for video, frames are now enqueued in decode order (fileOffset-sorted).
                 // Setting DTS to .invalid tells VT to decode in the order frames arrive,

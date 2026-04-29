@@ -403,9 +403,31 @@ final class PacketFeeder {
         }
 
         // ── Audio ─────────────────────────────────────────────────────────────
+        //
+        // GOP-snap (Sprint 51) silently extends the video batch beyond the
+        // originally-requested `audioSeconds` window.  If we fetch audio for
+        // only `audioSeconds` worth of content, the audio playerNode runs dry
+        // before the next refill fires, causing periodic silence.
+        //
+        // Fix: after GOP-snap we know the actual video frames fetched
+        // (limitedVideo).  Convert that back to seconds using the indexed fps,
+        // then size the audio window to cover at least that many seconds.
+        //
+        // Example: toFill=6.0s, but GOP-snap extended video from 144→243 frames
+        // (≈10.1s at 24fps).  Without this fix audio gets 6.0s; with it audio
+        // gets ≈10.1s — matching the video window and eliminating the gap.
 
         if hasAudio, let aFmt = audioFormatDesc {
-            let limitedAudio = min(audioSamplesFor(seconds: audioSeconds),
+            // Scale audio to cover the actual (post-GOP-snap) video window.
+            let effectiveAudioSeconds: Double
+            if duration > 0, videoSamplesTotal > 0 {
+                let fps = Double(videoSamplesTotal) / duration
+                let videoSecondsActual = fps > 0 ? Double(limitedVideo) / fps : audioSeconds
+                effectiveAudioSeconds = max(audioSeconds, videoSecondsActual)
+            } else {
+                effectiveAudioSeconds = audioSeconds
+            }
+            let limitedAudio = min(audioSamplesFor(seconds: effectiveAudioSeconds),
                                    audioSamplesTotal - fromAudioIdx)
             if limitedAudio > 0 {
                 do {
