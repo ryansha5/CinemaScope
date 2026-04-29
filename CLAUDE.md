@@ -371,7 +371,20 @@ immediately) which is fully reliable on tvOS.  The `fullScreenCover` modifier ha
 **Never re-introduce `.fullScreenCover` for `PlayerLabHostView` on tvOS** — the
 `.task` lifecycle is broken for fullScreenCover on tvOS and prepare() will silently never run.
 
-Location: `HomeView.body` — `if let pending = pendingLabPlay` block inside the root `ZStack`.
+**Never remove `.id(pending.id)` from the `PlayerLabHostView` call in the ZStack.**
+Without it, SwiftUI reuses the same view instance when `pendingLabPlay` changes from
+`PendingLabPlay(A)` to `PendingLabPlay(B)` without passing through `nil` (e.g. a rapid
+second play tap, a retry, or any code path that overwrites `pendingLabPlay` directly).
+Reuse means `@StateObject private var controller` is not recreated and `.task` (which
+has no `id:`) does not rerun — `prepare()` is never called for session B and the stale
+controller from session A silently persists.  The `.id(pending.id)` forces a full
+view+controller destroy+recreate whenever the session UUID changes.
+
+Locations:
+- `HomeView.body` — `if let pending = pendingLabPlay` block inside the root `ZStack`;
+  the `PlayerLabHostView` call has `.id(pending.id)` and passes `sessionID: pending.id`.
+- `PlayerLabHostView` — `let sessionID: UUID` input; `.task(id: url)` for defense-in-depth
+  (restarts the task if `url` ever changes while the view is alive, even if identity holds).
 
 ---
 

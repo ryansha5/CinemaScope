@@ -203,6 +203,7 @@ struct HomeView: View {
             // is set back to nil (onExit / onFallback).
             if let pending = pendingLabPlay {
                 PlayerLabHostView(
+                    sessionID:   pending.id,
                     url:         pending.url,
                     startTicks:  pending.ticks,
                     itemName:    pending.item.name,
@@ -264,6 +265,14 @@ struct HomeView: View {
                 .ignoresSafeArea()
                 .transition(.opacity)
                 .zIndex(50)
+                // Sprint 67: explicit session identity.
+                // Without .id(), SwiftUI reuses the same PlayerLabHostView instance
+                // when pendingLabPlay changes A→B without passing through nil (e.g.
+                // double-tap, retry).  Reuse means @StateObject (controller) is not
+                // recreated and .task does not rerun — prepare() is never called for
+                // session B.  .id(pending.id) forces a full destroy+recreate whenever
+                // the session changes, guaranteeing a fresh controller and a fresh task.
+                .id(pending.id)
             }
         }
         .animation(.easeInOut(duration: 0.25), value: destination)
@@ -897,8 +906,7 @@ struct HomeView: View {
                         // `result` is preserved in PendingLabPlay so the onFallback
                         // handler can pass the Emby URL to AVPlayer cleanly if
                         // PlayerLab cannot open the raw stream.
-                        print("[Route] → PlayerLab raw stream: \(rawURL.absoluteString.prefix(80))")
-                        pendingLabPlay = PendingLabPlay(
+                        let newSession = PendingLabPlay(
                             item:     item,
                             url:      rawURL,
                             ticks:    ticks,
@@ -908,10 +916,13 @@ struct HomeView: View {
                             user:     user,
                             token:    token
                         )
+                        let prevID = pendingLabPlay?.id.uuidString.prefix(8) ?? "nil"
+                        print("[Session] pendingLabPlay ← \(newSession.id.uuidString.prefix(8))  prev=\(prevID)  route=raw  item='\(item.name)'")
+                        print("[Route] → PlayerLab raw stream: \(rawURL.absoluteString.prefix(80))")
+                        pendingLabPlay = newSession
                     } else if standardRoute.meetsThreshold(confidenceThreshold) {
                         // ── PlayerLab direct-play (Emby says DirectPlay) ──────
-                        print("[Route] → PlayerLab direct-play: \(result.url.absoluteString.prefix(80))")
-                        pendingLabPlay = PendingLabPlay(
+                        let newSession = PendingLabPlay(
                             item:     item,
                             url:      result.url,
                             ticks:    ticks,
@@ -921,6 +932,10 @@ struct HomeView: View {
                             user:     user,
                             token:    token
                         )
+                        let prevID = pendingLabPlay?.id.uuidString.prefix(8) ?? "nil"
+                        print("[Session] pendingLabPlay ← \(newSession.id.uuidString.prefix(8))  prev=\(prevID)  route=direct  item='\(item.name)'")
+                        print("[Route] → PlayerLab direct-play: \(result.url.absoluteString.prefix(80))")
+                        pendingLabPlay = newSession
                     } else {
                         // ── AVPlayer (transcode, unsupported format, below threshold) ──
                         print("[Route] → AVPlayer (PlayerLab confidence below threshold or codec unsupported)")

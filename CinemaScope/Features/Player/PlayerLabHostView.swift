@@ -36,6 +36,10 @@ struct PlayerLabHostView: View {
 
     // MARK: - Inputs
 
+    /// Opaque session identifier supplied by HomeView (equals PendingLabPlay.id).
+    /// Used in diagnostics and as the .task(id:) key so the task reruns if the
+    /// session changes while the view is alive.
+    let sessionID:   UUID
     let url:         URL
     let startTicks:  Int64
     let itemName:    String
@@ -105,7 +109,18 @@ struct PlayerLabHostView: View {
             // Hide transport while countdown is showing — countdown has its own Cancel
             .opacity(autoPlayCountdown != nil ? 0 : 1)
         }
-        .task {
+        // Sprint 67 diagnostics: prove view lifecycle in the playerlab log.
+        .onAppear {
+            sessionLog("PlayerLabHostView appeared   sid=\(sid)  url=\(url.lastPathComponent)")
+        }
+        // Sprint 67: .task(id: url) — restarts the task whenever url changes,
+        // even if SwiftUI somehow reuses this view instance for a new session.
+        // Combined with .id(pending.id) in HomeView this is defense-in-depth:
+        // the .id() guarantees a fresh view+controller; the task id guarantees a
+        // fresh prepare() even if the identity guarantee ever lapses.
+        .task(id: url) {
+            sessionLog("PlayerLabHostView .task START  sid=\(sid)  url=\(url.lastPathComponent)")
+
             // Sprint 44: First Frame Mode — set before prepare() so the debug
             // path activates on the very first call to prepare().
             controller.firstFrameMode = AppSettings.shared.playerLabFirstFrameMode
@@ -122,10 +137,16 @@ struct PlayerLabHostView: View {
             // If onFallbackRequired already fired, do nothing — the host is
             // handling the handoff. If prepare() failed for another reason,
             // also ask the host to fall back.
-            guard !fallbackFired else { return }
+            guard !fallbackFired else {
+                sessionLog("PlayerLabHostView .task END (fallback fired)  sid=\(sid)")
+                return
+            }
             guard controller.state == .ready else {
                 if case .failed(let msg) = controller.state {
+                    sessionLog("PlayerLabHostView .task END (prepare failed: \(msg))  sid=\(sid)")
                     onFallback("prepare failed: \(msg)")
+                } else {
+                    sessionLog("PlayerLabHostView .task END (state=\(controller.state.statusLabel))  sid=\(sid)")
                 }
                 return
             }
@@ -140,6 +161,7 @@ struct PlayerLabHostView: View {
             }
 
             controller.play()
+            sessionLog("PlayerLabHostView .task END (play() called)  sid=\(sid)")
         }
         // Sprint 44: kick off countdown when playback reaches .ended
         .onChange(of: controller.state) { _, newState in
@@ -149,8 +171,21 @@ struct PlayerLabHostView: View {
         }
         // Cancel any in-flight tasks when the view disappears
         .onDisappear {
+            sessionLog("PlayerLabHostView disappeared  sid=\(sid)")
             cancelAutoPlay()
         }
+    }
+
+    // MARK: - Diagnostics
+
+    /// Short prefix of sessionID used in log lines.
+    private var sid: String { String(sessionID.uuidString.prefix(8)) }
+
+    /// Writes msg to both stdout (Xcode console) and stderr (playerlab.log).
+    private func sessionLog(_ msg: String) {
+        let line = "[Session] \(msg)"
+        print(line)
+        fputs("\(line)\n", stderr)
     }
 
     // MARK: - Derived
