@@ -32,6 +32,14 @@
 // SC3A       — VideoFormatFactory: video format-description logic extracted to Decode/
 // SC6        — BufferPolicy: buffer thresholds + feed-decision helpers extracted to Core/
 // SC5        — SubtitleSetupCoordinator: subtitle wiring extracted to Subtitle/
+// Sprint 59  — Split buffer measures: optimisticBuffered (feeder tail) for watermark/refill;
+//              actualBuffered (layer-only tail via FrameRenderer.actualLayerEnqueuedMaxPTS)
+//              for underrun detection.  PENDING-LAG warning added (log-only).
+// Sprint 60  — PENDING-LAG hard pause: when actualBuf < 1.5 s AND pendingQ > 0 AND lag > 1 s,
+//              pause synchronizer clock and enter .buffering.  Skip HTTP fetch while paused
+//              (pending queue drains into layer via requestMediaDataWhenReady).  Resume when
+//              actualBuf ≥ 2.5 s.  pausedForPendingLag flag differentiates this from
+//              normal underruns in the recovery check.
 //
 // Controller is now an orchestrator:
 //   prepare()    → reset → open reader → ContainerPreparation → apply result
@@ -186,6 +194,15 @@ final class PlayerLabPlaybackController: ObservableObject {
     // MARK: - Buffer policy (SC6)
 
     private let policy = BufferPolicy()
+
+    /// Sprint 60: set when we enter `.buffering` due to a PENDING-LAG condition
+    /// (hundreds of frames stuck in `pendingVideoQueue` while `actualBuffered`
+    /// is critically low).  When true the buffering block skips the HTTP fetch
+    /// — the pending queue already holds the needed frames — and uses
+    /// `pendingLagResumeThreshold` (2.5 s of actual layer depth) as the
+    /// recovery bar instead of the normal `resumeThreshold` (1.5 s feeder tail).
+    /// Reset to `false` on resume, seek, or stop.
+    private var pausedForPendingLag: Bool = false
 
     // MARK: - Background tasks
 
@@ -743,6 +760,7 @@ final class PlayerLabPlaybackController: ObservableObject {
         renderer.flushAll()
         stopFeedLoop()
         stopTimeTracking()
+        pausedForPendingLag = false   // Sprint 60
         demuxer           = nil
         mkvDemuxer        = nil
         detectedContainer = "—"
@@ -801,6 +819,7 @@ final class PlayerLabPlaybackController: ObservableObject {
 
         let wasPlaying = (state == .playing || state == .buffering)
         stopFeedLoop()
+        pausedForPendingLag = false   // Sprint 60: reset on seek
 
         // ── Phase 1: PRE-FETCH (async IO, no flush yet) ───────────────────────
         record("  [seek] pre-fetching \(String(format: "%.0f", policy.initialWindowSeconds))s window…")
@@ -986,17 +1005,37 @@ final class PlayerLabPlaybackController: ObservableObject {
             }
         }
 
-        // Sprint 59: warn when the pending lag is significant — this is the
-        // distortion signal.  If actualBuffered is near zero while optimisticBuffered
-        // looks healthy, the display layer is clock-starved while pendingVideoQueue
-        // holds frames it hasn't accepted yet.
-        if pendingLag > 1.0 && actualBuffered < policy.resumeThreshold {
-            record("[feed] ⚠️ PENDING-LAG  "
+        // ── Sprint 60: PENDING-LAG hard pause ────────────────────────────────
+        //
+        // When `actualBuffered` is critically low AND hundreds of frames are
+        // queued in `pendingVideoQueue` (feeder tail is healthy, layer tail is not),
+        // the clock is about to outrun what the display layer physically holds.
+        //
+        // Pause the synchronizer immediately — `requestMediaDataWhenReady` will
+        // keep draining `pendingVideoQueue` into the layer while the clock is at
+        // rate=0.  Resume only when `actualBuffered` reaches
+        // `pendingLagResumeThreshold` (2.5 s), meaning the layer has consumed
+        // enough of the backlog to be safe.
+        //
+        // Do NOT fetch new frames just because `actualBuffered` is low: the
+        // pending queue already has the needed headroom.  Refill decisions
+        // (`isLowWatermark`) still use `optimisticBuffered` / `buffered`.
+        if state == .playing
+            && policy.isPendingLagPause(actualBuffered: actualBuffered,
+                                        pendingQueueCount: pendingQ,
+                                        lag: pendingLag) {
+            pausedForPendingLag = true
+            transition(to: .buffering,
+                       "PENDING-LAG actualBuf=\(String(format: "%.2f", actualBuffered))s "
+                     + "lag=\(String(format: "%.2f", pendingLag))s pendingQ=\(pendingQ)")
+            renderer.synchronizer.rate = 0
+            if renderer.audioRendererAttached { renderer.pauseAudioPlayer() }
+            record("[feed] ⚠️ PENDING-LAG PAUSE  "
                  + "actualBuf=\(String(format: "%.2f", actualBuffered))s  "
                  + "optBuf=\(String(format: "%.2f", optimisticBuffered))s  "
                  + "lag=\(String(format: "%.2f", pendingLag))s  "
                  + "pendingQ=\(pendingQ)  "
-                 + "— layer has not accepted \(pendingQ) frames; clock may outrun delivery")
+                 + "— synchronizer paused; waiting for pendingVideoQueue to drain into layer")
         }
 
         // ── Sprint 47 (rev 2): Proactive non-blocking background index extension ────
@@ -1105,41 +1144,91 @@ final class PlayerLabPlaybackController: ObservableObject {
         }
 
         if state == .buffering {
-            let toFill     = policy.refillSeconds(currentlyBuffered: buffered)
-            let videoCount = feeder.videoSamplesFor(seconds: toFill)
-            if logCycle % policy.bufferingLogInterval == 0 {
-                let idxDur    = mkvDemuxer.map { String(format: "%.1f", $0.indexedDurationSeconds) } ?? "—"
-                let taskState = backgroundIndexTask != nil ? "🔄 scanning" : "idle"
-                record("[Buffer] refilling \(String(format: "%.1f", toFill))s "
-                     + "≈ \(videoCount) samples  "
-                     + "cursor=\(feeder.nextVideoSampleIdx)/\(feeder.videoSamplesTotal)  "
-                     + "tail=\(String(format: "%.2f", feeder.lastEnqueuedVideoPTS))s  "
-                     + "indexedDur=\(idxDur)s  indexTask=\(taskState)")
+            // Sprint 60: PENDING-LAG pauses skip the HTTP fetch — the pending queue
+            // already holds the needed frames; draining it into the layer IS the
+            // recovery.  Only do an HTTP refill if the OPTIMISTIC buffer is also low
+            // (i.e. pendingVideoQueue itself is nearly empty and we truly need new data).
+            // Sprint 60: skip HTTP fetch during a PENDING-LAG pause — the pending queue
+            // is the recovery mechanism.  Only fetch if pendingQ has drained to 0 (nothing
+            // left to drain into the layer) or if this is a normal underrun (not a lag pause).
+            let shouldFetch = !pausedForPendingLag || pendingQ == 0
+
+            if shouldFetch {
+                let toFill     = policy.refillSeconds(currentlyBuffered: buffered)
+                let videoCount = feeder.videoSamplesFor(seconds: toFill)
+                if logCycle % policy.bufferingLogInterval == 0 {
+                    let idxDur    = mkvDemuxer.map { String(format: "%.1f", $0.indexedDurationSeconds) } ?? "—"
+                    let taskState = backgroundIndexTask != nil ? "🔄 scanning" : "idle"
+                    record("[Buffer] refilling \(String(format: "%.1f", toFill))s "
+                         + "≈ \(videoCount) samples  "
+                         + "cursor=\(feeder.nextVideoSampleIdx)/\(feeder.videoSamplesTotal)  "
+                         + "tail=\(String(format: "%.2f", feeder.lastEnqueuedVideoPTS))s  "
+                         + "indexedDur=\(idxDur)s  indexTask=\(taskState)")
+                }
+                let cursorBefore = feeder.nextVideoSampleIdx
+                await feeder.feedWindow(videoCount:   videoCount,
+                                        audioSeconds: toFill,
+                                        label:        "buf-refill",
+                                        log:          record(_:))
+                framesLoaded = feeder.nextVideoSampleIdx
+
+                let rawTime2  = renderer.currentTime.seconds
+                let nowSec2   = rawTime2.isNaN ? currentTimeFloor : max(rawTime2, currentTimeFloor)
+                let newBuf    = max(0, feeder.lastEnqueuedVideoPTS - nowSec2)
+                videoBuffered = newBuf
+                record("[Buffer] after refill: cursor \(cursorBefore)→\(feeder.nextVideoSampleIdx)  "
+                     + "buf \(String(format: "%.2f", buffered))s→\(String(format: "%.2f", newBuf))s  "
+                     + "layer=\(renderer.layerStatusDescription)")
+            } else {
+                // PENDING-LAG pause: no fetch this cycle — waiting for pendingVideoQueue
+                // to drain into the layer via requestMediaDataWhenReady.
+                if logCycle % policy.bufferingLogInterval == 0 {
+                    let latestLayerPTS = renderer.actualLayerEnqueuedMaxPTS
+                    let waitActual: Double = latestLayerPTS.isValid
+                        ? max(0, latestLayerPTS.seconds - nowSec) : 0
+                    record("[Buffer] PENDING-LAG wait  "
+                         + "actualBuf=\(String(format: "%.2f", waitActual))s  "
+                         + "pendingQ=\(renderer.pendingVideoQueueCount)  "
+                         + "optBuf=\(String(format: "%.2f", buffered))s  "
+                         + "need≥\(policy.pendingLagResumeThreshold)s actual before resume")
+                }
             }
-            let cursorBefore = feeder.nextVideoSampleIdx
-            await feeder.feedWindow(videoCount:   videoCount,
-                                    audioSeconds: toFill,
-                                    label:        "buf-refill",
-                                    log:          record(_:))
-            framesLoaded = feeder.nextVideoSampleIdx
 
-            let rawTime2  = renderer.currentTime.seconds
-            let nowSec2   = rawTime2.isNaN ? currentTimeFloor : max(rawTime2, currentTimeFloor)
-            let newBuf    = max(0, feeder.lastEnqueuedVideoPTS - nowSec2)
-            videoBuffered = newBuf
-            record("[Buffer] after refill: cursor \(cursorBefore)→\(feeder.nextVideoSampleIdx)  "
-                 + "buf \(String(format: "%.2f", buffered))s→\(String(format: "%.2f", newBuf))s  "
-                 + "layer=\(renderer.layerStatusDescription)")
+            // ── Recovery check ───────────────────────────────────────────────
+            //
+            // PENDING-LAG pause: check `actualBuffered` (layer-only depth) against
+            //   `pendingLagResumeThreshold` (2.5 s).  Recovery means the layer has
+            //   drained enough of the backlog that the clock can safely resume.
+            //
+            // Normal underrun: check the feeder tail (`optimisticBuffered` / newBuf)
+            //   against `resumeThreshold` (1.5 s) — the usual path unchanged.
+            let latestLayerPTS = renderer.actualLayerEnqueuedMaxPTS
+            let recoverActual: Double = latestLayerPTS.isValid
+                ? max(0, latestLayerPTS.seconds - nowSec) : 0
+            let recoverOptimistic: Double = max(0, feeder.lastEnqueuedVideoPTS - nowSec)
 
-            if policy.isRecovered(bufferedSeconds: newBuf) {
-                transition(to: .playing, "buffer recovered \(String(format: "%.2f", newBuf))s")
+            let didRecover: Bool
+            if pausedForPendingLag {
+                didRecover = recoverActual >= policy.pendingLagResumeThreshold
+            } else {
+                didRecover = policy.isRecovered(bufferedSeconds: recoverOptimistic)
+            }
+
+            if didRecover {
+                let wasLag = pausedForPendingLag
+                pausedForPendingLag = false
+                let recoverLabel = wasLag
+                    ? "PENDING-LAG resolved actual=\(String(format: "%.2f", recoverActual))s"
+                    : "buffer recovered opt=\(String(format: "%.2f", recoverOptimistic))s"
+                transition(to: .playing, recoverLabel)
                 let recoverTime = renderer.currentTime
                 renderer.synchronizer.setRate(1, time: recoverTime)
                 // Sprint 54: resume audio player node after buffer recovery.
                 if renderer.audioRendererAttached {
                     renderer.resumeAudioIfNeeded()
                 }
-                record("[Buffer] RESUME  video=\(String(format: "%.2f", newBuf))s")
+                record("[Buffer] RESUME  \(wasLag ? "lag-actual" : "video")="
+                     + "\(String(format: "%.2f", wasLag ? recoverActual : recoverOptimistic))s")
             }
             return
         }

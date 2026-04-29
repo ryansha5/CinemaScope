@@ -70,6 +70,21 @@ struct BufferPolicy {
     /// renderer drains the last frames.
     let eosMinBuffer:         Double = 0.5
 
+    // MARK: - Pending-lag pause thresholds (Sprint 60)
+
+    /// `actualBuffered` below which a PENDING-LAG condition triggers a clock
+    /// pause.  Equal to `resumeThreshold` so the guard fires before the normal
+    /// underrun path but at the same perceived depth — the difference is that a
+    /// PENDING-LAG pause skips HTTP fetching (pending queue is already full) and
+    /// waits for `pendingLagResumeThreshold` to confirm the layer has drained.
+    let pendingLagPauseThreshold:  Double = 1.5
+
+    /// `actualBuffered` at or above which the controller exits a PENDING-LAG
+    /// pause and restores the synchronizer clock.  Higher than `resumeThreshold`
+    /// to ensure the layer has drained enough of the pending-queue backlog before
+    /// the clock advances again.
+    let pendingLagResumeThreshold: Double = 2.5
+
     // MARK: - Log-cycle intervals
 
     /// Feed-loop cycles between periodic status log lines (normal playback).
@@ -111,5 +126,19 @@ struct BufferPolicy {
     /// large deficits fill efficiently to the target.
     func refillSeconds(currentlyBuffered: Double) -> Double {
         max(targetBufferSeconds - currentlyBuffered, feedChunkSeconds)
+    }
+
+    /// `true` when a PENDING-LAG clock-pause should be triggered.
+    ///
+    /// All three conditions must hold simultaneously:
+    ///   - `actualBuffered < pendingLagPauseThreshold` — layer depth is critically low
+    ///   - `pendingQueueCount > 0`                    — frames are queued but not yet at the layer
+    ///   - `lag > 1.0`                                — feeder tail is >1 s ahead of the layer
+    ///
+    /// When true, the synchronizer clock should be paused.  The pending frames
+    /// will drain into the layer via `requestMediaDataWhenReady` while rate=0;
+    /// no new HTTP fetch is needed until `actualBuffered < lowWatermarkSeconds`.
+    func isPendingLagPause(actualBuffered: Double, pendingQueueCount: Int, lag: Double) -> Bool {
+        actualBuffered < pendingLagPauseThreshold && pendingQueueCount > 0 && lag > 1.0
     }
 }
