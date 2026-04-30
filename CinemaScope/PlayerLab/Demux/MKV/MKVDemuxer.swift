@@ -739,7 +739,19 @@ final class MKVDemuxer {
             try Task.checkCancellation()
 
             guard let (elem, hdrBytes) = try await parser.nextElement(at: cursor, limit: limit)
-            else { break }
+            else {
+                // Sprint 72: log so we can distinguish transient HTTP failures
+                // from cursor-alignment bugs.  This fires when nextElement cannot
+                // read an EBML header at `cursor`.  Common causes:
+                //   (a) transient HTTP 4xx/5xx → retry on next triggerBackgroundIndex call
+                //   (b) cursor pointing inside cluster payload (alignment bug)
+                // If this appears many times at the SAME cursor value, it's (b).
+                // If it appears once then the scan advances, it's (a).
+                log("  [IndexTask] ⚠️ nextElement nil at cursor=\(cursor) "
+                  + "limit=\(limit) clusterCount=\(clusterCount) "
+                  + "indexed=\(String(format: "%.1f", frameIndex.last?.pts.seconds ?? 0))s")
+                break
+            }
 
             // Compute element span up-front so we can advance backgroundScanCursor
             // to cursor+total (start of the NEXT element) after each cluster.
@@ -763,6 +775,13 @@ final class MKVDemuxer {
                 // iteration, a restart will begin here rather than re-scanning
                 // the just-completed cluster (which would duplicate index entries).
                 backgroundScanCursor = cursor + total
+
+                // Sprint 71: update indexedDurationSeconds after every cluster
+                // so callers can observe real-time progress without waiting for
+                // the function to return.  The feed loop's periodic log shows
+                // `indexedDur` which reads this property directly — incremental
+                // updates make the indexer's progress visible in the Xcode console.
+                indexedDurationSeconds = frameIndex.last?.pts.seconds ?? indexedDurationSeconds
 
                 let indexedSec = frameIndex.last?.pts.seconds ?? 0
                 if indexedSec >= targetSeconds {

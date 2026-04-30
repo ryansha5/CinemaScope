@@ -728,7 +728,9 @@ final class PacketFeeder {
                 if absIdx == 0 {
                     // Sprint 46: explicit confirmation that enqueueVideo is about
                     // to be called for the very first sample.
-                    feederLog("[enqueue] → renderer.enqueueVideo called for sample 0")
+                    let msg = "[PacketFeeder] [enqueue] → renderer.enqueueVideo called for sample 0"
+                    feederLog(msg)
+                    print(msg)   // mirror to stdout so this appears in Xcode console
                 }
                 renderer.enqueueVideo(sb, sampleIndex: absIdx)
             }

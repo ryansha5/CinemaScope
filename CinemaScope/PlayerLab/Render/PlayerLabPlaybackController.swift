@@ -191,6 +191,23 @@ final class PlayerLabPlaybackController: ObservableObject {
     /// Lower bound for currentTime; guards against a stale timebase after seek.
     private var currentTimeFloor: Double = 0
 
+    // MARK: - Freeze detector (Sprint 74 diagnostics)
+    //
+    // Tracks how many consecutive feed-loop cycles the playback clock has failed
+    // to advance while state == .playing and tbRate == 1.  A clock that doesn't
+    // move for 5+ cycles (~500 ms) while the synchronizer is running indicates a
+    // silent freeze — frames are being dropped by the layer without the controller
+    // transitioning to .buffering.
+    //
+    // lastFeedCurrentTime: the `nowSec` value seen in the previous cycle.
+    // clockFrozenCycles:   incremented when nowSec ≤ lastFeedCurrentTime + 0.05 s;
+    //                      reset to 0 whenever the clock visibly advances.
+    // lastFeedFramesEnqueued: renderer.framesEnqueued value from previous cycle;
+    //                         used to see whether the layer is accepting frames.
+    private var lastFeedCurrentTime:    Double = -1
+    private var clockFrozenCycles:      Int    = 0
+    private var lastFeedFramesEnqueued: Int    = 0
+
     // MARK: - Buffer policy (SC6)
 
     private let policy = BufferPolicy()
@@ -550,7 +567,25 @@ final class PlayerLabPlaybackController: ObservableObject {
         //    firstIDRVideoKeyframeIndex(from:) fetches the first few bytes of each
         //    candidate keyframe and advances past any leading CRAs to the first
         //    true IDR_N_LP.
-        if let mkv = mkvDemuxer {
+        // Sprint 70: gate all DV dual-layer handling on the video codec being HEVC.
+        // Dolby Vision Profile 7 dual-layer MKV is always HEVC — H.264 is never DV P7.
+        // MKVDemuxer.isDolbyVisionDualLayer can false-positive on H.264 files whose
+        // first cluster happens to contain many small non-keyframes (e.g. a low-motion
+        // TV episode with a long open-GOP run before the first IDR).  Applying the BL
+        // preamble skip and firstIDRVideoKeyframeIndex scan to an H.264 file wastes the
+        // first N frames and leaves the feeder cursor deep into the file — causing an
+        // immediate underrun after any seek because so few indexed frames remain.
+        if feeder.isDolbyVisionDualLayer && !videoTrack.isHEVC {
+            // Sprint 70: clear false-positive DV flag — H.264 is never DV P7.
+            // MKVDemuxer.isDolbyVisionDualLayer can fire on H.264 files whose first
+            // cluster has many small non-keyframes (long open-GOP run before the first
+            // IDR).  Applying the BL preamble skip to H.264 skips the first N frames
+            // and leaves the feeder deep in the file, causing immediate underrun.
+            feeder.isDolbyVisionDualLayer = false
+            record("[7] ℹ️ isDolbyVisionDualLayer cleared — codec=\(videoTrack.codecFourCC ?? "?") is not HEVC; "
+                 + "DV P7 dual-layer detection only applies to HEVC content")
+        }
+        if let mkv = mkvDemuxer, videoTrack.isHEVC, feeder.isDolbyVisionDualLayer {
             let preambleEnd = mkv.firstVideoKeyframeIndex   // exclusive upper bound of BL preamble
             feeder.dvBLPreambleEndIndex = preambleEnd       // Fix 1: restrict BL filter to preamble
 
@@ -870,6 +905,15 @@ final class PlayerLabPlaybackController: ObservableObject {
         record("[seek] → \(String(format: "%.2f", targetSeconds))s "
              + "(\(Int(clampedFraction * 100))% of \(String(format: "%.0f", duration))s)")
 
+        // Sprint 76: ensure the MKV index covers the target region before resolving
+        // the keyframe.  Without this, findVideoKeyframeSampleIndex silently clamps
+        // to the last indexed keyframe (e.g. 7.758 s instead of 1165 s when the
+        // startup index only covers 8.6 s).
+        if mkvDemuxer != nil {
+            await ensureMKVIndexedForSeek(targetSeconds: targetSeconds,
+                                          windowSeconds: policy.initialWindowSeconds)
+        }
+
         let keyframeIdx: Int
         let keyframePTS: CMTime
         let audioIdx:    Int
@@ -885,6 +929,17 @@ final class PlayerLabPlaybackController: ObservableObject {
 
         record("  keyframe[\(keyframeIdx)] @ \(String(format: "%.4f", keyframePTS.seconds))s  "
              + "audio_idx=\(audioIdx)")
+
+        // Sprint 76: warn if the resolved keyframe is still far from the target
+        // (e.g. index extension hit the zero-progress guard or the file is
+        // sparse at this position).
+        let seekDelta = targetSeconds - keyframePTS.seconds
+        if seekDelta > 30 {
+            record("[seek] ⚠️ resolved keyframe is \(String(format: "%.2f", seekDelta))s before target  "
+                 + "target=\(String(format: "%.2f", targetSeconds))s  "
+                 + "keyframe=\(String(format: "%.4f", keyframePTS.seconds))s  "
+                 + "— index may not cover seek region")
+        }
 
         let wasPlaying = (state == .playing || state == .buffering)
         stopFeedLoop()
@@ -998,23 +1053,224 @@ final class PlayerLabPlaybackController: ObservableObject {
         guard backgroundIndexTask == nil else { return }   // scan already in flight
         guard !mkv.isFullyIndexed           else { return }
 
+        // Sprint 71: scan in 15-second increments and update feeder totals after
+        // every chunk.  Previously, continueIndexing(untilSeconds: X) ran as a
+        // single call and only updated feeder.videoSamplesTotal when the entire
+        // scan completed (~7–8 s for a 60-second window on typical LAN speeds).
+        // That meant the feed loop saw cursor=total the entire time and couldn't
+        // start refilling even after the first few seconds of new content were
+        // indexed.  Incremental updates allow recovery within ~1 second of the
+        // first chunk completing instead of requiring the full scan to finish.
         backgroundIndexTask = Task { [weak self] in
             guard let self else { return }
-            do {
-                let (vAdded, aAdded) = try await mkv.continueIndexing(untilSeconds: targetSeconds)
-                // Update feeder totals — Task inherits @MainActor so this is safe.
-                feeder.videoSamplesTotal = mkv.indexedVideoFrameCount
-                feeder.audioSamplesTotal = mkv.indexedAudioFrameCount
-                feeder.duration          = mkv.indexedDurationSeconds
-                record("[IndexTask] ✅ \(String(format: "%.1f", mkv.indexedDurationSeconds))s  "
-                     + "+\(vAdded)v/+\(aAdded)a  "
-                     + "total=\(feeder.videoSamplesTotal)v/\(feeder.audioSamplesTotal)a  "
-                     + (mkv.isFullyIndexed ? "✅ fully indexed" : "more to scan"))
-            } catch {
-                record("[IndexTask] ❌ scan error: \(error.localizedDescription)")
+            var step = 0
+            var totalVideo = 0
+            var totalAudio = 0
+
+            while let mkv = mkvDemuxer, !mkv.isFullyIndexed,
+                  mkv.indexedDurationSeconds < targetSeconds {
+                if Task.isCancelled { break }
+
+                let chunkEnd = min(targetSeconds, mkv.indexedDurationSeconds + 15.0)
+                do {
+                    let (v, a) = try await mkv.continueIndexing(untilSeconds: chunkEnd)
+                    step       += 1
+                    totalVideo += v
+                    totalAudio += a
+
+                    // Update feeder totals after every chunk so the feed loop
+                    // immediately sees new frames and can start refilling.
+                    // Task inherits @MainActor so these assignments are safe.
+                    feeder.videoSamplesTotal = mkv.indexedVideoFrameCount
+                    feeder.audioSamplesTotal = mkv.indexedAudioFrameCount
+                    feeder.duration          = mkv.indexedDurationSeconds
+
+                    if v > 0 || a > 0 {
+                        record("[IndexTask] 📦 #\(step) → \(String(format: "%.1f", mkv.indexedDurationSeconds))s  "
+                             + "+\(v)v/+\(a)a  "
+                             + "total=\(feeder.videoSamplesTotal)v/\(feeder.audioSamplesTotal)a")
+                    }
+                } catch {
+                    if !Task.isCancelled {
+                        record("[IndexTask] ❌ scan error: \(error.localizedDescription)")
+                    }
+                    break
+                }
             }
+
+            let finalDur = mkvDemuxer?.indexedDurationSeconds ?? 0
+            record("[IndexTask] ✅ done → \(String(format: "%.1f", finalDur))s  "
+                 + "+\(totalVideo)v/+\(totalAudio)a total  "
+                 + "total=\(feeder.videoSamplesTotal)v/\(feeder.audioSamplesTotal)a  "
+                 + (mkvDemuxer?.isFullyIndexed ?? true ? "✅ fully indexed" : "target reached"))
             backgroundIndexTask = nil
         }
+    }
+
+    /// Proactively start background MKV indexing immediately after prepare()
+    /// completes — before the resume seek and play().  Gives the indexer a head
+    /// start so it is already running while the seek I/O and initial buffer load
+    /// occur.  The target is the full file duration so the indexer eventually
+    /// covers all content.
+    ///
+    /// Sprint 71 fix: previously the indexer only started reactively when the
+    /// buffer underran and cursor = total.  That meant the user waited ~7–8 s
+    /// with a frozen buffer before any new frames became available.  Starting
+    /// here cuts that wait to <1 s because the indexer is already partway
+    /// through its first chunk by the time the underrun fires.
+    // MARK: - Seek index coverage (Sprint 76)
+    //
+    // MKV startup index covers only ~8–10 s of a large file.  If seek() runs while
+    // the index hasn't reached the target region, findVideoKeyframeSampleIndex
+    // silently snaps to the last indexed keyframe (e.g. 7.758 s instead of 1165 s).
+    //
+    // Fix: before resolving any seek target on the MKV path, extend the index
+    // synchronously until it covers targetSeconds + lookahead (or the file is
+    // fully indexed).  feeder totals are refreshed after each step so the feeder
+    // cursor math stays consistent.
+
+    private func ensureMKVIndexedForSeek(targetSeconds: Double,
+                                         windowSeconds: Double) async {
+        guard let mkv = mkvDemuxer, !mkv.isFullyIndexed else { return }
+
+        // How far we need the index to reach: target + lookahead (but ≤ file duration).
+        let lookahead        = max(2.0, windowSeconds)
+        let requiredSeconds  = min(duration > 0 ? duration : .greatestFiniteMagnitude,
+                                   targetSeconds + lookahead)
+
+        let indexedBefore    = mkv.indexedDurationSeconds
+        let framesBefore     = mkv.indexedVideoFrameCount
+
+        if indexedBefore >= requiredSeconds {
+            record("[seek-index] ✅ already covered  "
+                 + "target=\(String(format: "%.2f", targetSeconds))s  "
+                 + "indexed=\(String(format: "%.2f", indexedBefore))s")
+            return
+        }
+
+        record("[seek-index] 🔍 extending index  "
+             + "target=\(String(format: "%.2f", targetSeconds))s  "
+             + "indexed=\(String(format: "%.2f", indexedBefore))s  "
+             + "required=\(String(format: "%.2f", requiredSeconds))s")
+
+        var totalVAdded = 0
+        var totalAAdded = 0
+
+        while !mkv.isFullyIndexed && mkv.indexedDurationSeconds < requiredSeconds {
+            // Scan in 60-second increments so we yield between steps and the
+            // @MainActor scheduler stays responsive.
+            let stepTarget = min(requiredSeconds, mkv.indexedDurationSeconds + 60.0)
+            let (vAdded, aAdded) = (try? await mkv.continueIndexing(untilSeconds: stepTarget)) ?? (0, 0)
+
+            // Refresh feeder totals immediately after each step.
+            feeder.videoSamplesTotal = mkv.indexedVideoFrameCount
+            feeder.audioSamplesTotal = mkv.indexedAudioFrameCount
+            if mkv.indexedDurationSeconds > 0 { feeder.duration = mkv.indexedDurationSeconds }
+
+            totalVAdded += vAdded
+            totalAAdded += aAdded
+
+            record("[seek-index] step  "
+                 + "indexed=\(String(format: "%.2f", mkv.indexedDurationSeconds))s  "
+                 + "+\(vAdded)v/+\(aAdded)a  "
+                 + "totals=\(feeder.videoSamplesTotal)v/\(feeder.audioSamplesTotal)a")
+
+            // Avoid spinning if continueIndexing returns 0 new frames (transient HTTP
+            // failure or cursor alignment issue).
+            if vAdded == 0 && aAdded == 0 { break }
+        }
+
+        record("[seek-index] ✅ done  "
+             + "indexed=\(String(format: "%.2f", mkv.indexedDurationSeconds))s  "
+             + "was=\(String(format: "%.2f", indexedBefore))s  "
+             + "+\(totalVAdded)v/+\(totalAAdded)a  "
+             + "fullyIndexed=\(mkv.isFullyIndexed)")
+
+        let _ = framesBefore  // suppress unused-let warning
+    }
+
+    func startEarlyBackgroundIndexing() {
+        guard let mkv = mkvDemuxer, !mkv.isFullyIndexed else { return }
+        // Scan the entire file so the indexer covers any seek target.
+        let target = duration > 0 ? duration : mkv.indexedDurationSeconds + 300.0
+        record("[IndexTask] 🚀 early-start → full file scan (\(String(format: "%.0f", target))s)  "
+             + "from \(String(format: "%.1f", mkv.indexedDurationSeconds))s")
+        triggerBackgroundIndex(mkv: mkv, to: target)
+    }
+
+    // MARK: - Startup buffer readiness (Sprint 73)
+    //
+    // After seek() (or prepare() with a thin initial window), the pre-loaded
+    // buffer can be well below policy.startupBufferSeconds — as little as 0.6 s
+    // when the seek falls back to the last keyframe in a partially-indexed MKV.
+    //
+    // waitForStartupBuffer() fills this gap before play() is called.  It polls
+    // at 200 ms, calling incremental feedWindow top-ups whenever the background
+    // indexer has advanced past the current feeder cursor.  The polling gives the
+    // @MainActor background-index Task execution windows between suspensions.
+    //
+    // Contract:
+    //   • Call AFTER startEarlyBackgroundIndexing() (indexer must already be running)
+    //   • Call BEFORE play()
+    //   • play() will see buffer ≥ startupBufferSeconds (12 s) → no immediate
+    //     LOW WATERMARK refill on the first feed-loop tick
+    //
+    // For fully-indexed files (MP4, small MKV) the buffer target is reached on
+    // the first top-up with no sleep needed.  For partially-indexed MKV, each
+    // 200 ms sleep lets one indexer step complete before the next top-up.
+    // Times out after 15 s and lets play() fire anyway (with a ⚠️ log).
+
+    func waitForStartupBuffer() async {
+        let target  = policy.startupBufferSeconds
+        let initial = max(0, feeder.lastEnqueuedVideoPTS - startPTS.seconds)
+
+        if initial >= target {
+            record("[Startup] ✅ buffer already ready: \(String(format: "%.1f", initial))s ≥ \(target)s  (no wait needed)")
+            return
+        }
+
+        record("[Startup] 📦 topping up buffer \(String(format: "%.1f", initial))s → \(target)s …  "
+             + "cursor=\(feeder.nextVideoSampleIdx)/\(feeder.videoSamplesTotal)  "
+             + "startPTS=\(String(format: "%.3f", startPTS.seconds))s")
+
+        let deadline = Date().addingTimeInterval(15)
+        var iteration = 0
+
+        repeat {
+            let loaded = max(0, feeder.lastEnqueuedVideoPTS - startPTS.seconds)
+            if loaded >= target { break }
+
+            // Top-up if the indexer has made new frames available.
+            let available = feeder.videoSamplesTotal - feeder.nextVideoSampleIdx
+            if available > 0 {
+                let toFill     = target - loaded
+                let videoCount = min(feeder.videoSamplesFor(seconds: toFill), available)
+                if videoCount > 0 {
+                    await feeder.feedWindow(
+                        videoCount:   videoCount,
+                        audioSeconds: toFill,
+                        label:        "startup-topup",
+                        log:          record(_:)
+                    )
+                }
+            }
+
+            // Re-check after top-up (avoids a 200 ms sleep if we're already done).
+            let loadedAfterTopUp = max(0, feeder.lastEnqueuedVideoPTS - startPTS.seconds)
+            if loadedAfterTopUp >= target { break }
+
+            // Sleep 200 ms to give the background indexer a window to advance.
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            iteration += 1
+
+        } while Date() < deadline
+
+        let final = max(0, feeder.lastEnqueuedVideoPTS - startPTS.seconds)
+        let ready = final >= target
+        record("[Startup] \(ready ? "✅" : "⚠️") buffer \(String(format: "%.1f", final))s  "
+             + "target=\(target)s  iterations=\(iteration)  "
+             + "cursor=\(feeder.nextVideoSampleIdx)/\(feeder.videoSamplesTotal)  "
+             + "\(ready ? "ready — play() safe" : "timed out — playing anyway")")
     }
 
     private func feedIfNeeded(logCycle: Int) async {
@@ -1050,9 +1306,11 @@ final class PlayerLabPlaybackController: ObservableObject {
         videoBuffered = actualLayerPTS.isValid ? actualBuffered : optimisticBuffered
         audioBuffered = max(0, feeder.lastEnqueuedAudioPTS - nowSec)
 
-        // ── Periodic log (Sprint 46 + Sprint 59 diagnostics) ─────────────────────
-        let pendingQ = renderer.pendingVideoQueueCount
+        // ── Periodic log (Sprint 46 + Sprint 59 + Sprint 74 diagnostics) ──────────
+        let pendingQ   = renderer.pendingVideoQueueCount
         let pendingLag = optimisticBuffered - actualBuffered
+        let tbRate     = CMTimebaseGetRate(renderer.synchronizer.timebase)
+        let framesEnq  = renderer.framesEnqueued
         if logCycle % policy.periodicLogInterval == 0 {
             let idxDur    = mkvDemuxer.map { String(format: "%.1f", $0.indexedDurationSeconds) } ?? "—"
             let idxTask   = backgroundIndexTask != nil ? "🔄" : "idle"
@@ -1060,8 +1318,10 @@ final class PlayerLabPlaybackController: ObservableObject {
             record("[feed] t=\(String(format: "%.1f", nowSec))s  "
                  + "buf=\(String(format: "%.1f", actualBuffered))s  "           // actual (layer)
                  + "optBuf=\(String(format: "%.1f", optimisticBuffered))s  "    // feeder tail
+                 + "tbRate=\(String(format: "%.2f", tbRate))  "                 // Sprint 74: synchronizer clock rate
                  + "pendingQ=\(pendingQ)  "                                     // frames not yet at layer
                  + "lag=\(String(format: "%.2f", pendingLag))s  "              // gap = optBuf - buf
+                 + "framesEnq=\(framesEnq)  "                                   // Sprint 74: cumulative layer accepts
                  + "v=\(feeder.nextVideoSampleIdx)/\(feeder.videoSamplesTotal)  "
                  + "a=\(feeder.nextAudioSampleIdx)/\(feeder.audioSamplesTotal)  "
                  + "indexedDur=\(idxDur)s  indexTask=\(idxTask)  "
@@ -1073,10 +1333,26 @@ final class PlayerLabPlaybackController: ObservableObject {
             }
         }
 
-        // Sprint 59: warn when the pending lag is significant — diagnostic signal
-        // for backpressure analysis.  The layer's requestMediaDataWhenReady callback
-        // drains pendingVideoQueue while the clock runs; an actual underrun (0.5 s)
-        // is still the hard safety net.
+        // Sprint 77 — PENDING-LAG: diagnostic log only, no clock intervention.
+        //
+        // Sprint 76 introduced a `.buffering` stall transition here that fired
+        // whenever actualBuf < resumeThreshold AND pendingLag > 1.0 s AND
+        // pendingQ > 24.  This caused a permanent deadlock: immediately after
+        // play(), the startup buffer load leaves ~240 frames in pendingVideoQueue
+        // (lag ~10 s, actualBuf ~1.5 s), so the gate fired on the very first
+        // feed-loop tick and set rate=0.  With the clock paused, framesEnq never
+        // advanced, the .buffering refill loop kept adding ~47 frames per cycle,
+        // and pendingQ grew unboundedly (241 → 2145) — the `canResume` condition
+        // could never be met.
+        //
+        // Root cause of the original concern (clock outrunning layer delivery) is
+        // already addressed by proactiveDrainPending() (Sprint 74) draining
+        // pendingVideoQueue on every feed-loop tick at ~2.5 frames/100 ms — the
+        // same rate as content playback.  The clock does not outrun the layer
+        // when the pending queue is being drained continuously.
+        //
+        // True underruns (actualBuf below underrunThreshold) are still caught by
+        // the bufferForUnderrunCheck block below.  Only log here; never stall.
         if pendingLag > 1.0 && actualBuffered < policy.resumeThreshold {
             record("[feed] ⚠️ PENDING-LAG  "
                  + "actualBuf=\(String(format: "%.2f", actualBuffered))s  "
@@ -1085,6 +1361,62 @@ final class PlayerLabPlaybackController: ObservableObject {
                  + "pendingQ=\(pendingQ)  "
                  + "— layer has not accepted \(pendingQ) frames; clock may outrun delivery")
         }
+
+        // ── Sprint 74: Freeze detector ────────────────────────────────────────────
+        //
+        // A "freeze without .buffering" occurs when the display layer silently stops
+        // rendering (e.g. frames expire before draining from pendingVideoQueue, or
+        // the synchronizer timebase stops without the controller pausing it) but the
+        // feed loop never detects an underrun because bufferForUnderrunCheck still
+        // reads above 0.5 s.
+        //
+        // Detection: when state == .playing, track whether `nowSec` has advanced by
+        // at least 0.05 s since the previous cycle.  If it hasn't moved for 5+
+        // consecutive cycles (~500 ms), emit a FREEZE log with full clock/layer state
+        // so the cause can be diagnosed post-mortem.
+        //
+        // The 5-cycle threshold avoids false positives from normal 100 ms jitter in
+        // the time-tracking loop.  Each cycle is ~100 ms; 5 cycles = ~500 ms of
+        // actual frozen display.
+        //
+        // Note: this is a diagnostic-only path.  It does NOT enter .buffering
+        // automatically — the cause must be identified first before adding recovery.
+        if state == .playing {
+            let didAdvance = nowSec > lastFeedCurrentTime + 0.05
+            if didAdvance {
+                clockFrozenCycles = 0
+            } else {
+                clockFrozenCycles += 1
+            }
+            if clockFrozenCycles == 5 {
+                // 5th cycle of no advancement — fire a one-shot freeze diagnostic.
+                record("[feed] 🧊 FREEZE  "
+                     + "t=\(String(format: "%.3f", nowSec))s  "
+                     + "tbRate=\(String(format: "%.2f", tbRate))  "
+                     + "actualBuf=\(String(format: "%.2f", actualBuffered))s  "
+                     + "optBuf=\(String(format: "%.2f", optimisticBuffered))s  "
+                     + "pendingQ=\(pendingQ)  "
+                     + "framesEnq=\(framesEnq) (delta=\(framesEnq - lastFeedFramesEnqueued) in last 5 cycles)  "
+                     + "feederTail=\(String(format: "%.2f", feeder.lastEnqueuedVideoPTS))s  "
+                     + "layerTail=\(actualLayerPTS.isValid ? String(format: "%.2f", actualLayerPTS.seconds) : "n/a")s  "
+                     + "layer=\(renderer.layerStatusDescription)  "
+                     + "v=\(feeder.nextVideoSampleIdx)/\(feeder.videoSamplesTotal)  "
+                     + "startPTS=\(String(format: "%.3f", startPTS.seconds))s")
+            }
+            // Log every 10 frozen cycles while the freeze persists (after the initial alert).
+            if clockFrozenCycles > 5 && clockFrozenCycles % 10 == 0 {
+                record("[feed] 🧊 FREEZE persists  "
+                     + "frozenCycles=\(clockFrozenCycles)  "
+                     + "t=\(String(format: "%.3f", nowSec))s  "
+                     + "tbRate=\(String(format: "%.2f", tbRate))  "
+                     + "framesEnq=\(framesEnq) (delta=\(framesEnq - lastFeedFramesEnqueued) in last 10 cycles)")
+            }
+        } else {
+            // Reset when not in .playing (e.g. during .buffering recovery or .paused).
+            clockFrozenCycles = 0
+        }
+        lastFeedCurrentTime    = nowSec
+        lastFeedFramesEnqueued = framesEnq
 
         // ── Sprint 47 (rev 2): Proactive non-blocking background index extension ────
         //
@@ -1174,7 +1506,53 @@ final class PlayerLabPlaybackController: ObservableObject {
         // underrun means the display layer's clock has nearly outrun its accepted
         // frames — pendingVideoQueue headroom is irrelevant at that point if the
         // layer's requestMediaDataWhenReady callback hasn't fired yet.
-        if state == .playing && policy.isUnderrun(bufferedSeconds: actualBuffered) {
+        //
+        // Sprint 74: Proactive pendingVideoQueue drain.
+        //
+        // `requestMediaDataWhenReady` fires only ~every 2 s on the tvOS simulator
+        // because both the callback and the feed loop run on the main thread and the
+        // Swift task gets priority.  Without a proactive drain, each LOW WATERMARK
+        // refill adds 195-267 frames to pendingVideoQueue while the callback drains
+        // ~50 frames per 2 s cycle.  pendingQ accumulates to 400-500 frames and the
+        // layer runs dry when the clock reaches the end of the layer's accepted 2 s
+        // window — causing visible freezes at predictable intervals (~19 s, ~34 s, ~36 s).
+        //
+        // Fix: call proactiveDrainPending() on every feed-loop tick (~100 ms).  This
+        // drains at 10 Hz — fast enough to keep pace with 25 fps content (2.5 frames
+        // per 100 ms interval) — and keeps pendingQ near zero so the layer is always
+        // continuously supplied.
+        if pendingQ > 0 {
+            renderer.proactiveDrainPending()
+        }
+
+        // Sprint 72 — PENDING-LAG false underrun suppression:
+        //
+        // Both `actualBuffered` and `pendingVideoQueue` drain happen on the main
+        // thread.  After a large feedWindow call, `requestMediaDataWhenReady` hasn't
+        // had a chance to run yet — the layer's internal queue is full (~50 frames /
+        // ~2 s) and the remaining 200–300 frames sit in pendingVideoQueue.  On the
+        // very next feed-loop iteration (before the callback fires), `actualBuffered`
+        // can legitimately read 0 even though `pendingQ` = 270 and `optimisticBuffered`
+        // = 5.71 s — all 270 frames have PTS AHEAD of the current clock and will
+        // reach the layer via the callback in milliseconds.
+        //
+        // Entering .buffering in this state pauses the clock and triggers a
+        // redundant refill, which produces the "freeze → speed up → play" choppy
+        // pattern reported after Sprint 71.
+        //
+        // Fix: when pendingQ > 0 AND optimisticBuffered > underrunThreshold, use
+        // optimisticBuffered for the underrun check.  These frames have future PTS
+        // and will drain to the layer before they expire.  Only treat actualBuffered
+        // as definitive when pendingVideoQueue is empty (a true dry pipeline).
+        let bufferForUnderrunCheck: Double = {
+            let pq = renderer.pendingVideoQueueCount
+            if pq > 0 && optimisticBuffered > policy.underrunThreshold {
+                // Pending frames are ahead of the clock — treat them as real buffer.
+                return optimisticBuffered
+            }
+            return actualBuffered
+        }()
+        if state == .playing && policy.isUnderrun(bufferedSeconds: bufferForUnderrunCheck) {
             let idxDur   = mkvDemuxer.map { String(format: "%.1f", $0.indexedDurationSeconds) } ?? "—"
             let taskState = backgroundIndexTask != nil ? "🔄 scanning" : "idle — waiting for network?"
             transition(to: .buffering, "underrun actual=\(String(format: "%.2f", actualBuffered))s")
@@ -1183,7 +1561,10 @@ final class PlayerLabPlaybackController: ObservableObject {
             if renderer.audioRendererAttached { renderer.pauseAudioPlayer() }
             record("[Buffer] UNDERRUN  actualVideo=\(String(format: "%.2f", actualBuffered))s  "
                  + "optVideo=\(String(format: "%.2f", buffered))s  "
+                 + "checkBuf=\(String(format: "%.2f", bufferForUnderrunCheck))s  "
                  + "pendingQ=\(pendingQ)  "
+                 + "feederTail=\(String(format: "%.2f", feeder.lastEnqueuedVideoPTS))s  "
+                 + "layerTail=\(actualLayerPTS.isValid ? String(format: "%.2f", actualLayerPTS.seconds) : "n/a")s  "
                  + "audio=\(String(format: "%.2f", audioBuffered))s  "
                  + "nextV=\(feeder.nextVideoSampleIdx)/\(feeder.videoSamplesTotal)  "
                  + "indexedDur=\(idxDur)s  indexTask=\(taskState)  "
@@ -1192,6 +1573,16 @@ final class PlayerLabPlaybackController: ObservableObject {
         }
 
         if state == .buffering {
+            // Sprint 75: cancel the background indexer before the HTTP fetch so
+            // the refill gets exclusive bandwidth.  (The indexer and refill make
+            // concurrent HTTP range-requests that compete on the same LAN
+            // connection, inflating refill time by 2-4×.)  The proactive trigger
+            // below will restart the indexer once the buffer has recovered.
+            if backgroundIndexTask != nil {
+                record("[Buffer] cancelling indexer — freeing bandwidth for buffering refill")
+                backgroundIndexTask?.cancel()
+                backgroundIndexTask = nil
+            }
             let toFill     = policy.refillSeconds(currentlyBuffered: buffered)
             let videoCount = feeder.videoSamplesFor(seconds: toFill)
             if logCycle % policy.bufferingLogInterval == 0 {
@@ -1210,23 +1601,79 @@ final class PlayerLabPlaybackController: ObservableObject {
                                     log:          record(_:))
             framesLoaded = feeder.nextVideoSampleIdx
 
-            let rawTime2  = renderer.currentTime.seconds
-            let nowSec2   = rawTime2.isNaN ? currentTimeFloor : max(rawTime2, currentTimeFloor)
-            let newBuf    = max(0, feeder.lastEnqueuedVideoPTS - nowSec2)
-            videoBuffered = newBuf
+            let rawTime2     = renderer.currentTime.seconds
+            let nowSec2      = rawTime2.isNaN ? currentTimeFloor : max(rawTime2, currentTimeFloor)
+
+            // Sprint 76: use ACTUAL layer-accepted tail for recovery, not the
+            // feeder tail.  The feeder tail is optimistic — pendingVideoQueue
+            // may still be large and those frames haven't reached the layer.
+            // Resuming the clock while actualBuf is still shallow (but optBuf
+            // looks healthy) causes the distortion / freeze pattern at every
+            // refill boundary.
+            let actualLayerPTS2 = renderer.actualLayerEnqueuedMaxPTS
+            let actualRecoveredBuf: Double = actualLayerPTS2.isValid
+                ? max(0, actualLayerPTS2.seconds - nowSec2)
+                : 0
+            let optimisticRecoveredBuf = max(0, feeder.lastEnqueuedVideoPTS - nowSec2)
+            let pendingQ2   = renderer.pendingVideoQueueCount
+            let pendingLag2 = optimisticRecoveredBuf - actualRecoveredBuf
+
+            // Update published buffer depth.  Use optimistic value here so the
+            // progress bar stays sane; underrun/recovery logic uses actual.
+            videoBuffered = optimisticRecoveredBuf
+
             record("[Buffer] after refill: cursor \(cursorBefore)→\(feeder.nextVideoSampleIdx)  "
-                 + "buf \(String(format: "%.2f", buffered))s→\(String(format: "%.2f", newBuf))s  "
+                 + "actualBuf=\(String(format: "%.2f", actualRecoveredBuf))s  "
+                 + "optBuf=\(String(format: "%.2f", optimisticRecoveredBuf))s  "
+                 + "pendingQ=\(pendingQ2)  "
+                 + "lag=\(String(format: "%.2f", pendingLag2))s  "
                  + "layer=\(renderer.layerStatusDescription)")
 
-            if policy.isRecovered(bufferedSeconds: newBuf) {
-                transition(to: .playing, "buffer recovered \(String(format: "%.2f", newBuf))s")
+            // Sprint 70: trigger background indexer if cursor is exhausted while
+            // buffering and the MKV index is still incomplete.
+            //
+            // The Sprint 57 cursor-exhausted guard lives AFTER this block and is
+            // unreachable while state == .buffering.  Without this trigger, the
+            // indexer stays idle indefinitely and the refill loop spins returning 0
+            // new frames on every cycle — a guaranteed permanent freeze.
+            if feeder.nextVideoSampleIdx >= feeder.videoSamplesTotal,
+               let mkv = mkvDemuxer, !mkv.isFullyIndexed {
+                let taskState = backgroundIndexTask != nil ? "already running ✅" : "NOT running — triggering now ⚠️"
+                record("[Buffer] cursor exhausted while buffering — indexTask=\(taskState)  "
+                     + "cursor=\(feeder.nextVideoSampleIdx)/\(feeder.videoSamplesTotal)  "
+                     + "indexedDur=\(String(format: "%.1f", mkv.indexedDurationSeconds))s")
+                // Sprint 71: scan to full file duration so incremental steps
+                // cover as much content as possible before needing re-triggering.
+                let bufTarget = feeder.duration > 0 ? feeder.duration : mkv.indexedDurationSeconds + 300.0
+                triggerBackgroundIndex(mkv: mkv, to: bufTarget)
+            }
+
+            // Sprint 76: gate recovery on actual layer headroom, not feeder tail.
+            //
+            // Sprint 77: removed the `pendingQ2 < 24` and tightened `pendingLag2`
+            // conditions.  While in .buffering the refill loop continuously adds
+            // new frames, so pendingQ grows — a `pendingQ < 24` threshold can
+            // never be met and causes a permanent deadlock.  `pendingLag2 < 1.0`
+            // is also unachievable immediately after a large refill.
+            //
+            // Correct gate: the layer has genuine headroom (actualRecoveredBuf >=
+            // resumeThreshold).  proactiveDrainPending() drains pendingQ on every
+            // feed-loop tick after clock resumes, so the lag clears within a few
+            // hundred milliseconds of play resuming — no pre-resume gate needed.
+            let canResume = actualRecoveredBuf >= policy.resumeThreshold
+
+            if canResume {
+                transition(to: .playing, "buffer recovered actual=\(String(format: "%.2f", actualRecoveredBuf))s")
                 let recoverTime = renderer.currentTime
                 renderer.synchronizer.setRate(1, time: recoverTime)
                 // Sprint 54: resume audio player node after buffer recovery.
                 if renderer.audioRendererAttached {
                     renderer.resumeAudioIfNeeded()
                 }
-                record("[Buffer] RESUME  video=\(String(format: "%.2f", newBuf))s")
+                record("[Buffer] RESUME  "
+                     + "actual=\(String(format: "%.2f", actualRecoveredBuf))s  "
+                     + "opt=\(String(format: "%.2f", optimisticRecoveredBuf))s  "
+                     + "pendingQ=\(pendingQ2)  lag=\(String(format: "%.2f", pendingLag2))s")
             }
             return
         }
@@ -1253,7 +1700,10 @@ final class PlayerLabPlaybackController: ObservableObject {
                  + "cursor=\(feeder.nextVideoSampleIdx)=total  "
                  + "indexedDur=\(String(format: "%.1f", mkv.indexedDurationSeconds))s  "
                  + "indexTask=\(taskState)")
-            triggerBackgroundIndex(mkv: mkv, to: mkv.indexedDurationSeconds + 60.0)
+            // Sprint 71: scan to full file duration (incremental steps update
+            // feeder.videoSamplesTotal after each 15-second chunk).
+            let exhaustTarget = feeder.duration > 0 ? feeder.duration : mkv.indexedDurationSeconds + 300.0
+            triggerBackgroundIndex(mkv: mkv, to: exhaustTarget)
             return  // wait for indexer — underrun already handled above if needed
         }
 
@@ -1266,6 +1716,42 @@ final class PlayerLabPlaybackController: ObservableObject {
         // Using actualBuffered (layer-only, ~1-2s) here would create a permanent
         // watermark trigger loop since the layer's internal queue is always shallow.
         guard policy.isLowWatermark(bufferedSeconds: buffered) else { return }
+
+        // Sprint 75 — Skip proactive refill when actualBuf < resumeThreshold.
+        //
+        // A LOW WATERMARK refill runs an async HTTP fetch that can take many
+        // seconds (network speed ≈ content bitrate on typical home LANs).  If
+        // actualBuffered is already below resumeThreshold (1.5 s) at trigger time,
+        // the clock will advance to the feeder tail during the fetch — by the time
+        // the 424 frames arrive they are all "in the past" → the layer renders them
+        // as a rapid speed-up, then the buffer empties again → freeze.
+        //
+        // Fix: when actualBuf < resumeThreshold, skip the LOW WATERMARK refill
+        // here and let the UNDERRUN check fire on the next tick, which pauses the
+        // clock BEFORE starting the fetch.  The refill then runs in .buffering with
+        // the clock frozen at a clean PTS, and the display resumes from exactly
+        // that PTS once the buffer is healthy.
+        guard actualBuffered >= policy.resumeThreshold else {
+            record("[feed] ⚠️ LOW WATERMARK skipped — "
+                 + "actualBuf=\(String(format: "%.2f", actualBuffered))s < resumeThreshold=\(String(format: "%.2f", policy.resumeThreshold))s  "
+                 + "optBuf=\(String(format: "%.2f", optimisticBuffered))s  pendingQ=\(pendingQ)  "
+                 + "UNDERRUN will pause clock before refilling")
+            return
+        }
+
+        // Sprint 75 — Cancel the background indexer before the HTTP fetch.
+        //
+        // The indexer runs concurrent HTTP range-requests for cluster headers.
+        // When both the indexer and the refill are making HTTP requests
+        // simultaneously, they compete for the same LAN connection and the
+        // refill can take 2–4× longer than it would alone.  Cancel the indexer
+        // here to give the refill exclusive bandwidth; the proactive trigger in
+        // the next feed-loop iteration will restart it once the buffer is healthy.
+        if backgroundIndexTask != nil {
+            record("[feed] LOW WATERMARK — cancelling indexer to free refill bandwidth")
+            backgroundIndexTask?.cancel()
+            backgroundIndexTask = nil
+        }
 
         let toFill     = policy.refillSeconds(currentlyBuffered: buffered)
         let videoCount = feeder.videoSamplesFor(seconds: toFill)
@@ -1393,7 +1879,9 @@ final class PlayerLabPlaybackController: ObservableObject {
 
     func record(_ msg: String) {
         log.append(msg)
-        fputs("[PlayerLabPlaybackController] \(msg)\n", stderr)
+        let line = "[PlayerLabPlaybackController] \(msg)"
+        fputs("\(line)\n", stderr)
+        print(line)          // mirror to stdout so Xcode console shows controller logs
     }
 
     private func formatBytes(_ n: Int64) -> String {

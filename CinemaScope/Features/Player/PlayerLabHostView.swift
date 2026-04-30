@@ -54,7 +54,10 @@ struct PlayerLabHostView: View {
 
     // MARK: - State
 
-    @StateObject private var controller = PlayerLabPlaybackController()
+    // Sprint 76: production player must not be in video-only diagnostic mode.
+    // The default init is videoOnly:true (Phase 2/3 test mode); the production
+    // host needs videoOnly:false so audio is classified and played.
+    @StateObject private var controller = PlayerLabPlaybackController(videoOnly: false)
 
     // Sprint 44 — countdown state
     @State private var nextCandidate:     AutoPlayCandidate? = nil
@@ -63,6 +66,12 @@ struct PlayerLabHostView: View {
     @State private var countdownTask:     Task<Void, Never>? = nil
     /// Parallel fetch task — cancelled together with countdownTask.
     @State private var candidateTask:     Task<AutoPlayCandidate?, Never>? = nil
+
+    // Sprint 74 — log export toast
+    /// Path of the most-recently exported log file, shown briefly in the transport bar.
+    @State private var exportToastMessage: String? = nil
+    /// Task that clears `exportToastMessage` after the display timeout.
+    @State private var exportToastTask:    Task<Void, Never>? = nil
 
     // MARK: - Body
 
@@ -160,6 +169,28 @@ struct PlayerLabHostView: View {
                 }
             }
 
+            // ── Sprint 72 / 73: Start indexer + wait for startup buffer ─────
+            //
+            // Sprint 72: moved startEarlyBackgroundIndexing() to AFTER seek()
+            // so seek()'s stopFeedLoop() can't cancel it.
+            //
+            // Sprint 73: added waitForStartupBuffer() between the indexer start
+            // and play().  Without this, the pre-loaded buffer after a seek
+            // fallback is only ~0.6 s (the last few indexed frames before
+            // cursor exhaustion), causing an immediate real underrun on the
+            // first clock tick.  waitForStartupBuffer() polls at 200 ms,
+            // calling incremental feedWindow top-ups as the background indexer
+            // advances, until the buffer reaches policy.startupBufferSeconds
+            // (12 s) or the 15 s timeout fires.
+            //
+            // Correct order:
+            //   1. seek()                       ← stopFeedLoop() fires here
+            //   2. startEarlyBackgroundIndexing ← no cancel risk after step 1
+            //   3. waitForStartupBuffer()        ← tops up while indexer runs
+            //   4. play()                        ← clock starts with ≥ 12 s buffer
+            controller.startEarlyBackgroundIndexing()
+            await controller.waitForStartupBuffer()
+
             controller.play()
             // Sprint 68: log controller state immediately after play() so the log
             // shows whether the state is .playing or if something transitioned it
@@ -174,10 +205,13 @@ struct PlayerLabHostView: View {
                 startAutoPlay()
             }
         }
-        // Cancel any in-flight tasks when the view disappears
+        // Cancel any in-flight tasks when the view disappears.
+        // Sprint 74: auto-export the log so it is always saved even if the
+        // player froze and the user couldn't press the Export Log button.
         .onDisappear {
             sessionLog("PlayerLabHostView disappeared  sid=\(sid)")
             cancelAutoPlay()
+            exportLog()
         }
     }
 
@@ -368,7 +402,24 @@ struct PlayerLabHostView: View {
                 }
                 .disabled(!controller.state.canSeek || controller.duration == 0)
 
+                // Sprint 74: Export Log — copies playerlab.log to Documents and
+                // prints the path to stdout (Xcode console) for easy access.
+                Button(action: exportLog) {
+                    Label("Export Log", systemImage: "square.and.arrow.up")
+                        .font(.system(size: 17, weight: .semibold))
+                }
+
                 Spacer()
+
+                // Sprint 74: export toast — shows exported path briefly
+                if let toast = exportToastMessage {
+                    Text(toast)
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundStyle(.green.opacity(0.9))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .transition(.opacity)
+                }
 
                 // Status
                 Text(controller.state.statusLabel)
@@ -483,6 +534,84 @@ struct PlayerLabHostView: View {
     private func togglePlayPause() {
         if controller.state == .playing { controller.pause() }
         else { controller.play() }
+    }
+
+    // MARK: - Sprint 74: Log Export
+    //
+    // Copies playerlab.log (the stderr redirect file set up by PlayerLabLog.setup())
+    // to the app's Documents directory with a timestamp, and also dumps the
+    // in-memory controller.log array to a separate .txt file.
+    //
+    // Both paths are printed to stdout (visible in Xcode console).  On the Mac:
+    //
+    //   open "$(xcrun simctl get_app_container booted SMR.CinemaScope data)/Documents/"
+    //
+    // Or look for the printed path in the Xcode console after tapping Export Log.
+    //
+    // A brief toast appears in the transport bar confirming the export.
+
+    private func exportLog() {
+        let fm  = FileManager.default
+        let now = Date()
+
+        // Timestamp suffix: YYYYMMDD_HHmmss
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyyMMdd_HHmmss"
+        let ts = fmt.string(from: now)
+
+        let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first!
+
+        var exported: [String] = []
+
+        // ── 1. Copy the live playerlab.log (stderr redirect) ─────────────────
+        if let src = PlayerLabLog.logFilePath, fm.fileExists(atPath: src) {
+            let dst = docs.appendingPathComponent("playerlab_\(ts).log")
+            do {
+                try? fm.removeItem(at: dst)
+                try fm.copyItem(atPath: src, toPath: dst.path)
+                exported.append(dst.lastPathComponent)
+                print("📋 [Export] playerlab.log → \(dst.path)")
+                sessionLog("📋 Exported playerlab.log → \(dst.lastPathComponent)")
+            } catch {
+                print("⚠️ [Export] playerlab.log copy failed: \(error)")
+                sessionLog("⚠️ Export of playerlab.log failed: \(error.localizedDescription)")
+            }
+        } else {
+            print("⚠️ [Export] playerlab.log not found at: \(PlayerLabLog.logFilePath ?? "nil")")
+        }
+
+        // ── 2. Dump the in-memory controller.log array ────────────────────────
+        //    This contains every controller.record() line and is the most
+        //    convenient source for post-mortem analysis in a text editor.
+        let memDst = docs.appendingPathComponent("playerlab_mem_\(ts).txt")
+        let header = "# PlayerLab in-memory log  session=\(sid)  exported=\(now)\n"
+                   + "# item: \(itemName)\n"
+                   + "# url:  \(url.absoluteString)\n\n"
+        let content = header + controller.log.joined(separator: "\n")
+        do {
+            try content.write(to: memDst, atomically: true, encoding: .utf8)
+            exported.append(memDst.lastPathComponent)
+            print("📋 [Export] controller.log → \(memDst.path)")
+            sessionLog("📋 Exported controller.log → \(memDst.lastPathComponent)")
+        } catch {
+            print("⚠️ [Export] controller.log write failed: \(error)")
+        }
+
+        // ── 3. Print access command to stdout ─────────────────────────────────
+        print("📋 [Export] To open: open \"\(docs.path)\"")
+
+        // ── 4. Show toast in the transport bar ────────────────────────────────
+        let toastText = exported.isEmpty
+            ? "⚠️ Export failed"
+            : "✅ \(exported.count) file\(exported.count == 1 ? "" : "s") → Documents/"
+        withAnimation {
+            exportToastMessage = toastText
+        }
+        exportToastTask?.cancel()
+        exportToastTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 4_000_000_000)  // 4 seconds
+            withAnimation { exportToastMessage = nil }
+        }
     }
 
     private func seekBy(_ seconds: Double) {

@@ -25,7 +25,29 @@ struct BufferPolicy {
     // MARK: - Window / target constants
 
     /// Seconds of video to pre-load before reporting .ready.
-    let initialWindowSeconds: Double = 3.0
+    ///
+    /// Sprint 73: raised from 3.0 → 10.0.
+    ///
+    /// Rationale: the initial scan covers ~8–10 s.  With 3.0 s the initial
+    /// feedWindow loads only 3 s; when the buffer fell below lowWatermarkSeconds
+    /// (10 s) on the very first feed-loop tick, a LOW WATERMARK refill fired
+    /// immediately.  On slower connections or when competing with background-
+    /// indexer HTTP traffic, that refill took > 3 s → real underrun → .buffering
+    /// on the first tick after play().
+    ///
+    /// Raising to 10.0 s means the initial feedWindow always tries to load as
+    /// many frames as the current index covers (up to 10 s).  Paired with
+    /// waitForStartupBuffer() in PlayerLabHostView, the pre-play buffer reaches
+    /// startupBufferSeconds before the clock starts — eliminating the immediate
+    /// underrun entirely.
+    let initialWindowSeconds: Double = 10.0
+
+    /// Minimum pre-loaded buffer depth before play() should be called.
+    ///
+    /// Sprint 73: set above lowWatermarkSeconds (10.0) so that after
+    /// waitForStartupBuffer() completes, the first feed-loop tick does NOT
+    /// immediately see a LOW WATERMARK and fire a competing refill.
+    let startupBufferSeconds: Double = 12.0
 
     /// Desired buffer depth during normal playback.
     /// Sprint 58: raised from 8.0 → 15.0 to stay above the new 10.0 s low-watermark.

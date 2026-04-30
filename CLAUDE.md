@@ -405,6 +405,362 @@ Locations:
 - `PlayerLabPlaybackController.play()` — `[play-check]` diagnostic block after `renderer.play(from:)`
 - `PlayerLabHostView.task` — updated `.task END` log includes `state=\(controller.state.statusLabel)`
 
+### Sprint 69 — Logging gap: controller/renderer fputs invisible in Xcode console
+
+**Root cause:** `PlayerLabLog.setup()` calls `freopen()` to redirect stderr to
+`playerlab.log`.  After the redirect, Xcode console only shows stdout (`print()`).
+`PlayerLabPlaybackController.record()` and all `FrameRenderer` diagnostic fputs calls
+wrote to stderr only → they went to the log file but were completely invisible during
+Xcode debugging sessions.  `sessionLog()` in `PlayerLabHostView` always wrote to both
+`print()` AND `fputs(stderr)`, so `[Session]` lines appeared in Xcode console and gave
+the false impression that controller/renderer logs were also visible.
+
+**Fix:**
+- `record()` in `PlayerLabPlaybackController` now calls both `fputs(stderr)` and
+  `print()`.  ALL `[PlayerLabPlaybackController]` lines are now visible in Xcode console.
+- `FrameRenderer.frLog(_:)` — new private helper that also calls both fputs and print.
+  Key lifecycle lines (`init`, `play(from:)`, `pause()`, `resume()`, `flushAll()`,
+  `flushForSeek()`, `startAudioEngine` pass/fail, `First frame enqueued`,
+  `playerNode.play()`) were migrated to `frLog()`.
+- `PacketFeeder.enqueueAndAdvance` — the sample-0 enqueue confirmation now also
+  calls `print()` so it is visible in Xcode console.
+
+**Never revert `record()` or `frLog()` back to stderr-only** — the logging gap made
+`[PlayerLabPlaybackController]` and `[FrameRenderer]` lines completely invisible during
+debugging for the entire duration of Sprints 67 and 68, blocking diagnosis.
+
+Locations:
+- `PlayerLabPlaybackController.record()` — `print(line)` added after `fputs`
+- `FrameRenderer.frLog(_:)` — new private helper (replaces direct `fputs` calls)
+- `PacketFeeder.enqueueAndAdvance` — sample-0 guard now also calls `print()`
+
+### Sprint 70 — H.264/AC3 MKV freeze: DV false positive + buffering indexer starvation
+
+**Root cause A — False-positive `isDolbyVisionDualLayer` on H.264 content:**
+`MKVDemuxer.isDolbyVisionDualLayer` fired `true` for a H.264 Friends TV episode.
+Dolby Vision Profile 7 dual-layer MKV is always HEVC — H.264 is never DV P7.
+The detection false-positives on H.264 files whose first cluster contains many small
+non-keyframes (long open-GOP before the first IDR; typical for TV content at 24fps).
+This triggered `firstIDRVideoKeyframeIndex(from: firstKF)` which scanned ahead 116
+frames, forcing the cursor to start at frame 140 (PTS≈5.8s) instead of frame 0.
+With only 208 frames in the initial index window, starting at 140 left only 68 frames.
+After any seek to later in the file, the buffer immediately underran.
+
+**Fix A:** In `prepare()`, gate both the false-positive clear and the DV preamble block
+on `videoTrack.isHEVC`. Two-step approach:
+1. If `feeder.isDolbyVisionDualLayer && !videoTrack.isHEVC` → clear the flag and log.
+2. `if let mkv = mkvDemuxer, videoTrack.isHEVC, feeder.isDolbyVisionDualLayer` — the
+   preamble scan and cursor advance only run when the codec is confirmed HEVC.
+
+**Never apply the DV BL preamble scan or cursor advance to H.264 content.**
+
+**Root cause B — Background indexer never triggered from `.buffering` state:**
+When the buffer underruns (state → `.buffering`), the refill block spins calling
+`feedWindow(340 frames)` which returns 0 new frames because `cursor=videoSamplesTotal`.
+The Sprint 57 cursor-exhausted guard that calls `triggerBackgroundIndex` lives *after*
+the `.buffering` return block and is never reached while in `.buffering` state.  The
+indexer stays idle indefinitely → permanent freeze.
+
+**Fix B:** Inside the `.buffering` refill block, after `feedWindow` returns, check if
+`cursor >= total && !isFullyIndexed` and call `triggerBackgroundIndex` if so.
+
+**Never omit the cursor-exhausted indexer trigger from the `.buffering` block** — it is
+the only path that fires when an underrun occurs while the index is still incomplete.
+
+Locations:
+- `PlayerLabPlaybackController.prepare()` — `if feeder.isDolbyVisionDualLayer && !videoTrack.isHEVC` clear block; `if let mkv = mkvDemuxer, videoTrack.isHEVC, feeder.isDolbyVisionDualLayer` preamble block
+- `PlayerLabPlaybackController` feed loop — cursor-exhausted `triggerBackgroundIndex` call inside the `.buffering` refill block
+
+### Sprint 71 — Indexer starvation: feeder totals not updated until full scan completes
+
+**Root cause — `feeder.videoSamplesTotal` only updated at end of full `continueIndexing` scan:**
+`triggerBackgroundIndex` called `continueIndexing(untilSeconds: target)` as a single call.
+For a typical target of `indexedDurationSeconds + 60.0` (60-second window), scanning
+~116 MB of cluster headers over a 2.67 GB file at LAN speeds takes 7–8 seconds.  During
+this entire window, `feeder.videoSamplesTotal` showed the OLD value (208 frames), so the
+feed loop kept calling `feedWindow` → returned 0 frames → buffer stayed empty → visible
+freeze lasting 7–8 s after every buffer underrun.  Additionally, `indexedDurationSeconds`
+was only updated at the end of `continueIndexing`, making the feed loop's `indexedDur`
+log always show 8.6s throughout the scan — indistinguishable from a genuine hang.
+
+**Fix A — Incremental 15-second steps in `triggerBackgroundIndex`:**
+Rewrote `triggerBackgroundIndex` as a loop of `continueIndexing(untilSeconds: step)` calls
+with `step = indexedDurationSeconds + 15.0`.  After each step, `feeder.videoSamplesTotal`
+is updated immediately.  The feed loop sees new frames after ~1–2 seconds (first step)
+instead of waiting 7–8 s for the full scan.  Recovery from underrun drops from ~8 s to <1 s.
+
+**Fix B — Incremental `indexedDurationSeconds` updates inside `continueIndexing`:**
+Added `indexedDurationSeconds = frameIndex.last?.pts.seconds ?? indexedDurationSeconds`
+after every cluster's `backgroundScanCursor = cursor + total` line.  The feed loop's
+`indexedDur=Xs` log now shows real-time progress, not a frozen 8.6s throughout the scan.
+
+**Fix C — Early-start background indexing from `PlayerLabHostView.task`:**
+`controller.startEarlyBackgroundIndexing()` is called immediately after `prepare()`
+succeeds and before the resume seek.  This gives the indexer a head start while the
+seek's HTTP pre-fetch executes.  By the time play() is called and the initial buffer
+drains, the indexer has already completed one or more steps — making recovery nearly
+instantaneous when the underrun fires.
+
+**Fix D — Full-file scan targets:**
+Both `triggerBackgroundIndex` call sites that previously used `indexedDurationSeconds + 60.0`
+now use `feeder.duration` (full file) as the target.  The incremental steps handle
+bandwidth throttling naturally; a full-file target ensures the indexer eventually covers
+any seek destination without needing re-triggering.
+
+**Never revert `triggerBackgroundIndex` to a single `continueIndexing` call** — this
+restores the 7–8 s freeze.  **Never remove the `startEarlyBackgroundIndexing()` call
+from `PlayerLabHostView.task`** — without it, the indexer has no head start and the first
+underrun always causes a visible multi-second freeze.
+
+Locations:
+- `MKVDemuxer.continueIndexing` — `indexedDurationSeconds = frameIndex.last?.pts.seconds ?? …` after `backgroundScanCursor = cursor + total`
+- `PlayerLabPlaybackController.triggerBackgroundIndex` — incremental while-loop with 15s steps; updates feeder totals after each step
+- `PlayerLabPlaybackController.startEarlyBackgroundIndexing()` — new public method, targets `feeder.duration`
+- `PlayerLabHostView.task` — `controller.startEarlyBackgroundIndexing()` after seek and before play() (Sprint 72 fix)
+
+### Sprint 72 — Three post-71 fixes: early-start cancellation, nil-element logging, PENDING-LAG false underruns
+
+**Root cause A — `startEarlyBackgroundIndexing()` cancelled by seek:**
+Sprint 71 called `startEarlyBackgroundIndexing()` before `seek(toFraction:)`.  `seek()`
+calls `stopFeedLoop()` which does `backgroundIndexTask?.cancel(); backgroundIndexTask = nil`.
+The early-start task immediately saw `Task.isCancelled=true` and returned `(0,0)` — the
+indexer got zero head start.  Log evidence: `[IndexTask] 🚀 early-start → ...` then
+`[IndexTask] ✅ done → 8.6s  +0v/+0a  target reached` after every seek.
+
+**Fix A:** Moved `startEarlyBackgroundIndexing()` to AFTER `seek(toFraction:)` in
+`PlayerLabHostView.task`, immediately before `controller.play()`.  At that point,
+`stopFeedLoop()` has already fired and there is no subsequent cancellation.
+
+**Never place `startEarlyBackgroundIndexing()` before the seek** — the seek will cancel
+the task before it can do any work.
+
+**Root cause B — `continueIndexing` breaking silently on `nextElement` nil:**
+When `parser.nextElement(at: cursor, limit:)` returns nil (HTTP failure or cursor
+alignment issue), the while loop breaks immediately with no log.  The outer
+`triggerBackgroundIndex` loop retries on the next cycle but still hits the same nil,
+producing many `[IndexTask] ✅ done → 8.6s  +0v/+0a` lines without diagnosis.
+
+**Fix B:** Added a `log(...)` call in the `else { break }` branch in
+`continueIndexing`'s while loop to record `cursor`, `limit`, `clusterCount`, and
+current indexed duration.  If the same cursor appears many times, it is a cursor
+alignment bug; if it appears once and then scanning advances, it is a transient HTTP
+failure.
+
+**Root cause C — PENDING-LAG false underruns causing choppy playback:**
+After a large `feedWindow` call loads 300+ frames into `pendingVideoQueue`, the
+`requestMediaDataWhenReady` callback hasn't yet had a chance to drain them to the layer
+(both run on the main thread; the callback runs between feed-loop iterations, not
+inline).  `actualBuffered` reads 0 (the layer holds nothing past the current clock)
+while `optimisticBuffered` = 5.71 s (270 frames in pendingVideoQueue, all with PTS
+AHEAD of the clock).  The old underrun check (`actualBuffered < 0.5 s`) fires
+unconditionally, enters `.buffering`, pauses the clock, and triggers a redundant
+refill — producing the "freeze → play a little → freeze again" choppy pattern.
+
+**Fix C:** `bufferForUnderrunCheck` replaces the bare `actualBuffered` in the underrun
+condition.  When `pendingQ > 0 && optimisticBuffered > underrunThreshold`, the pending
+frames have future PTS and will drain to the layer via the callback imminently, so
+`optimisticBuffered` is used for the check instead of `actualBuffered`.  When
+`pendingQ = 0` (pipeline truly empty), `actualBuffered` is used as before.  A new
+`checkBuf=` field in the `[Buffer] UNDERRUN` log shows which value triggered the check.
+
+**Never suppress underrun detection when pendingQ=0** — an empty pipeline with
+`actualBuffered = 0` is a real underrun and the clock must be paused.
+
+Locations:
+- `PlayerLabHostView.task` — `startEarlyBackgroundIndexing()` moved to after `seek()`, before `play()`
+- `MKVDemuxer.continueIndexing` — `log(...)` in the `nextElement` nil `else { break }` branch
+- `PlayerLabPlaybackController` feed loop — `bufferForUnderrunCheck` replaces `actualBuffered` in underrun condition; `checkBuf=` added to `[Buffer] UNDERRUN` log
+
+### Sprint 73 — Immediate underrun on seek fallback: startup buffer too thin
+
+**Root cause — seek to partially-indexed position leaves < 1 s of buffer:**
+After seek to 1165 s (85% of file), `findVideoKeyframeSampleIndex` falls back to the
+last keyframe in the 8.6 s startup index (~frame 192, PTS ~8.0 s).  The seek pre-fetch
+uses `initialWindowSeconds = 3.0 s` and tries to load 3 s from frame 192, but only ~16
+frames exist between frame 192 and `videoSamplesTotal = 208` → **0.67 s of buffer
+after seek**.  Clock starts at 8.0 s, drains 0.67 s later → real underrun → `.buffering`
+within the first second of playback, every time.
+
+**Root cause detail — `initialWindowSeconds` also caps the seek pre-fetch:**
+`seek()` uses `policy.initialWindowSeconds` as the target for its Phase-1 pre-fetch
+(`fetchPackets(videoCount: feeder.videoSamplesFor(seconds: initialWindowSeconds), ...)`).
+Raising `initialWindowSeconds` from 3 s → 10 s gives a larger pre-fetch target, but the
+actual frames loaded are still capped by the cursor position vs. `videoSamplesTotal`.
+The fix for the cursor exhaustion case is `waitForStartupBuffer()`.
+
+**Fix A — Raise `initialWindowSeconds` from 3.0 → 10.0 s in BufferPolicy:**
+For all cases where the index DOES cover the target (non-seek startup, or seeks early
+in the file), this doubles the pre-play buffer and eliminates the immediate LOW WATERMARK
+refill on the first feed-loop tick.  The initial feedWindow loads up to 10 s before
+`prepare()` returns `.ready`.
+
+**Fix B — Add `startupBufferSeconds = 12.0 s` to BufferPolicy:**
+Set above `lowWatermarkSeconds` (10 s) so that after `waitForStartupBuffer()` completes,
+the first feed-loop tick does NOT immediately see LOW WATERMARK and trigger a competing
+refill while the clock is already running.
+
+**Fix C — Add `waitForStartupBuffer()` to PlayerLabPlaybackController:**
+Called from `PlayerLabHostView.task` AFTER `startEarlyBackgroundIndexing()` and BEFORE
+`play()`.  Polls at 200 ms, calling incremental `feedWindow` top-ups whenever the
+background indexer has made new frames available, until `buffer >= startupBufferSeconds`
+or the 15 s timeout fires.  The 200 ms sleeps are suspension points that give the
+`@MainActor` background-index Task execution windows between iterations.
+
+**Fix D — `[Buffer] UNDERRUN` log now includes `feederTail=` and `layerTail=`:**
+Absolute PTS values of the feeder's last-enqueued frame and the display layer's
+last-accepted frame.  Combined with `checkBuf=` (Sprint 72), these three fields
+fully characterise whether an underrun is real (both tails at clock) or a pending-lag
+false alarm (feederTail well ahead of clock).
+
+**Never call `play()` immediately after `startEarlyBackgroundIndexing()`** without
+first calling `await controller.waitForStartupBuffer()`.  On any seek that falls back
+to the partially-indexed region, the buffer is < 1 s and the clock will underrun
+within that first second.
+
+Locations:
+- `BufferPolicy.initialWindowSeconds` — raised 3.0 → 10.0
+- `BufferPolicy.startupBufferSeconds` — new constant 12.0
+- `PlayerLabPlaybackController.waitForStartupBuffer()` — new async method; polling top-up loop
+- `PlayerLabHostView.task` — `await controller.waitForStartupBuffer()` inserted between
+  `startEarlyBackgroundIndexing()` and `play()`
+- `PlayerLabPlaybackController` feed loop — `feederTail=` and `layerTail=` added to
+  `[Buffer] UNDERRUN` log
+
+### Sprint 74 — pendingVideoQueue accumulation: freeze/distortion at predictable intervals
+
+**Root cause — `requestMediaDataWhenReady` fires ~every 2 s on tvOS simulator:**
+The callback that drains `pendingVideoQueue` to `AVSampleBufferDisplayLayer` runs on
+`DispatchQueue.main`.  The feed loop also runs on `@MainActor`.  Swift tasks have higher
+scheduling priority than GCD callbacks on the tvOS simulator, so the callback fires
+~every 2 s (not ~every frame).  Each LOW WATERMARK refill adds 195–267 frames to
+`pendingVideoQueue` while the callback drains only ~50 frames per 2 s cycle.
+`pendingQ` accumulated to 499–555 frames.  When the clock reached the end of the
+layer's 2 s accepted window, the layer ran dry briefly → all 499 pending frames dumped
+at once → visible freeze + distortion at predictable positions (~19 s, ~34 s, ~36 s
+with constant timing every run).
+
+**Diagnostic evidence from user log:**
+```
+[feed] t=35.5s  buf=1.4s  optBuf=11.7s  tbRate=1.00  pendingQ=499  lag=10.30s  framesEnq=739
+[feed] t=36.6s  buf=10.6s  optBuf=10.6s  tbRate=1.00  pendingQ=0   lag=0.00s   framesEnq=1238
+```
+`framesEnq` jumped from 739 → 1238 (+499) in one 100 ms feed cycle — all 499 pending
+frames reached the layer at once when it ran dry at t=35.5–36.6 s.
+
+**Fix — proactive drain in the feed loop:**
+`FrameRenderer.proactiveDrainPending()` is a public wrapper around the private
+`drainVideoQueue()`.  Called from `PlayerLabPlaybackController.feedIfNeeded()` on every
+tick (~100 ms) when `pendingQ > 0`.  At 25 fps, the feed loop drains ~2.5 frames per
+100 ms interval — same rate as content playback — so `pendingQ` stays near zero and
+the layer is continuously supplied without waiting for the ~2 s callback.
+
+**Auto-export on disappear:**
+`PlayerLabHostView.onDisappear` now calls `exportLog()` automatically so the log is
+always saved even when the player freezes and the manual Export button is unreachable.
+
+**Never remove `proactiveDrainPending()` from the feed loop** — without it, `pendingQ`
+accumulates on the tvOS simulator and every refill cycle produces visible distortion
+at the predictable interval where the layer runs dry.
+
+**Never rely solely on `requestMediaDataWhenReady` to drain `pendingVideoQueue`** on
+tvOS — the callback fires too infrequently when the feed loop is the dominant main-thread
+occupant.
+
+Locations:
+- `FrameRenderer.proactiveDrainPending()` — new public wrapper around `drainVideoQueue()`
+- `PlayerLabPlaybackController` feed loop — `if pendingQ > 0 { renderer.proactiveDrainPending() }` before underrun check
+- `PlayerLabHostView.onDisappear` — `exportLog()` call added for auto-export on freeze/dismiss
+
+### Sprint 75 — LOW WATERMARK refill races clock when network ≈ content bitrate
+
+**Root cause — LOW WATERMARK refill with critically-low actualBuf causes speed-up + freeze:**
+After Sprint 74's proactive drain emptied `pendingVideoQueue`, `optimisticBuffered` dropped to match `actualBuffered` (~1.5 s).  LOW WATERMARK fired at `optBuf=1.11s < 10s` and started a 424-frame HTTP fetch.  At 15.8 Mbps content on a ~16 Mbps LAN, the fetch took ~17 seconds of wall time.  The clock advanced from 22.5 s to 40.21 s during the fetch.  All 374 queued frames (PTS 24–40 s) reached the layer simultaneously and were rendered as a rapid speed-up, after which the buffer was empty again → freeze.
+
+**Root cause B — Background indexer competing for HTTP bandwidth:**
+The background indexer made concurrent HTTP range-requests for cluster headers during the LOW WATERMARK refill, reducing effective bandwidth to the refill by 2–4× and inflating the 17-second delay further.
+
+**Fix A — Skip LOW WATERMARK proactive refill when `actualBuf < policy.resumeThreshold`:**
+When the real buffer is already below resumeThreshold (1.5 s), a long HTTP fetch will always let the clock outrun the feeder tail.  The LOW WATERMARK guard now `return`s early with a diagnostic log, allowing the UNDERRUN check to fire on a subsequent tick.  UNDERRUN pauses the clock (`rate=0`) BEFORE the fetch — so the display shows a clean still frame, the fetch completes, and the clock resumes from the exact paused PTS without any speed-up or position jump.
+
+**Fix B — Cancel background indexer before `await feedWindow()` in both LOW WATERMARK and `.buffering`:**
+The indexer is cancelled immediately before the HTTP fetch in both code paths.  Cancellation frees the LAN connection for the refill's bulk sequential reads, reducing refill time by 2–4×.  The proactive indexer trigger in the next feed-loop iteration restarts the indexer once the buffer has recovered.
+
+**Never allow a LOW WATERMARK proactive refill when `actualBuffered < policy.resumeThreshold`** — on bandwidth-constrained networks the clock always outpaces the fetch and the speed-up/freeze pattern recurs deterministically.
+
+**Never omit `cancelBackgroundIndex()` before `await feedWindow()` in the LOW WATERMARK and `.buffering` blocks** — the indexer competes for HTTP bandwidth and inflates refill time.
+
+Locations:
+- `PlayerLabPlaybackController` LOW WATERMARK block — `guard actualBuffered >= policy.resumeThreshold` early-return; `cancelBackgroundIndex()` before `await feedWindow()`
+- `PlayerLabPlaybackController` `.buffering` block — `cancelBackgroundIndex()` before `await feedWindow()`
+
+### Sprint 76 — Seek snaps to wrong position + distortion at refill boundaries
+
+**Bug 1 root cause — seek resolves against incomplete MKV index:**
+`seek(toFraction:)` called `findVideoKeyframeSampleIndex(nearestBeforePTS:)` directly against an index that only covered 8.6 s of a 1364 s file.  The nearest keyframe before PTS 1165 s in that tiny index was frame 186 at PTS 7.758 s.  The seek silently snapped there, so the user always resumed from near the start of the episode instead of the intended 85% position.
+
+**Fix — `ensureMKVIndexedForSeek()` called at the top of `seek(toFraction:)`:**
+New private async helper.  Before resolving any keyframe, it extends the MKV index until `indexedDurationSeconds >= targetSeconds + max(2.0, initialWindowSeconds)` (or the file is fully indexed).  Index extension runs in 60-second incremental steps so the @MainActor scheduler stays responsive.  Feeder totals are refreshed after each step.  A delta-warning log fires if the resolved keyframe is still > 30 s from the target (transient HTTP failure or genuine sparse index).
+
+**Never call `findVideoKeyframeSampleIndex` on the MKV path without first calling `ensureMKVIndexedForSeek`** — the startup index covers only the first ~8–10 s and any seek beyond that region silently clamps to the last indexed keyframe.
+
+**Bug 2 root cause — buffering recovery used optimistic feeder tail:**
+The `.buffering` recovery check was `let newBuf = feeder.lastEnqueuedVideoPTS - now; if policy.isRecovered(newBuf)`.  `feeder.lastEnqueuedVideoPTS` advances the moment frames enter `pendingVideoQueue`, not when the layer accepts them.  With `pendingQ = 234` and `actualBuf = 1.5 s`, `newBuf` could read 12 s → `isRecovered()` returned true → clock resumed → clock immediately outpaced the shallow layer tail → distortion at every refill boundary.
+
+**Fix A — Recovery gated on actual layer tail:**
+`canResume = actualRecoveredBuf >= resumeThreshold`.  `actualRecoveredBuf` is derived from `renderer.actualLayerEnqueuedMaxPTS` — the last PTS the layer physically accepted.  Recovery waits until the layer genuinely has headroom.  (Sprint 76 originally also required `pendingLag2 < 1.0 && pendingQ2 < 24`; those conditions were removed in Sprint 77 — see below.)
+
+**Fix B — `PlayerLabHostView` was creating controller with `videoOnly: true` (default):**
+The production player was in video-only diagnostic mode for all content, silently skipping audio session activation and audio engine start.  Changed to `PlayerLabPlaybackController(videoOnly: false)`.
+
+**Never use `feeder.lastEnqueuedVideoPTS` (optimistic) for buffering recovery or underrun suppression** — use `renderer.actualLayerEnqueuedMaxPTS` (actual) instead.
+
+Locations:
+- `PlayerLabPlaybackController.ensureMKVIndexedForSeek(_:windowSeconds:)` — new helper; called at top of `seek(toFraction:)`
+- `PlayerLabPlaybackController.seek(toFraction:)` — `ensureMKVIndexedForSeek` call + delta-warning log
+- `PlayerLabPlaybackController` `.buffering` recovery — `canResume` gates on `actualRecoveredBuf` only
+- `PlayerLabHostView` — `PlayerLabPlaybackController(videoOnly: false)` explicit
+
+### Sprint 77 — Pending-lag stall gate causes permanent deadlock
+
+**Root cause — stall gate fires immediately after play() on every startup:**
+Sprint 76's `criticalPendingLag` block entered `.buffering` and set `rate=0` whenever
+`actualBuffered < resumeThreshold && pendingLag > 1.0 && pendingQ > 24`.  This fired
+on the very first feed-loop tick after `play()` because the startup buffer load
+(`waitForStartupBuffer`) leaves ~240 frames in `pendingVideoQueue` (lag ~10 s,
+`actualBuf ~1.5 s`).  With the clock paused, `framesEnq` never advanced, and the
+`.buffering` refill loop kept adding ~47 frames per cycle → `pendingQ` grew from
+241 → 2145 without bound.  The `canResume` condition also had `pendingQ2 < 24` which
+the refill loop actively prevented from ever being met → permanent `.buffering` freeze.
+
+**Why this was wrong:** The large pendingQ immediately after play() is expected and
+benign.  `proactiveDrainPending()` (Sprint 74) drains the queue at ~2.5 frames per
+100 ms feed-loop tick — the same rate as content playback.  The layer does not run
+dry while the queue is being drained continuously; no clock intervention is needed.
+
+**Fix A — Remove the stall-transition block entirely:**
+The entire `criticalPendingLag` path (which set `rate=0` and called
+`transition(to: .buffering, ...)`) has been deleted.  In its place: a log-only
+`⚠️ PENDING-LAG` warning when `pendingLag > 1.0 && actualBuffered < resumeThreshold`.
+True underruns (actualBuf below underrunThreshold) are still caught by the unchanged
+`bufferForUnderrunCheck` block further down the feed loop.
+
+**Fix B — Remove `pendingQ2 < 24` and `pendingLag2 < 1.0` from `canResume`:**
+The `.buffering` recovery condition is now simply `actualRecoveredBuf >= resumeThreshold`.
+After the clock resumes, `proactiveDrainPending()` clears the pending backlog within
+a few hundred milliseconds — no pre-resume gate on queue depth is needed.
+
+**Never add a `.buffering` stall transition based on `pendingQ` or `pendingLag` alone** —
+the pending queue is naturally large immediately after any large buffer pre-load
+(startup, seek, or refill), and a clock-pause at that moment creates a feedback loop
+that grows pendingQ unboundedly.
+
+**Never gate `canResume` on `pendingQ < N`** — the `.buffering` refill loop adds frames
+on every cycle, so any fixed pendingQ threshold is unreachable from inside .buffering.
+
+Locations:
+- `PlayerLabPlaybackController` feed loop — `criticalPendingLag` block removed; replaced with log-only `⚠️ PENDING-LAG`
+- `PlayerLabPlaybackController` `.buffering` recovery — `canResume` simplified to `actualRecoveredBuf >= policy.resumeThreshold`
+
 ---
 
 ## Key file locations
@@ -455,7 +811,21 @@ CinemaScope/Features/PlaybackQuarantine/
 | `[IndexTask]` | Background MKV indexing progress; `cursor exhausted but not fully indexed` = Sprint 57 early-return guard fired (normal for fast-indexing files) |
 | `[Buffer]` | Underrun / recovery events |
 
-### Log file location (device/simulator)
+### Where to read logs — IMPORTANT
+
+`PlayerLabLog.setup()` calls `freopen()` to redirect **stderr** to `playerlab.log`.
+After that redirect, Xcode console shows **stdout** (`print()`) only.
+
+**Sprint 69 fix:** `record()` in `PlayerLabPlaybackController` and `frLog()` in
+`FrameRenderer` now write to BOTH stderr (→ file) AND stdout (→ Xcode console).
+`[Session]` lines from `PlayerLabHostView.sessionLog()` always wrote to both; all
+other controller/renderer lines were stderr-only and were invisible in Xcode console.
+
+After the fix, `[PlayerLabPlaybackController]` and `[FrameRenderer]` lines appear
+directly in the Xcode console alongside `[Session]` lines.  You should no longer
+need to read the log file for normal debugging.
+
+The file is still written for crash post-mortem:
 
 ```bash
 find /Users/$(whoami)/Library/Developer/CoreSimulator -name 'playerlab.log' 2>/dev/null

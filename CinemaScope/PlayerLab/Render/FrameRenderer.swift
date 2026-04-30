@@ -146,6 +146,18 @@ final class FrameRenderer {
     /// False until the engine is running and the player node is wired.
     private(set) var audioRendererAttached: Bool = false
 
+    // MARK: - Logging helper
+
+    /// Write `msg` to both stderr (→ playerlab.log) and stdout (→ Xcode console).
+    /// Use for all diagnostic lines so they are visible regardless of how the
+    /// developer is reading output.
+    @inline(__always)
+    private func frLog(_ msg: String) {
+        let line = "[FrameRenderer] \(msg)"
+        fputs("\(line)\n", stderr)
+        print(line)
+    }
+
     // MARK: - Init
 
     /// - Parameter videoOnly: When `true` (default) the audio engine is NOT started
@@ -160,11 +172,10 @@ final class FrameRenderer {
         synchronizer.addRenderer(layer)
         synchronizer.rate = 0   // start paused
 
-        fputs("[FrameRenderer] init videoOnly=\(videoOnly) — "
+        frLog("init videoOnly=\(videoOnly) — "
             + (videoOnly
                ? "video synchronizer created (audio engine will not be used)"
-               : "video synchronizer created — call startAudioEngine(inputDesc:) after AVAudioSession.setActive")
-            + "\n", stderr)
+               : "video synchronizer created — call startAudioEngine(inputDesc:) after AVAudioSession.setActive"))
     }
 
     /// Wire up the AVAudioEngine for compressed audio playback.
@@ -210,9 +221,9 @@ final class FrameRenderer {
             let fourCC = String(bytes: [UInt8((fmtID >> 24) & 0xFF), UInt8((fmtID >> 16) & 0xFF),
                                         UInt8((fmtID >>  8) & 0xFF), UInt8( fmtID        & 0xFF)],
                                 encoding: .ascii) ?? "????"
-            fputs("[FrameRenderer] ❌ startAudioEngine: AVAudioFormat sr=0/ch=0 for codec "
+            frLog("❌ startAudioEngine: AVAudioFormat sr=0/ch=0 for codec "
                 + "'\(fourCC)' — format description missing channel layout; "
-                + "running video-only (check AudioFormatFactory for this codec)\n", stderr)
+                + "running video-only (check AudioFormatFactory for this codec)")
             return
         }
 
@@ -236,8 +247,8 @@ final class FrameRenderer {
                                | AudioChannelLayoutTag(ch)
         }
         guard let outChannelLayout = AVAudioChannelLayout(layoutTag: outLayoutTag) else {
-            fputs("[FrameRenderer] ❌ startAudioEngine: could not create output AVAudioChannelLayout "
-                + "tag=\(outLayoutTag) ch=\(ch)\n", stderr)
+            frLog("❌ startAudioEngine: could not create output AVAudioChannelLayout "
+                + "tag=\(outLayoutTag) ch=\(ch)")
             return
         }
         let outFmt = AVAudioFormat(standardFormatWithSampleRate: sr, channelLayout: outChannelLayout)
@@ -276,11 +287,10 @@ final class FrameRenderer {
         do {
             try audioEngine.start()
             audioRendererAttached = true
-            fputs("[FrameRenderer] ✅ AVAudioEngine started (Sprint 54 audio path)  "
-                + "sr=\(Int(sr))Hz  ch=\(ch)\n", stderr)
+            frLog("✅ AVAudioEngine started (Sprint 54 audio path)  "
+                + "sr=\(Int(sr))Hz  ch=\(ch)")
         } catch {
-            fputs("[FrameRenderer] ❌ AVAudioEngine start failed: \(error.localizedDescription)\n",
-                  stderr)
+            frLog("❌ AVAudioEngine start failed: \(error.localizedDescription)")
         }
     }
 
@@ -308,6 +318,16 @@ final class FrameRenderer {
             let entry = pendingVideoQueue.removeFirst()
             performLayerEnqueue(entry.buffer, sampleIndex: entry.sampleIndex)
         }
+    }
+
+    /// Sprint 74: Proactively flush pendingVideoQueue to the display layer.
+    /// Called from the feed loop every ~100 ms to supplement the
+    /// requestMediaDataWhenReady callback, which fires only ~every 2 s on the
+    /// tvOS simulator.  Without this, pendingQ accumulates to 400-500 frames and
+    /// the layer runs dry at the end of each drain cycle, causing visible freezes.
+    func proactiveDrainPending() {
+        guard !pendingVideoQueue.isEmpty else { return }
+        drainVideoQueue()
     }
 
     /// Registers a requestMediaDataWhenReady callback if one is not already active.
@@ -398,9 +418,9 @@ final class FrameRenderer {
             if let fmt = CMSampleBufferGetFormatDescription(sampleBuffer) {
                 let dims = CMVideoFormatDescriptionGetDimensions(fmt)
                 let size = CGSize(width: CGFloat(dims.width), height: CGFloat(dims.height))
-                fputs("[FrameRenderer] ✅ First frame enqueued — "
+                frLog("✅ First frame enqueued — "
                     + "PTS=\(String(format: "%.4f", firstFramePTS.seconds))s  "
-                    + "dims=\(Int(size.width))×\(Int(size.height))\n", stderr)
+                    + "dims=\(Int(size.width))×\(Int(size.height))")
                 onFirstFrame?(size)
             }
         }
@@ -533,10 +553,9 @@ final class FrameRenderer {
         // to show → black screen.
         if !videoOnlyDiagnostic && audioRendererAttached {
             playerNode.play()
-            fputs("[FrameRenderer] [P4/Sprint54] playerNode.play()  "
+            frLog("[P4/Sprint54] playerNode.play()  "
                 + "isPlaying=\(playerNode.isPlaying)  "
-                + (playerNode.isPlaying ? "✅ audio running" : "❌ player node not running")
-                + "\n", stderr)
+                + (playerNode.isPlaying ? "✅ audio running" : "❌ player node not running"))
         }
 
         // ── Video synchronizer ────────────────────────────────────────────────
@@ -549,10 +568,10 @@ final class FrameRenderer {
         let syncRate = synchronizer.rate
         let tbRate   = CMTimebaseGetRate(synchronizer.timebase)
         let tbTime   = CMTimebaseGetTime(synchronizer.timebase)
-        fputs("[FrameRenderer] play(from: \(String(format: "%.4f", startPTS.seconds))s)  "
+        frLog("play(from: \(String(format: "%.4f", startPTS.seconds))s)  "
             + "syncRate=\(syncRate)  tbRate=\(tbRate)  "
             + "tbTime=\(tbTime.isValid ? String(format: "%.3f", tbTime.seconds) + "s" : "invalid")  "
-            + "framesEnqueued=\(framesEnqueued)\n", stderr)
+            + "framesEnqueued=\(framesEnqueued)")
     }
 
     /// Freeze playback at the current position.
@@ -561,7 +580,7 @@ final class FrameRenderer {
         if !videoOnlyDiagnostic && audioRendererAttached {
             playerNode.pause()
         }
-        fputs("[FrameRenderer] pause() — synchronizer rate=0  playerNode paused\n", stderr)
+        frLog("pause() — synchronizer rate=0  playerNode paused")
     }
 
     /// Resume from the current position after pause().
@@ -570,7 +589,7 @@ final class FrameRenderer {
         if !videoOnlyDiagnostic && audioRendererAttached {
             playerNode.play()
         }
-        fputs("[FrameRenderer] resume() — synchronizer rate=1  playerNode resumed\n", stderr)
+        frLog("resume() — synchronizer rate=1  playerNode resumed")
     }
 
     /// Set an arbitrary playback rate on the video synchronizer.
@@ -614,7 +633,7 @@ final class FrameRenderer {
         guard !videoOnlyDiagnostic && audioRendererAttached else { return }
         if !playerNode.isPlaying {
             playerNode.play()
-            fputs("[FrameRenderer] resumeAudioIfNeeded() → playerNode.play()\n", stderr)
+            frLog("resumeAudioIfNeeded() → playerNode.play()")
         }
     }
 
@@ -654,7 +673,7 @@ final class FrameRenderer {
         framesEnqueued = 0
         firstFramePTS  = .invalid
         actualLayerEnqueuedMaxPTS = .invalid   // Sprint 59: reset layer-tail tracking
-        fputs("[FrameRenderer] flushAll() — layer + audio cleared, rate=0\n", stderr)
+        frLog("flushAll() — layer + audio cleared, rate=0")
     }
 
     /// Flush only the video layer (leaves audio player running, e.g. mid-seek).
@@ -708,7 +727,7 @@ final class FrameRenderer {
         framesEnqueued = 0
         firstFramePTS  = .invalid
         actualLayerEnqueuedMaxPTS = .invalid   // Sprint 59: reset layer-tail tracking
-        fputs("[FrameRenderer] flushForSeek() — pipeline quiesced, layer + audio cleared\n", stderr)
+        frLog("flushForSeek() — pipeline quiesced, layer + audio cleared")
     }
 
     // MARK: - Status
